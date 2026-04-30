@@ -86,7 +86,14 @@
                 <module>postgres</module>
                 <module>tigergraph</module>
                 <module>umbra</module>
+                <module>age</module>
           </modules>
+        </profile>
+        <profile>
+            <id>age</id>
+            <modules>
+                <module>age</module>
+            </modules>
         </profile>
         <profile>
             <id>cypher</id>
