@@ -75,14 +75,98 @@ bash scripts/load-test-data.sh
 
 This script auto-creates a `.venv` with `psycopg2-binary` on first run.
 
-### Production data (SF1+)
+### Production data (SF0.1+) via agefreighter
 
-For larger scale factors, load from pre-generated LDBC vanilla CSVs:
+Production loads use the [agefreighter](https://github.com/rioriost/agefreighter) library, which
+streams pre-converted CSVs directly into AGE via PostgreSQL's `COPY` protocol — the only approach
+that scales to SF1000.
+
+#### Prerequisites
+
+```bash
+# Clone agefreighter and create its venv (one-time setup)
+cd ~/repositories
+git clone https://github.com/rioriost/agefreighter.git
+cd agefreighter
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip && pip install -e . && pip install "psycopg[binary]"
+```
+
+The preprocessing script lives in the `GraphBenchmarking` repo (sibling to this repo):
+```
+~/repositories/GraphBenchmarking/ldbc_snb_benchmark/preprocess_ldbc.py
+```
+
+LDBC raw data is expected at `~/repositories/ldbc_snb_data/sf{N}/` (see the SF3 Bootstrap doc for
+the download commands).
+
+#### Step 1 — Preprocess LDBC CSVs
+
+```bash
+cd ~/repositories/GraphBenchmarking/ldbc_snb_benchmark
+python3 preprocess_ldbc.py --sf 3   # replace 3 with 0.1, 1, 10, 100, 300, 1000
+
+# Sanity check
+ls converted/sf3/vertices/ | wc -l   # must be 11
+ls converted/sf3/edges/ | wc -l      # must be 15
+ls converted/sf3/agefreighter_config.json
+```
+
+This produces comma-delimited CSVs under `converted/sf{N}/vertices/` and `converted/sf{N}/edges/`,
+plus an `agefreighter_config.json` that drives the load. Key transformations applied:
+- Places split into `City`, `Country`, `Continent`; organisations split into `Company`, `University`
+- Person `language` column renamed to `speaks` and converted to a JSON array (e.g. `["si","en"]`)
+- Person `email` column converted to a JSON array
+- `KNOWS` edges stored **bidirectionally** (both A→B and B→A) because AGE queries use directed
+  `(p)-[:KNOWS]->(friend)` patterns
+
+#### Step 2 — Load with agefreighter
+
+agefreighter uses a libpq keyword-value connection string (not the `postgresql://` URL format):
+
+```bash
+source ~/repositories/agefreighter/.venv/bin/activate
+
+agefreighter \
+  --graphname ldbc_snb \
+  --pg-con-str "host=<host> port=5432 dbname=<dbname> user=<user> password=<password>" \
+  load \
+  --source-type csv \
+  --config ~/repositories/GraphBenchmarking/ldbc_snb_benchmark/converted/sf3/agefreighter_config.json \
+  --progress
+```
+
+> **Warning**: agefreighter drops and recreates the `ldbc_snb` graph if it already exists.
+
+agefreighter automatically creates GIN indexes on `properties` (`gin_agtype_ops`) and B-tree
+indexes on `id`, `start_id`, and `end_id` for every label.
+
+#### Step 3 — Create query-performance indexes
 
 ```bash
 export CONNECTION_STRING="postgresql://user:pass@host:5432/dbname"
-bash scripts/load-data.sh --sf 3   # or --sf 1, --sf 10, etc.
+psql "$CONNECTION_STRING" -f scripts/create-indexes.sql
 ```
+
+`create-indexes.sql` adds:
+- **GIN on `properties`** (idempotent with agefreighter's; required on the dev load path): AGE
+  compiles `MATCH (n:Label {id: X})` to `properties @> '{"id":X}'::agtype` (containment), which
+  requires GIN with `gin_agtype_ops` — B-tree indexes on extracted values cannot serve this operator.
+- **B-tree on extracted `creationDate`**: range filters (`WHERE msg.creationDate < $maxDate`) in IC2, IC3, IC4, IC7, IC9.
+- **B-tree on extracted `name`**: equality filters on Tag, TagClass, Country names in IC3–IC6, IC11.
+- **B-tree on edge `start_id`/`end_id`** (idempotent with agefreighter's): adjacency traversal for all multi-hop patterns.
+
+#### Step 4 — Vacuum, analyze, and snapshot
+
+```bash
+export CONNECTION_STRING="postgresql://user:pass@host:5432/dbname"
+bash scripts/vacuum-analyze.sh
+bash scripts/snapshot-database.sh
+```
+
+The snapshot is required before validation or benchmark runs because IU operations mutate the
+graph — see [Snapshot and Restore](#snapshot-and-restore) below.
 
 ## Snapshot and Restore
 

@@ -19,11 +19,11 @@ FROM (
           commonInterestScore agtype, personGender agtype, personCityName agtype, birthday agtype)
 ) candidates
 WHERE (
-  EXTRACT(MONTH FROM TO_TIMESTAMP(birthday::text::bigint / 1000.0)) = $month
-  AND EXTRACT(DAY FROM TO_TIMESTAMP(birthday::text::bigint / 1000.0)) >= 21
+  EXTRACT(MONTH FROM TO_TIMESTAMP(birthday::text::bigint / 1000.0) AT TIME ZONE 'UTC') = $month
+  AND EXTRACT(DAY FROM TO_TIMESTAMP(birthday::text::bigint / 1000.0) AT TIME ZONE 'UTC') >= 21
 ) OR (
-  EXTRACT(MONTH FROM TO_TIMESTAMP(birthday::text::bigint / 1000.0)) = ($month % 12) + 1
-  AND EXTRACT(DAY FROM TO_TIMESTAMP(birthday::text::bigint / 1000.0)) < 22
+  EXTRACT(MONTH FROM TO_TIMESTAMP(birthday::text::bigint / 1000.0) AT TIME ZONE 'UTC') = ($month % 12) + 1
+  AND EXTRACT(DAY FROM TO_TIMESTAMP(birthday::text::bigint / 1000.0) AT TIME ZONE 'UTC') < 22
 )
 ORDER BY commonInterestScore DESC, personId ASC
 LIMIT 10;

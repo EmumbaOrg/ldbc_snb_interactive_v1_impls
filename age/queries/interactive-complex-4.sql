@@ -2,12 +2,12 @@ SET search_path = ag_catalog, public;
 SELECT tagName, postCount FROM (
   SELECT * FROM cypher('$graphName', $$
     MATCH (p:Person {id: $personId})-[:KNOWS]->(friend:Person)<-[:HAS_CREATOR]-(post:Post)-[:HAS_TAG]->(tag:Tag)
-    WHERE post.creationDate >= $startDate AND post.creationDate < $endDate
-    WITH tag, count(post) AS postCount
-    WHERE NOT EXISTS {
-      MATCH (:Person {id: $personId})-[:KNOWS]->(:Person)<-[:HAS_CREATOR]-(oldPost:Post)-[:HAS_TAG]->(tag)
-      WHERE oldPost.creationDate < $startDate
-    }
+    WITH DISTINCT tag, post
+    WITH tag,
+         CASE WHEN post.creationDate >= $startDate AND post.creationDate < $endDate THEN 1 ELSE 0 END AS inWindow,
+         CASE WHEN post.creationDate < $startDate THEN 1 ELSE 0 END AS preWindow
+    WITH tag, sum(inWindow) AS postCount, sum(preWindow) AS preWindowCount
+    WHERE postCount > 0 AND preWindowCount = 0
     RETURN tag.name, postCount
     ORDER BY postCount DESC, tag.name ASC
   $$) AS (tagName agtype, postCount agtype)

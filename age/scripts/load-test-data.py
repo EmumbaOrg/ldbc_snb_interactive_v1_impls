@@ -311,10 +311,17 @@ def load_edges(cur, conn, static_dir, dynamic_dir, place_label, org_label):
     bulk_insert_edges(cur, conn, "Person", "Tag", "HAS_INTEREST",
         edge_rows(rows, "Person.id", "Tag.id"))
 
-    # person KNOWS person — duplicate "Person.id" header, read positionally
+    # person KNOWS person — load both directions per CSV row.
+    # The LDBC CSV has one row per friendship (A|B only, not B|A).
+    # All read queries use directed (p)-[:KNOWS]->(friend), so both directions must be stored.
+    # IU8 also creates both directions for consistency.
     knows_headers, knows_rows = read_csv_rows(os.path.join(dynamic_dir, "person_knows_person_0_0.csv"))
-    bulk_insert_edges(cur, conn, "Person", "Person", "KNOWS",
-        [{"srcId": int(r[0]), "tgtId": int(r[1]), "creationDate": int(r[2])} for r in knows_rows])
+    knows_both = []
+    for r in knows_rows:
+        a, b, d = int(r[0]), int(r[1]), int(r[2])
+        knows_both.append({"srcId": a, "tgtId": b, "creationDate": d})
+        knows_both.append({"srcId": b, "tgtId": a, "creationDate": d})
+    bulk_insert_edges(cur, conn, "Person", "Person", "KNOWS", knows_both)
 
     # person STUDY_AT university
     rows = read_csv(os.path.join(dynamic_dir, "person_studyAt_organisation_0_0.csv"))
