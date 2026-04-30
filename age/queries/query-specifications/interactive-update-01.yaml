@@ -1,0 +1,37 @@
+workload: Updates
+operation: insert
+number: 1
+title: Add person
+description: Add a *Person* **node**, connected to the network by 4 possible **edge** types.
+parameters:
+  - name: personId
+    type: ID
+  - name: personFirstName
+    type: String
+  - name: personLastName
+    type: String
+  - name: gender
+    type: String
+  - name: birthday
+    type: Date
+  - name: creationDate
+    type: DateTime
+  - name: locationIP
+    type: String
+  - name: browserUsed
+    type: String
+  - name: cityId
+    type: ID
+  - name: languages
+    type: \{String\}
+  - name: emails
+    type: \{Long String\}
+  - name: tagIds
+    type: \{ID\}
+  - name: studyAt
+    type: \{\<ID, 32-bit Integer>\}
+    description: "`{<universityId, classYear>}`"
+  - name: workAt
+    type: \{\<ID, 32-bit Integer>\}
+    description: "`{<companyId, workFrom>}`"
+choke_points: [9.1, 9.2]

@@ -1,0 +1,34 @@
+workload: Interactive
+operation: short
+number: 7
+title: Replies of a message
+description: |
+  Given a *Message* with ID `$messageId`, retrieve the (1-hop) *Comments* that reply to it.
+
+  In addition, return a boolean flag `knows` indicating if the author of the reply (`replyAuthor`) knows the author of the original message (`messageAuthor`).
+  If author is same as original author, return `False` for `knows` flag.
+parameters:
+  - name: messageId
+    type: ID
+result:
+  - name: comment.id
+    type: ID
+  - name: comment.content
+    type: Text
+  - name: comment.creationDate
+    type: DateTime
+  - name: replyAuthor.id
+    type: ID
+  - name: replyAuthor.firstName
+    type: String
+  - name: replyAuthor.lastName
+    type: String
+  - name: knows
+    type: Boolean
+    category: calculated
+    description: "`True` if the *knows* edge exists between the `replyAuthor` and the `messageAuthor` nodes, `False` otherwise (including the case when the two nodes are the same)"
+sort:
+  - name: comment.creationDate
+    direction: desc
+  - name: replyAuthor.id
+    direction: asc

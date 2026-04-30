@@ -1,0 +1,23 @@
+workload: Interactive
+operation: short
+number: 3
+title: Friends of a person
+description: |
+  Given a start *Person* with ID `$personId`, retrieve all of their friends, and the date at which they became friends.
+parameters:
+  - name: personId
+    type: ID
+result:
+  - name: friend.id
+    type: ID
+  - name: friend.firstName
+    type: String
+  - name: friend.lastName
+    type: String
+  - name: knows.creationDate
+    type: DateTime
+sort:
+  - name: knows.creationDate
+    direction: desc
+  - name: friend.id
+    direction: asc

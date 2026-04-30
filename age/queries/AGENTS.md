@@ -4,23 +4,28 @@
 You are a professional Database expert who has deep expertise in both relational and graph databases like Apache AGE with postgres, neo4j, graphdb, tigergraph. 
 
 
-## Instrcuctions
-It is a must to follow the specifications as they are the ground truth for many implmenentations. For implementation strategy other implementations can be consulted. 
-YAML query specifications are stored in `queries/query-specifications/` — one file per query:
+## Instructions
 
-| Pattern | Files |
-|---|---|
-| `interactive-complex-read-NN.yaml` | IC1–IC12 |
-| `interactive-short-read-N.yaml` | IS1–IS7 |
-| `interactive-update-N.yaml` | IU1–IU8 |
+The YAML specifications are the ground truth. Follow them exactly. For implementation strategy (e.g. how to express a pattern in AGE Cypher), consult the reference implementations listed below.
 
-The corresponding cypher age query implementations are in `queries/interactive-complex-N.sql`, `queries/interactive-short-N.sql`, and `queries/interactive-update-N.sql`.
+## Spec Files
 
-### Cross-checking against other implementations
+YAML query specifications are in `query-specifications/` — one file per query:
 
-The repo contains reference implementations in `cypher/`, `duckdb/`, `tigergraph/`, and `graphdb/` directories. If a semantic question cannot be resolved from the YAML alone, compare against `cypher/` (Neo4j) as the authoritative reference — it is the implementation used to generate LDBC validation params.
+| Spec file pattern | Queries | Notes |
+|---|---|---|
+| `interactive-complex-read-NN.yaml` | IC1–IC12 | |
+| `interactive-complex-read-13.yaml` | IC13 | AGE returns -1 constant (no shortestPath support) |
+| `interactive-complex-read-14-v1.yaml` / `-v2.yaml` | IC14 | AGE returns empty list (no allShortestPaths support) |
+| `interactive-short-read-NN.yaml` | IS1–IS7 | |
+| `interactive-update-NN.yaml` | IU1–IU8 | Sourced from `insert-NN.yaml` in ldbc_snb_docs repo |
 
-### How to review a query
+The corresponding AGE SQL implementations are in:
+- `interactive-complex-N.sql` (IC1–IC12; no SQL files for IC13/IC14)
+- `interactive-short-N.sql` (IS1–IS7)
+- `interactive-update-N.sql` (IU1–IU8)
+
+## How to Review a Query
 
 For each query, read both the YAML spec and the SQL file, then verify:
 
@@ -28,41 +33,52 @@ For each query, read both the YAML spec and the SQL file, then verify:
 
 2. **Graph traversal** — the MATCH pattern must follow the spec description exactly. Pay attention to:
    - Hop count (1-hop friends vs 2-hop friends-of-friends)
-   - Node types (`Post` vs `Comment` vs generic `Message` — AGE uses separate labels)
+   - Node types (`Post` vs `Comment` vs generic `Message` — AGE uses separate labels for each)
    - Edge directions (e.g. `(post)-[:HAS_CREATOR]->(person)` not the reverse)
-   - Whether the same node variable is reused across multiple MATCH clauses (anonymous `(:Post)` creates a new node; named `(post)` reuses the previously bound one)
+   - Whether the same node variable is reused across MATCH clauses — anonymous `(:Post)` creates a new unbound node; named `(post)` reuses the previously bound one. Using anonymous nodes where a named variable is required is a common bug.
 
-3. **Filters** — date filters use `<` not `<=` for exclusive upper bounds (spec says "before date X"). Check all WHERE conditions against the description.
+3. **Filters** — date filters use `<` not `<=` for exclusive upper bounds ("before date X"). Check all WHERE conditions against the spec description.
 
-4. **2-hop deduplication** — queries involving friends-of-friends must exclude direct friends and the start person. The standard pattern is:
+4. **2-hop deduplication** — queries involving friends-of-friends must exclude direct friends and the start person. The standard AGE pattern is:
    ```cypher
    OPTIONAL MATCH (p)-[direct:KNOWS]->(friend)
    WITH DISTINCT friend, direct WHERE direct IS NULL
    ```
 
-5. **Result columns** — the YAML `result` list defines the exact columns and order. Verify the RETURN clause maps to those columns in the same order.
+5. **Result columns** — the YAML `result` list defines the exact columns and order. Verify the RETURN clause produces those columns in that order.
 
-6. **Sort order** — the YAML `sort` list defines primary/secondary sort keys and directions (`asc`/`desc`). The SQL `ORDER BY` must match exactly, including tie-breakers. For queries with inner `LIMIT` (e.g. IS2), the inner `ORDER BY` must use the same tie-breaker as the outer one.
+6. **Sort order** — the YAML `sort` list defines primary/secondary sort keys and directions (`asc`/`desc`). The SQL `ORDER BY` must match exactly, including tie-breakers. For queries with an inner `LIMIT` (e.g. IS2), the inner `ORDER BY` must use the same tie-breaker direction as the outer one.
 
 7. **Limit** — the YAML `limit` field must match `LIMIT N` in the SQL.
 
-8. **Aggregation** — where the spec says `count(DISTINCT ...)`, use `count(DISTINCT ...)` not `count(*)`. Cast agtype aggregates: `SUM(col::text::bigint)`.
+8. **Aggregation** — where the spec says `count(DISTINCT ...)`, use `count(DISTINCT ...)` not `count(*)`. AGE agtype aggregates require a cast: `SUM(col::text::bigint)`.
 
-9. **IC7 tie-breaking** — spec says "return the Message with lowest identifier" when a liker liked multiple messages at the same timestamp. Use `commentOrPostId ASC` as the innermost tie-breaker within a `DISTINCT ON (personId)` window.
+9. **IC7 tie-breaking** — spec says "return the Message with lowest identifier" when a liker liked multiple messages at the same timestamp. Use `commentOrPostId ASC` as the innermost tie-breaker inside a `DISTINCT ON (personId)` window ordered by `likeCreationDate DESC`.
 
-10. **IC12 tag source** — tags must come from the original Post, not from the Comment/reply. Pattern: `(post:Post)-[:HAS_TAG]->(tag)` not `(reply)-[:HAS_TAG]->(tag)`.
+10. **IC12 tag source** — tags must come from the original Post, not from the Comment/reply. Use `(post:Post)-[:HAS_TAG]->(tag)` not `(reply)-[:HAS_TAG]->(tag)`.
 
-### Known intentional deviations
+11. **IU single-statement rule** — each `interactive-update-N.sql` must contain exactly one `cypher()` call. All operations (CREATE node + edges) go inside a single `$$...$$` block using `WITH ... CREATE` chaining. Do not split into multiple SELECT statements.
+
+## Known Intentional Deviations — Do NOT Flag as Bugs
 
 | Query | Deviation | Reason |
 |---|---|---|
 | IC13 | Always returns `-1` | AGE does not support `shortestPath()` |
 | IC14 | Always returns empty list | AGE does not support `allShortestPaths()` |
-| All | `UNION ALL` of Comment + Post branches | AGE lacks a polymorphic `Message` label; each message type is a separate vertex label |
-| All dates | Stored as epoch milliseconds (bigint) | AGE has no native DateTime type; `AgeConverter` converts `java.util.Date` → epoch ms |
+| All reads | `UNION ALL` of Comment + Post branches | AGE has no polymorphic `Message` label; Post and Comment are separate vertex labels |
+| All dates | Stored and compared as epoch milliseconds (bigint) | AGE has no native DateTime type; Java layer converts `java.util.Date` → epoch ms |
 
-Do **not** flag these as bugs.
+## Cross-Checking Against Other Implementations
 
-### Cross-checking against other implementations
+If the YAML spec is ambiguous, compare against the reference implementations in the repo:
 
-The repo contains reference implementations in `cypher/`, `duckdb/`, `tigergraph/`, and `graphdb/` directories. If a semantic question cannot be resolved from the YAML alone, compare against `cypher/` (Neo4j) as the authoritative reference — it is the implementation used to generate LDBC validation params.
+| Implementation | Path | Use for |
+|---|---|---|
+| **Neo4j (Cypher)** | `cypher/queries/` | **Primary reference** — generates LDBC validation params |
+| DuckDB | `duckdb/queries/` | SQL-style cross-check |
+| TigerGraph | `tigergraph/gsql/` | GSQL cross-check |
+| GraphDB | `graphdb/queries/` | SPARQL cross-check |
+
+Always prefer `cypher/` as the authoritative reference. Known bugs in other implementations:
+- TigerGraph IC7: picks highest message ID on ties (spec requires lowest)
+- DuckDB IC7: can return multiple rows per liker when timestamps tie

@@ -1,0 +1,13 @@
+workload: Updates
+operation: insert
+number: 2
+title: Add like to post
+description: Add a *likes* **edge** to a *Post*.
+parameters:
+  - name: personId
+    type: ID
+  - name: postId
+    type: ID
+  - name: creationDate
+    type: DateTime
+choke_points: [9.2]

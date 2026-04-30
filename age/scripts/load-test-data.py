@@ -406,6 +406,25 @@ def load_edges(cur, conn, static_dir, dynamic_dir, place_label, org_label):
                   [("creationDate", "creationDate", int)]))
 
 
+def create_vertex_id_indexes(cur, conn):
+    """Create GIN indexes on vertex properties before edge loading.
+    AGE compiles MATCH {id: X} to `properties @> '{"id": X}'` (containment).
+    GIN with gin_agtype_ops supports that operator; B-tree on cast expressions does not.
+    Without these, every MATCH in bulk_insert_edges does a full table scan.
+    """
+    print("Creating vertex GIN indexes (required for fast edge loading)...")
+    labels = ["Person", "Post", "Comment", "Forum", "Tag", "TagClass",
+              "City", "Country", "Continent", "University", "Company"]
+    for lbl in labels:
+        idx = f"idx_{lbl.lower()}_props_gin_load"
+        cur.execute(
+            f"CREATE INDEX IF NOT EXISTS {idx} ON {GRAPH}.\"{lbl}\" "
+            f"USING gin(properties ag_catalog.gin_agtype_ops)"
+        )
+        conn.commit()
+        print(f"  {lbl}: GIN index created")
+
+
 def main():
     vanilla_dir = sys.argv[1] if len(sys.argv) > 1 else "test-data/vanilla"
     cs = sys.argv[2] if len(sys.argv) > 2 else \
@@ -419,6 +438,7 @@ def main():
 
     setup_graph(cur, conn)
     place_label, org_label = load_vertices(cur, conn, static_dir, dynamic_dir)
+    create_vertex_id_indexes(cur, conn)
     load_edges(cur, conn, static_dir, dynamic_dir, place_label, org_label)
 
     cur.close()

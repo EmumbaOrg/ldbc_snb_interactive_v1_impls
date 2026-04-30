@@ -1,0 +1,33 @@
+workload: Updates
+operation: insert
+number: 7
+title: Add comment
+description: Add a *Comment* **node** replying to a *Post*/*Comment*, connected to the network by 4 possible **edge** types (*replyOf*, *hasCreator*, *isLocatedIn*, *hasTag*).
+parameters:
+  - name: commentId
+    type: ID
+  - name: creationDate
+    type: DateTime
+  - name: locationIP
+    type: String
+  - name: browserUsed
+    type: String
+  - name: content
+    type: Text
+  - name: length
+    type: 32-bit Integer
+  - name: authorPersonId
+    type: ID
+  - name: countryId
+    type: ID
+  - name: replyToPostId
+    type: ID
+    category: calculated
+    description: "**old version:** $-1$ if the *Comment* is a reply of a *Comment*; **new version:** null if the *Comment* is a reply of a *Post*"
+  - name: replyToCommentId
+    type: ID
+    category: calculated
+    description: "**old version:** $-1$ if the *Comment* is a reply of a *Post*; **new version:** null if the *Comment* is a reply of a *Post*"
+  - name: tagIds
+    type: \{ID\}
+choke_points: [9.1, 9.2]

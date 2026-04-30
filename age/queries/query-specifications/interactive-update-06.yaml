@@ -1,0 +1,31 @@
+workload: Updates
+operation: insert
+number: 6
+title: Add post
+description: Add a *Post* **node** connected to the network by 4 possible **edge** types (*hasCreator*, *containerOf*, *isLocatedIn*, *hasTag*).
+parameters:
+  - name: postId
+    type: ID
+  - name: imageFile
+    type: String
+  - name: creationDate
+    type: DateTime
+  - name: locationIP
+    type: String
+  - name: browserUsed
+    type: String
+  - name: language
+    type: String
+  - name: content
+    type: Text
+  - name: length
+    type: 32-bit Integer
+  - name: authorPersonId
+    type: ID
+  - name: forumId
+    type: ID
+  - name: countryId
+    type: ID
+  - name: tagIds
+    type: \{ID\}
+choke_points: [9.1, 9.2]

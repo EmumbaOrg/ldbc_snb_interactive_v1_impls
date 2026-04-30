@@ -1,0 +1,16 @@
+workload: Interactive
+operation: short
+number: 4
+title: Content of a message
+description: |
+  Given a *Message* with ID `$messageId`, retrieve its content and creation date.
+parameters:
+  - name: messageId
+    type: ID
+result:
+  - name: message.creationDate
+    type: DateTime
+    description: "`messageCreationDate`"
+  - name: message.content or message.imageFile (for photos)
+    type: Text
+    description: "`messageContent`"
