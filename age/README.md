@@ -121,26 +121,32 @@ plus an `agefreighter_config.json` that drives the load. Key transformations app
 - `KNOWS` edges stored **bidirectionally** (both A→B and B→A) because AGE queries use directed
   `(p)-[:KNOWS]->(friend)` patterns
 
-#### Step 2 — Load with agefreighter
+#### Step 2 — Load with the production loader
 
-agefreighter uses a libpq keyword-value connection string (not the `postgresql://` URL format):
+> **Why not `agefreighter --source-type csv` directly?**
+> agefreighter's `format_kv()` wraps every value in double-quotes, storing all properties as
+> agtype strings — `{"id": "933", "creationDate": "1266161530447"}`. AGE queries use integer
+> literals (`MATCH (p:Person {id: 933})`), and integer `933 ≠` string `"933"` in agtype
+> containment, so every MATCH returns 0 rows. `scripts/load-production-data.py` uses the same
+> PostgreSQL COPY protocol but applies two correctness-critical transformations:
+> 1. Numeric columns (`id`, `creationDate`, `birthday`, `length`, `classYear`, `workFrom`,
+>    `joinDate`) are stored as agtype integers, not quoted strings.
+> 2. Empty-string fields are **omitted** rather than stored as `""`. Image posts have empty
+>    `content` and `language`; text posts have empty `imageFile`. Keeping these as `""` makes
+>    `coalesce(p.content, p.imageFile)` return `""` for image posts (since `""` is non-null in
+>    Cypher), breaking IS2/IS4/IC2/IC7/IC9 expected results.
 
 ```bash
-source ~/repositories/agefreighter/.venv/bin/activate
+export CONNECTION_STRING="postgresql://user:pass@host:5432/dbname"
+cd ~/repositories/ldbc_snb_interactive_v1_impls/age
 
-agefreighter \
-  --graphname ldbc_snb \
-  --pg-con-str "host=<host> port=5432 dbname=<dbname> user=<user> password=<password>" \
-  load \
-  --source-type csv \
+python3 scripts/load-production-data.py \
   --config ~/repositories/GraphBenchmarking/ldbc_snb_benchmark/converted/sf3/agefreighter_config.json \
-  --progress
+  --graph-name ldbc_snb
 ```
 
-> **Warning**: agefreighter drops and recreates the `ldbc_snb` graph if it already exists.
-
-agefreighter automatically creates GIN indexes on `properties` (`gin_agtype_ops`) and B-tree
-indexes on `id`, `start_id`, and `end_id` for every label.
+This drops and recreates the graph, loads all vertices via COPY, creates GIN indexes, then loads
+all edges via COPY — in that order.
 
 #### Step 3 — Create query-performance indexes
 
@@ -150,12 +156,12 @@ psql "$CONNECTION_STRING" -f scripts/create-indexes.sql
 ```
 
 `create-indexes.sql` adds:
-- **GIN on `properties`** (idempotent with agefreighter's; required on the dev load path): AGE
-  compiles `MATCH (n:Label {id: X})` to `properties @> '{"id":X}'::agtype` (containment), which
-  requires GIN with `gin_agtype_ops` — B-tree indexes on extracted values cannot serve this operator.
+- **GIN on `properties`** (idempotent; required for dev load path too): AGE compiles
+  `MATCH (n:Label {id: X})` to `properties @> '{"id":X}'::agtype` (containment), which requires
+  GIN with `gin_agtype_ops` — B-tree on extracted values cannot serve this operator.
 - **B-tree on extracted `creationDate`**: range filters (`WHERE msg.creationDate < $maxDate`) in IC2, IC3, IC4, IC7, IC9.
 - **B-tree on extracted `name`**: equality filters on Tag, TagClass, Country names in IC3–IC6, IC11.
-- **B-tree on edge `start_id`/`end_id`** (idempotent with agefreighter's): adjacency traversal for all multi-hop patterns.
+- **B-tree on edge `start_id`/`end_id`** (idempotent): adjacency traversal for all multi-hop patterns.
 
 #### Step 4 — Vacuum, analyze, and snapshot
 

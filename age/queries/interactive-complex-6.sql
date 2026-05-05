@@ -23,5 +23,5 @@ SELECT tagName, SUM(postCount::text::bigint)::bigint AS postCount FROM (
   $$) AS (tagName agtype, postCount agtype)
 ) tags
 GROUP BY tagName
-ORDER BY SUM(postCount::text::bigint) DESC, tagName ASC
+ORDER BY SUM(postCount::text::bigint) DESC, tagName::text COLLATE "C" ASC
 LIMIT 10;

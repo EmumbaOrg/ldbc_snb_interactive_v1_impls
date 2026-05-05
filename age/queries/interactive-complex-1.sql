@@ -26,6 +26,7 @@ FROM (
     SELECT * FROM cypher('$graphName', $$
       MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(friend:Person)-[:IS_LOCATED_IN]->(city:City)
       WHERE friend.firstName = $firstName AND friend.id <> $personId
+      WITH DISTINCT friend, city
       OPTIONAL MATCH (friend)-[studyAt:STUDY_AT]->(uni:University)-[:IS_LOCATED_IN]->(uniCity:City)
       WITH friend, city, collect(CASE WHEN uni IS NULL THEN null ELSE [uni.name, studyAt.classYear, uniCity.name] END) AS unis
       OPTIONAL MATCH (friend)-[workAt:WORK_AT]->(company:Company)-[:IS_LOCATED_IN]->(compCountry:Country)
@@ -41,6 +42,7 @@ FROM (
     SELECT * FROM cypher('$graphName', $$
       MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(:Person)-[:KNOWS]->(friend:Person)-[:IS_LOCATED_IN]->(city:City)
       WHERE friend.firstName = $firstName AND friend.id <> $personId
+      WITH DISTINCT friend, city
       OPTIONAL MATCH (friend)-[studyAt:STUDY_AT]->(uni:University)-[:IS_LOCATED_IN]->(uniCity:City)
       WITH friend, city, collect(CASE WHEN uni IS NULL THEN null ELSE [uni.name, studyAt.classYear, uniCity.name] END) AS unis
       OPTIONAL MATCH (friend)-[workAt:WORK_AT]->(company:Company)-[:IS_LOCATED_IN]->(compCountry:Country)

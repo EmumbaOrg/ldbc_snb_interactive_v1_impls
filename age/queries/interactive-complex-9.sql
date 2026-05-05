@@ -12,7 +12,7 @@ SELECT * FROM (
     MATCH (p:Person {id: $personId})-[:KNOWS]->(friend:Person)<-[:HAS_CREATOR]-(msg:Post)
     WHERE msg.creationDate < $maxDate AND friend.id <> $personId
     RETURN friend.id, friend.firstName, friend.lastName, msg.id,
-           coalesce(msg.imageFile, msg.content), msg.creationDate
+           coalesce(msg.content, msg.imageFile), msg.creationDate
   $$) AS (personId agtype, personFirstName agtype, personLastName agtype,
           messageId agtype, messageContent agtype, messageCreationDate agtype)
   UNION ALL
@@ -36,7 +36,7 @@ SELECT * FROM (
     MATCH (friend)<-[:HAS_CREATOR]-(msg:Post)
     WHERE msg.creationDate < $maxDate
     RETURN friend.id, friend.firstName, friend.lastName, msg.id,
-           coalesce(msg.imageFile, msg.content), msg.creationDate
+           coalesce(msg.content, msg.imageFile), msg.creationDate
   $$) AS (personId agtype, personFirstName agtype, personLastName agtype,
           messageId agtype, messageContent agtype, messageCreationDate agtype)
 ) recent_messages

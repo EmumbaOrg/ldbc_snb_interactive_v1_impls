@@ -4,7 +4,7 @@ FROM (
   SELECT * FROM cypher('$graphName', $$
     MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(friend:Person)-[:IS_LOCATED_IN]->(city:City)
     WHERE friend.id <> $personId
-    OPTIONAL MATCH (p)-[directKnows:KNOWS]-(friend)
+    OPTIONAL MATCH (p)-[directKnows:KNOWS]->(friend)
     WITH p, friend, city, directKnows
     WHERE directKnows IS NULL
     WITH DISTINCT p, friend, city

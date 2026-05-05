@@ -352,8 +352,8 @@ public class AgeDb extends BaseDb<AgeQueryStore> {
         @Override
         protected LdbcShortQuery4MessageContentResult toResult(ResultSet row) throws SQLException {
             return new LdbcShortQuery4MessageContentResult(
-                    AgeConverter.toStr(row.getObject(1)),
-                    AgeConverter.toLong(row.getObject(2))
+                    AgeConverter.toStr(row.getObject(2)),
+                    AgeConverter.toLong(row.getObject(1))
             );
         }
     }

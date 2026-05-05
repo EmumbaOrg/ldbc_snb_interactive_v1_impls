@@ -11,8 +11,11 @@ FROM (
     $$) AS (friendId agtype, forumId agtype, forumTitle agtype, postCount agtype)
     UNION ALL
     SELECT * FROM cypher('$graphName', $$
-      MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(friend:Person)<-[member:HAS_MEMBER]-(forum:Forum)
-      WHERE member.joinDate > $minDate AND friend.id <> $personId
+      MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(friend:Person)
+      WHERE friend.id <> $personId
+      WITH DISTINCT friend
+      MATCH (friend)<-[member:HAS_MEMBER]-(forum:Forum)
+      WHERE member.joinDate > $minDate
       OPTIONAL MATCH (friend)<-[:HAS_CREATOR]-(post:Post)<-[:CONTAINER_OF]-(forum)
       RETURN friend.id, forum.id, forum.title, count(post)
     $$) AS (friendId agtype, forumId agtype, forumTitle agtype, postCount agtype)
