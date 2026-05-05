@@ -129,8 +129,11 @@ plus an `agefreighter_config.json` that drives the load. Key transformations app
 > literals (`MATCH (p:Person {id: 933})`), and integer `933 ≠` string `"933"` in agtype
 > containment, so every MATCH returns 0 rows. `scripts/load-production-data.py` uses the same
 > PostgreSQL COPY protocol but applies two correctness-critical transformations:
-> 1. Numeric columns (`id`, `creationDate`, `birthday`, `length`, `classYear`, `workFrom`,
->    `joinDate`) are stored as agtype integers, not quoted strings.
+> 1. The three columns whose Cypher comparisons have no cast wrapper — `id`, `creationDate`,
+>    `joinDate` — are stored as agtype integers, not quoted strings. (Other numeric-looking
+>    columns like `birthday`, `length`, `classYear`, `workFrom` stay as strings: every query
+>    that compares them already wraps with `toInteger()` / `::bigint`. See
+>    [`agefreighter-plan.md`](./agefreighter-plan.md) §2.1 for the derivation.)
 > 2. Empty-string fields are **omitted** rather than stored as `""`. Image posts have empty
 >    `content` and `language`; text posts have empty `imageFile`. Keeping these as `""` makes
 >    `coalesce(p.content, p.imageFile)` return `""` for image posts (since `""` is non-null in
@@ -190,6 +193,13 @@ bash scripts/restore-database.sh
 
 The restore script handles the AGE-specific OID mismatch that occurs when `pg_restore` creates a
 new schema OID — it patches `ag_catalog.ag_graph` and `ag_catalog.ag_label` to match.
+
+> **You MUST restore before every validation re-run.** `validate_database` mode replays
+> Update operations against the live DB, so a second run on top of the first creates duplicate
+> Comments (`Update7AddComment`), duplicate forum memberships (`Update5`), duplicate KNOWS
+> edges (`Update8`), etc. Symptoms include subset queries returning the same row twice
+> (e.g., IS2 returning the same `messageId` at positions 0 and 1) and 2-hop friend traversals
+> finding extra paths. Always: `restore-database.sh` → run validation → if re-running, restore again.
 
 ## Validation
 

@@ -33,10 +33,24 @@ GRAPH = "ldbc_snb"
 COPY_BATCH = 50_000          # rows per COPY flush (keeps memory bounded)
 ENTRY_ID_BITS = 48            # graphid = (ag_label.id << 48) | entry_sequence
 
-# Properties that must be stored as agtype integers (not strings).
+# Properties that MUST be stored as agtype integers (not strings).
+#
+# AGE's cross-type Cypher comparisons sort by *type* before value:
+# `agtype_string < agtype_int` always returns true regardless of numeric value.
+# So a property compared with raw `<` / `>` against a Long param must be int.
+#
+# Minimal set — only the props that LDBC interactive queries compare without
+# a `toInteger()` / `::bigint` wrapper:
+#   - id          : MATCH (n {id: 933})            (every query)
+#   - creationDate: WHERE c.creationDate < $maxDate (IC2/3/4/9), arithmetic in IC7
+#   - joinDate    : WHERE m.joinDate > $minDate     (IC5)
+#
+# Other numeric-looking props (birthday, length, classYear, workFrom) are kept
+# as strings: the queries that touch them either cast explicitly
+# (IC10: `birthday::text::bigint`, IC11: `toInteger(work.workFrom)`) or never
+# compare them, so storing as int gives no correctness benefit.
 NUMERIC_PROPS = frozenset({
-    "id", "birthday", "creationDate", "length",
-    "classYear", "workFrom", "joinDate",
+    "id", "creationDate", "joinDate",
 })
 
 VERTEX_LABELS = [

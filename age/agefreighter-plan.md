@@ -70,7 +70,7 @@ PGPASSWORD=postgres psql -h localhost -U postgres -d postgres \
 | C1 | All numeric LDBC properties must be stored as agtype integers, not strings. | LDBC interactive queries use bare-integer MATCH literals; AGE `@>` is type-strict. |
 | C2 | Empty-string fields must be **omitted** from properties (not stored as `""`). | LDBC `coalesce(content, imageFile)` for image posts must return imageFile. Storing `""` makes coalesce return `""` because empty string is non-null in Cypher. |
 | C3 | KNOWS edges must be loaded bidirectionally (both `a→b` and `b→a`). | Our queries use directed `(p)-[:KNOWS]->(friend)` and `(p)-[:KNOWS]->(:Person)-[:KNOWS]->(friend)`; this only matches Neo4j undirected `[:KNOWS]-` if both directions exist. |
-| C4 | Property numeric set: `id`, `birthday`, `creationDate`, `length`, `classYear`, `workFrom`, `joinDate`. JSON columns: `email`, `speaks` (Person). | Established in `scripts/load-production-data.py` `NUMERIC_PROPS`. |
+| C4 | Property numeric set (minimal): `id`, `creationDate`, `joinDate`. JSON columns: `email`, `speaks` (Person). See §2.1 for derivation. | Established in `scripts/load-production-data.py` `NUMERIC_PROPS`. |
 | C5 | The loader must scale to SF1000 (≈3B properties, ≈10B edges). | Customer requirement; `load-production-data.py` is single-threaded and will not finish in a reasonable time. |
 | C6 | Must be reproducible against the `agefreighter_config.json` already produced by `~/repositories/GraphBenchmarking/ldbc_snb_benchmark/preprocess_ldbc.py`. | That preprocessor is the source of truth for all SF{N}; it produces both the converted CSVs and the agefreighter config. |
 
@@ -79,6 +79,24 @@ PGPASSWORD=postgres psql -h localhost -U postgres -d postgres \
 `agefreighter`'s `preprocess_ldbc.py` already handles C3 — the converted KNOWS.csv has 28,146 rows for SF0.1 (= 14,073 friendships × 2). Good.
 
 So **the only constraint agefreighter currently fails is C1**.
+
+### 2.1 Why the numeric set is just three props (and not seven)
+
+AGE's `@>` containment and Cypher cross-type `< > =` are **type-strict**: comparing an agtype string against an agtype integer either fails to match (containment) or sorts by *type* before *value* (e.g., `'1500' < 1000` returns `true` because string sorts before integer in agtype's type order). So a property only needs integer storage if a query compares it to a Long param **without a casting wrapper**.
+
+| Property | Used as integer? | Where | Verdict |
+|---|---|---|---|
+| `id` | Yes | `MATCH (n {id: $personId})` everywhere — bare-int containment match | **MUST** |
+| `creationDate` | Yes | `WHERE c.creationDate < $maxDate` (IC2/3/4/9), `likeTime - msg.creationDate` arithmetic (IC7) | **MUST** |
+| `joinDate` | Yes | `WHERE m.joinDate > $minDate` (IC5) | **MUST** |
+| `birthday` | No | IC10 only: `EXTRACT(... FROM TO_TIMESTAMP(birthday::text::bigint / 1000.0) ...)` — explicit cast | string is fine |
+| `length` | No | Never appears in WHERE / ORDER BY / arithmetic | string is fine |
+| `classYear` | No | Only embedded in result arrays in IC1; never compared | string is fine |
+| `workFrom` | No | IC11: `WHERE toInteger(work.workFrom) < $workFromYear` — explicit cast | string is fine |
+
+Marking the optional four as int would give no correctness benefit and a tiny performance benefit (saves a per-row cast). The trade-off is broader churn in `format_kv`: the loader must list more keys, and a future schema change (e.g., new numeric prop) is one more thing to remember. Keep it minimal.
+
+`scripts/load-production-data.py` was updated 2026-05-05 to use this minimal set; the older 7-prop set is harmless functionally (queries still work) but over-asserts.
 
 ---
 
@@ -134,11 +152,10 @@ Run `agefreighter` as-is (everything quoted), then `UPDATE` every label table to
 
 ### 4.3 Constants the wrapper must expose
 
-Pull these from `scripts/load-production-data.py` lines 37–40:
+Per §2.1, only three props need integer typing for correctness:
 ```python
 NUMERIC_PROPS = frozenset({
-    "id", "birthday", "creationDate", "length",
-    "classYear", "workFrom", "joinDate",
+    "id", "creationDate", "joinDate",
 })
 ```
 
@@ -147,6 +164,8 @@ Compound (JSON) properties — these must be passed through as agtype literals, 
 COMPOUND_PROPS = frozenset({"email", "speaks"})
 ```
 (Detection: source value starts with `[` or `{` after `.strip()`.)
+
+If you find yourself wanting to add more keys to `NUMERIC_PROPS`, first verify the new key actually appears in a Cypher comparison without a `toInteger()` / `::bigint` wrapper. Otherwise leaving it as a string is correct and avoids over-asserting the schema.
 
 ### 4.4 Skeleton: `scripts/load-with-agefreighter.py`
 
@@ -182,8 +201,7 @@ import aiofiles
 from agefreighter.csvexporter import CSVExporter
 
 NUMERIC_PROPS = frozenset({
-    "id", "birthday", "creationDate", "length",
-    "classYear", "workFrom", "joinDate",
+    "id", "creationDate", "joinDate",
 })
 
 log = logging.getLogger("load-with-agefreighter")
@@ -501,8 +519,7 @@ self.numeric_keys = set(config.get("numeric_props", []))
 In `agefreighter_config.json` (add a top-level field):
 ```json
 {
-  "numeric_props": ["id", "creationDate", "birthday", "length",
-                    "classYear", "workFrom", "joinDate"],
+  "numeric_props": ["id", "creationDate", "joinDate"],
   "edge": [...],
   ...
 }
