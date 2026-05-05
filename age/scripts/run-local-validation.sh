@@ -79,7 +79,7 @@ if [[ ! -f "${SNAPSHOT_FILE}" ]]; then
   echo "       Run with --load first, or run scripts/snapshot-database.sh manually." >&2
   exit 1
 fi
-bash scripts/restore-database.sh
+bash scripts/restore-database.sh "${CONNECTION_STRING}" "${SNAPSHOT_FILE}"
 
 # ---- Step 3: Validate --------------------------------------------------------
 echo ""

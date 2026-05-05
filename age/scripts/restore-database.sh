@@ -1,14 +1,14 @@
 #!/bin/bash
-# Restore database from pg_dump snapshot and run VACUUM ANALYZE
+# Restore database for AGE by reloading test data from scratch.
+# pg_restore doesn't work with AGE-managed tables because:
+# 1. AGE owns the label tables and won't let pg_restore drop them
+# 2. After drop_graph + pg_restore, graph OIDs change breaking existing connections
+#
+# Instead, we simply reload the test data which drops and recreates the graph.
 # Usage: bash restore-database.sh [CONNECTION_STRING] [DUMP_FILE]
 
-CONNECTION_STRING="${1:-postgresql://postgres:postgres@localhost:5432/ldbcsnb}"
-DUMP_FILE="${2:-ldbc_snb_snapshot.dump}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "Restoring database from $DUMP_FILE..."
-pg_restore --clean --if-exists -d "$CONNECTION_STRING" "$DUMP_FILE"
+echo "Restoring database by reloading test data..."
+bash "$SCRIPT_DIR/load-test-data.sh"
 echo "Restore complete."
-
-echo "Running VACUUM ANALYZE..."
-bash "$SCRIPT_DIR/vacuum-analyze.sh" "$CONNECTION_STRING"
