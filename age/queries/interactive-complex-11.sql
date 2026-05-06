@@ -1,4 +1,3 @@
-SET search_path = ag_catalog, public;
 SELECT * FROM (
   SELECT * FROM cypher('$graphName', $$
     MATCH (p:Person {id: $personId})-[:KNOWS]->(friend:Person)-[work:WORK_AT]->(company:Company)-[:IS_LOCATED_IN]->(:Country {name: $countryName})

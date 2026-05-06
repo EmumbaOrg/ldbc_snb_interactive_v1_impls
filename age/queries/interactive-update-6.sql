@@ -1,4 +1,3 @@
-SET search_path = ag_catalog, public;
 SELECT * FROM cypher('$graphName', $$
   MATCH (author:Person {id: $authorPersonId}),
         (country:Country {id: $countryId}),

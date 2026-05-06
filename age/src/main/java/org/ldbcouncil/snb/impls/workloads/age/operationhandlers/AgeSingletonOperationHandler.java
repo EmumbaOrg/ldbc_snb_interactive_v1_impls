@@ -6,13 +6,11 @@ import org.ldbcouncil.snb.driver.ResultReporter;
 import org.ldbcouncil.snb.impls.workloads.age.AgeDbConnectionState;
 import org.ldbcouncil.snb.impls.workloads.operationhandlers.SingletonOperationHandler;
 
+import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 
-/**
- * Base handler for IS operations returning a single result (or null if not found).
- */
 public abstract class AgeSingletonOperationHandler<TOperation extends Operation<TOperationResult>, TOperationResult>
         implements SingletonOperationHandler<TOperationResult, TOperation, AgeDbConnectionState> {
 
@@ -23,17 +21,15 @@ public abstract class AgeSingletonOperationHandler<TOperation extends Operation<
                                  ResultReporter resultReporter) throws DbException {
         String sql = getQueryString(state, operation);
         state.logQuery(operation.getClass().getSimpleName(), sql);
-        try {
+        try (Connection conn = state.getConnection();
+             Statement stmt = conn.createStatement()) {
             TOperationResult result = null;
             int count = 0;
-            synchronized (state.getConnection()) {
-                try (Statement stmt = state.getConnection().createStatement()) {
-                    AgeListOperationHandler.executeTwoPartSql(stmt, sql);
-                    try (ResultSet rs = stmt.getResultSet()) {
-                        if (rs != null && rs.next()) {
-                            count = 1;
-                            result = toResult(rs);
-                        }
+            if (stmt.execute(sql)) {
+                try (ResultSet rs = stmt.getResultSet()) {
+                    if (rs.next()) {
+                        count = 1;
+                        result = toResult(rs);
                     }
                 }
             }

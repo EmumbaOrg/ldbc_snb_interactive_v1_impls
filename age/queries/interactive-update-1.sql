@@ -1,4 +1,3 @@
-SET search_path = ag_catalog, public;
 SELECT * FROM cypher('$graphName', $$
   MATCH (city:City {id: $cityId})
   CREATE (p:Person {

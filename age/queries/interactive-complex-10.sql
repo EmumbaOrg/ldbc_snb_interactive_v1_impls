@@ -1,4 +1,3 @@
-SET search_path = ag_catalog, public;
 SELECT personId, personFirstName, personLastName, commonInterestScore, personGender, personCityName
 FROM (
   SELECT * FROM cypher('$graphName', $$

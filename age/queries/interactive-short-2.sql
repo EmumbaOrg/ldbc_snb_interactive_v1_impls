@@ -1,4 +1,3 @@
-SET search_path = ag_catalog, public;
 SELECT * FROM (
   SELECT * FROM cypher('$graphName', $$
     MATCH (p:Person {id: $personId})<-[:HAS_CREATOR]-(msg:Comment)

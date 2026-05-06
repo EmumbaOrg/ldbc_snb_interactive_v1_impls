@@ -1,4 +1,3 @@
-SET search_path = ag_catalog, public;
 SELECT personId, personFirstName, personLastName, likeCreationDate, commentOrPostId,
        commentOrPostContent, minutesLatency, isNew
 FROM (

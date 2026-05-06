@@ -1,4 +1,3 @@
-SET search_path = ag_catalog, public;
 SELECT forumId, forumTitle, moderatorId, moderatorFirstName, moderatorLastName
 FROM (
   SELECT 1 AS src, * FROM cypher('$graphName', $$

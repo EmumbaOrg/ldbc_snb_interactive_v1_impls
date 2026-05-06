@@ -1,4 +1,3 @@
-SET search_path = ag_catalog, public;
 SELECT tagName, SUM(postCount::text::bigint)::bigint AS postCount FROM (
   SELECT * FROM cypher('$graphName', $$
     MATCH (p:Person {id: $personId})-[:KNOWS]->(friend:Person)<-[:HAS_CREATOR]-(post:Post)-[:HAS_TAG]->(tag:Tag)

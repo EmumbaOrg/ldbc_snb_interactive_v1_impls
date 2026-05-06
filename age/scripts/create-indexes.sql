@@ -85,3 +85,46 @@ CREATE INDEX IF NOT EXISTS idx_hasmoderator_start ON ldbc_snb."HAS_MODERATOR"  (
 CREATE INDEX IF NOT EXISTS idx_hasmoderator_end   ON ldbc_snb."HAS_MODERATOR"  (end_id);
 CREATE INDEX IF NOT EXISTS idx_ispartof_start     ON ldbc_snb."IS_PART_OF"     (start_id);
 CREATE INDEX IF NOT EXISTS idx_ispartof_end       ON ldbc_snb."IS_PART_OF"     (end_id);
+
+-- ---------------------------------------------------------------------------
+-- Phase C additions — vertex.id functional B-tree indexes
+-- The existing GIN-on-properties index supports MATCH ({id: X}) containment.
+-- However, for queries that PROJECT n.id from a previously-bound vertex set
+-- (e.g. RETURN friend.id ORDER BY friend.id), the planner cannot reuse the GIN
+-- and falls back to a parallel sort over the entire vertex table. A functional
+-- B-tree on the extracted id column lets the planner satisfy ORDER BY friend.id
+-- without a sort node and provides faster equality lookup than GIN containment
+-- for the hot single-id MATCH path.
+-- ---------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_person_id   ON ldbc_snb."Person"   (CAST(agtype_object_field_text(properties, 'id') AS bigint));
+CREATE INDEX IF NOT EXISTS idx_comment_id  ON ldbc_snb."Comment"  (CAST(agtype_object_field_text(properties, 'id') AS bigint));
+CREATE INDEX IF NOT EXISTS idx_post_id     ON ldbc_snb."Post"     (CAST(agtype_object_field_text(properties, 'id') AS bigint));
+CREATE INDEX IF NOT EXISTS idx_forum_id    ON ldbc_snb."Forum"    (CAST(agtype_object_field_text(properties, 'id') AS bigint));
+CREATE INDEX IF NOT EXISTS idx_tag_id      ON ldbc_snb."Tag"      (CAST(agtype_object_field_text(properties, 'id') AS bigint));
+CREATE INDEX IF NOT EXISTS idx_tagclass_id ON ldbc_snb."TagClass" (CAST(agtype_object_field_text(properties, 'id') AS bigint));
+CREATE INDEX IF NOT EXISTS idx_city_id     ON ldbc_snb."City"     (CAST(agtype_object_field_text(properties, 'id') AS bigint));
+CREATE INDEX IF NOT EXISTS idx_country_id  ON ldbc_snb."Country"  (CAST(agtype_object_field_text(properties, 'id') AS bigint));
+
+-- ---------------------------------------------------------------------------
+-- Phase C additions — Person.firstName (IC1)
+-- IC1 filters friend.firstName = $firstName across 1, 2, and 3-hop KNOWS paths.
+-- The existing GIN supports {firstName: X} but only at the *original* MATCH —
+-- once Person is bound transitively, the projection-side filter becomes a
+-- per-row containment check.
+-- ---------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_person_firstname ON ldbc_snb."Person" (agtype_object_field_text(properties, 'firstName'));
+
+-- ---------------------------------------------------------------------------
+-- Phase C additions — Message.creationDate composite covering index
+-- IC2 ("recent messages by friends") and IC9 ("recent messages by friends-of-friends")
+-- both filter messages by creationDate < maxDate and ORDER BY creationDate DESC.
+-- A composite (creationDate, id) on the union of Comment+Post would let the planner
+-- index-scan in date-desc order. AGE's per-label storage prevents a true union index;
+-- the next-best is a per-label composite that includes id as a covering column.
+-- ---------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_comment_date_id ON ldbc_snb."Comment"
+  (CAST(agtype_object_field_text(properties, 'creationDate') AS bigint) DESC,
+   CAST(agtype_object_field_text(properties, 'id') AS bigint));
+CREATE INDEX IF NOT EXISTS idx_post_date_id    ON ldbc_snb."Post"
+  (CAST(agtype_object_field_text(properties, 'creationDate') AS bigint) DESC,
+   CAST(agtype_object_field_text(properties, 'id') AS bigint));

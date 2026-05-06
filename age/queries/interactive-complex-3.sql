@@ -1,4 +1,3 @@
-SET search_path = ag_catalog, public;
 SELECT friendId, friendFirstName, friendLastName,
        SUM(CASE WHEN countryName::text = $countryXName THEN 1 ELSE 0 END)::int AS xCount,
        SUM(CASE WHEN countryName::text = $countryYName THEN 1 ELSE 0 END)::int AS yCount,

@@ -1,4 +1,3 @@
-SET search_path = ag_catalog, public;
 SELECT friendId, friendLastName, distance, friendBirthday, friendCreationDate,
        friendGender, friendBrowserUsed, friendLocationIp, friendEmails, friendLanguages,
        friendCityName, friendUniversities, friendCompanies

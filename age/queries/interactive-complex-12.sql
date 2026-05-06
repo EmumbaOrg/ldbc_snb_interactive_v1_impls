@@ -1,4 +1,3 @@
-SET search_path = ag_catalog, public;
 SELECT * FROM cypher('$graphName', $$
   MATCH (base:TagClass {name: $tagClassName})
   MATCH (p:Person {id: $personId})-[:KNOWS]->(friend:Person)

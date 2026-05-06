@@ -1,4 +1,3 @@
-SET search_path = ag_catalog, public;
 SELECT * FROM cypher('$graphName', $$
   MATCH (mod:Person {id: $moderatorPersonId})
   CREATE (f:Forum {id: $forumId, title: $forumTitle, creationDate: $creationDate})-[:HAS_MODERATOR]->(mod)
