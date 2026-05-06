@@ -59,6 +59,22 @@ public class AgeQueryStore extends QueryStore {
         return super.prepare(queryType, params);
     }
 
+    /**
+     * Returns a PreparedStatement-ready SQL template for the given query type.
+     * Only $graphName is substituted; Cypher $paramName references stay intact.
+     * Each cypher() call gets a third argument added: $$, ?::agtype).
+     * Returns null if no SQL file exists for the query type.
+     */
+    public String prepareTemplate(QueryType queryType) {
+        String sql = getParameterizedQuery(queryType);
+        if (sql == null) return null;
+        sql = sql.replace("$graphName", graphName);
+        // Insert agtype param before ) that closes each cypher() dollar-quoted body.
+        // AGE requires a bare $N Param node — no ::agtype cast, pgjdbc setString() coerces to agtype.
+        sql = sql.replace("$$)", "$$, ?)");
+        return sql;
+    }
+
     // -------------------------------------------------------------------------
     // IC queries — override to provide epoch-ms dates and computed endDate
     // -------------------------------------------------------------------------

@@ -8,7 +8,11 @@ import org.ldbcouncil.snb.impls.workloads.BaseDbConnectionState;
 import java.io.IOException;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Holds a HikariCP pool of JDBC connections to Apache AGE (PostgreSQL with the
@@ -25,6 +29,7 @@ public class AgeDbConnectionState extends BaseDbConnectionState<AgeQueryStore> {
     private final boolean printQueryNames;
     private final boolean printQueryStrings;
     private final boolean printQueryResults;
+    private final Set<String> parameterizedQueryTypes;
 
     public AgeDbConnectionState(Map<String, String> properties, AgeQueryStore queryStore)
             throws DbException {
@@ -38,6 +43,11 @@ public class AgeDbConnectionState extends BaseDbConnectionState<AgeQueryStore> {
         printQueryStrings = Boolean.parseBoolean(properties.getOrDefault("printQueryStrings", "false"));
         printQueryResults = Boolean.parseBoolean(properties.getOrDefault("printQueryResults", "false"));
 
+        String csv = properties.getOrDefault("age_parameterized_queries", "");
+        this.parameterizedQueryTypes = csv.isEmpty()
+            ? Collections.emptySet()
+            : new HashSet<>(Arrays.asList(csv.split("\\s*,\\s*")));
+
         // Pool size matches thread_count so each worker gets its own connection.
         int threadCount = Integer.parseInt(properties.getOrDefault("thread_count", "1"));
 
@@ -46,7 +56,10 @@ public class AgeDbConnectionState extends BaseDbConnectionState<AgeQueryStore> {
         // jit=off: JIT compilation costs 50-500ms per query for our OLTP workload
         // (each unique SQL string triggers a cold JIT compile; savings never recoup cost).
         String jdbcUrl = "jdbc:postgresql://" + endpoint
-                + "?options=-c%20search_path%3Dag_catalog%2Cpublic%20-c%20jit%3Doff";
+                + "?options=-c%20search_path%3Dag_catalog%2Cpublic%20-c%20jit%3Doff"
+                + "&prepareThreshold=1"
+                + "&preparedStatementCacheQueries=64"
+                + "&preparedStatementCacheSizeMiB=10";
 
         HikariConfig config = new HikariConfig();
         config.setJdbcUrl(jdbcUrl);
@@ -85,6 +98,14 @@ public class AgeDbConnectionState extends BaseDbConnectionState<AgeQueryStore> {
     public void logQuery(String operationName, String queryString) {
         if (printQueryNames) System.out.println("[AGE] " + operationName);
         if (printQueryStrings) System.out.println("[AGE] " + queryString);
+    }
+
+    public boolean isParameterized(String operationSimpleName) {
+        // operationSimpleName is e.g. "LdbcQuery1"; the property uses "Query1".
+        String stripped = operationSimpleName.startsWith("Ldbc")
+            ? operationSimpleName.substring(4)
+            : operationSimpleName;
+        return parameterizedQueryTypes.contains(stripped);
     }
 
     @Override
