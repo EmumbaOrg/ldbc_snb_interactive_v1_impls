@@ -45,4 +45,5 @@ psql "$CONNECTION_STRING" -f "$(dirname "$0")/create-indexes.sql" 2>&1 | grep -v
 
 echo "Running VACUUM ANALYZE after restore..."
 bash "$(dirname "$0")/vacuum-analyze.sh"
+
 echo "Restore complete."
