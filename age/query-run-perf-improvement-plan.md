@@ -976,3 +976,347 @@ If review fails, the implementing agent fixes and re-tests before re-handoff.
 - Does not change agefreighter loading, the AGE OID-fixup logic, the snapshot/restore scripts, or any non-AGE module under `/Users/waleed/repositories/ldbc_snb_interactive_v1_impls/`.
 - Does not change `driver/validate.properties` defaults beyond appending `age_parameterized_queries`. thread_count and validate_database stay at committed defaults; perf-test overrides go into a separate file or are applied transiently.
 - Does not touch `agefreighter-plan.md` or `perf-improvement-plan.md`. Those describe earlier phases and are historical record.
+
+---
+
+## 11. IC3 finding — full-Cypher rewrite REGRESSES; keep legacy path
+
+### 11.1 What was tried
+
+After Phases C+D+E completed, IC3 was left on the legacy text-substitution path because it uses `$countryXName` and `$countryYName` in OUTER PostgreSQL SQL (in the `SUM(CASE WHEN ...)` and `HAVING` clauses), not just inside the Cypher dollar-quoted body. A "full Cypher rewrite" was investigated as an alternative to the hybrid PG-bind-param approach.
+
+The candidate rewrite collapsed the four `cypher()` UNIONs into one:
+
+```cypher
+MATCH (p:Person {id: $personId})-[:KNOWS*1..2]->(friend:Person)
+WHERE friend.id <> $personId
+WITH DISTINCT friend
+MATCH (friend)<-[:HAS_CREATOR]-(msg)-[:IS_LOCATED_IN]->(country:Country),
+      (friend)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(fCountry:Country)
+WHERE (label(msg) = 'Comment' OR label(msg) = 'Post')
+  AND msg.creationDate >= $startDate AND msg.creationDate < $endDate
+  AND country.name IN [$countryXName, $countryYName]
+  AND fCountry.name <> $countryXName AND fCountry.name <> $countryYName
+WITH friend, country.name AS countryName
+WITH friend,
+     sum(CASE WHEN countryName = $countryXName THEN 1 ELSE 0 END) AS xCount,
+     sum(CASE WHEN countryName = $countryYName THEN 1 ELSE 0 END) AS yCount
+WHERE xCount > 0 AND yCount > 0
+WITH friend, xCount, yCount, xCount + yCount AS xyCount
+RETURN friend.id, friend.firstName, friend.lastName, xCount, yCount, xyCount
+ORDER BY xyCount DESC, friend.id ASC
+LIMIT 20
+```
+
+### 11.2 Measurements (verified 2026-05-06, SF0.1, person 933)
+
+| Variant | Wall clock for one call | Status |
+|---|---:|---|
+| Legacy 4-UNION + SQL aggregation (current) | mean 1,338 ms / p50 988 ms (full benchmark, 86 calls) | baseline |
+| Full-Cypher with `[:KNOWS*1..2]`, 35-day window | 3,476 ms | **2.6× slower than baseline** |
+| Full-Cypher with explicit `UNION` of 1-hop + 2-hop returning full friend nodes | hung > 30 s, cancelled | **infeasible** |
+| Friend discovery alone via `[:KNOWS*1..2]` + WITH DISTINCT (no message join) | 317 ms (174 distinct friends) | fast in isolation |
+| Friend + message + country join, no aggregation, 7-day window | 317 ms (0 rows) | fast at small scope |
+
+### 11.3 Why AGE Cypher loses here
+
+1. **Variable-length-path planner does no predicate pushdown**: `[:KNOWS*1..2]` enumerates all matching paths first, then joins with the message+country pattern. The legacy 4-UNION lets the PostgreSQL planner push the `creationDate` range, country IN-list, and `fCountry <>` predicates into each cypher() branch, picking different join orders for 1-hop vs 2-hop and for Comment vs Post.
+2. **`UNION` returning node objects materialises whole payloads inefficiently**: `UNION` over scalar IDs works (76 ms for 174 friends), but `RETURN friend` under UNION hangs. We could return IDs and re-MATCH, but that doubles the index lookups.
+3. **`ORDER BY` cannot reference `RETURN` aliases**: `ORDER BY xyCount` errors with `could not find rte for xyCount` unless `xyCount` is bound in a preceding `WITH`. Workable, but means another WITH stage that AGE must evaluate.
+4. **No `(msg:Comment|Post)` label disjunction**: must use `label(msg) = 'Comment' OR label(msg) = 'Post'`, which forces a sequential scan of all message vertices joined to friend rather than separate per-label index scans.
+
+### 11.4 Recommendation
+
+**Keep IC3 on the legacy path.** Do not attempt a full-Cypher rewrite. If future optimization is desired, use the hybrid approach: keep the 4-UNION shape, but use PostgreSQL JDBC bind parameters (`?`) for the outer-SQL references to `$countryXName` / `$countryYName`, paired with the existing agtype-JSON binding for each `cypher()` body's third argument. Expected gain ~30% (1,338 ms → ~900-1,000 ms) from cypher() plan caching plus PostgreSQL prepared-statement caching for the outer SQL. Do not undertake before a measured need.
+
+### 11.5 What NOT to try again
+
+- `[:KNOWS*1..2]` with multi-pattern joins inside a single `cypher()` call.
+- `UNION` returning full node objects for further processing.
+- Replacing `:Comment`/`:Post` separate matches with `label(msg) IN [...]` filters in the WHERE.
+
+---
+
+## 12. Phase F — IC10 full Cypher rewrite (precompute birthMonth/birthDay)
+
+**Audience**: an AI agent (Sonnet 4.6) tasked with implementing IC10's full parameterization in one pass. Read this entire section before writing any code. The prerequisite Phases C+D+E are already merged.
+
+**Working directory**: `/Users/waleed/repositories/ldbc_snb_interactive_v1_impls/age`.
+
+**Out of scope**:
+- IC3 — see §11; do not rewrite.
+- Any other query — Phase F is IC10-only.
+- The agefreighter loader — only `scripts/load-production-data.py` is in scope, plus a one-shot backfill SQL.
+
+### 12.1 Why this matters
+
+IC10 measured 3,422 ms mean / 3,363 ms p50 / 5,892 ms p99 in the SF0.1 benchmark — by far the slowest query type and the only IC with a tight distribution (min 1,803 ms — every call is slow, no cache benefit). The cause is twofold:
+
+1. The query carries `$month` in OUTER SQL (the EXTRACT predicate), so it stayed on the legacy text-substitution path during Phase E. Every call re-bakes the SQL string, defeating cypher() plan caching.
+2. The outer `EXTRACT(MONTH FROM TO_TIMESTAMP(birthday::text::bigint / 1000.0) AT TIME ZONE 'UTC')` is computed per candidate row.
+
+Moving the predicate into Cypher requires `birthMonth` and `birthDay` to exist as integer properties on Person — AGE Cypher has no datetime types, no `datetime()`, no `EXTRACT`, no calls into PostgreSQL functions from inside a Cypher block (verified 2026-05-06).
+
+Once the precompute exists, the whole query becomes a single parameterizable `cypher()` call and IC10 joins the Phase E plan-cached path. Expected result: 3,422 ms → ~1,500 ms (cypher() reparse cost is the dominant component; the EXTRACT cost is small relative to it).
+
+### 12.2 Deliverables
+
+- `scripts/load-production-data.py` modified to compute and store `birthMonth` and `birthDay` (UTC) on every Person at load time.
+- A new one-shot script `scripts/backfill-person-birth-month-day.sql` that populates the two fields on the existing graph WITHOUT a full reload. The loaded graph is large; a reload would take hours.
+- `queries/interactive-complex-10.sql` rewritten as a single parameterizable `cypher()` call using `friend.birthMonth` / `friend.birthDay` literals.
+- `AgeQueryStore.getQuery10Map` left untouched (still used by the legacy path; this stays as a fallback). New parameterization is wired through the existing `prepareTemplate()` + `getQueryParameterMap()` overrides on the `InteractiveQuery10` handler in `AgeDb.java`.
+- `Query10` added to `age_parameterized_queries` in `driver/validate.properties` AND `driver/benchmark.properties`.
+- `validate.properties` comment that previously said "IC3 and IC10 excluded" updated to say "IC3 only; IC10 migrated in Phase F".
+
+### 12.3 Implementation order
+
+Do NOT reorder. Steps 1-3 must precede steps 4-7 (the query depends on the new properties existing).
+
+```
+1. Modify load-production-data.py (§12.4)
+2. Write backfill-person-birth-month-day.sql (§12.5)
+3. Run the backfill against the live local DB; verify with EXPLAIN (§12.6)
+4. Rewrite interactive-complex-10.sql (§12.7)
+5. Update InteractiveQuery10 handler in AgeDb.java (§12.8)
+6. Update properties files (§12.9)
+7. Build + run 2K-subset validation (§12.10)
+```
+
+### 12.4 Loader change — `scripts/load-production-data.py`
+
+Add `birthMonth` and `birthDay` to `NUMERIC_PROPS` so they're stored as agtype integers:
+
+```python
+NUMERIC_PROPS = frozenset({
+    "id", "creationDate", "joinDate",
+    "birthMonth", "birthDay",
+})
+```
+
+In `load_vertex_csv` (or in `build_agtype_props` for Person rows), inject the computed fields BEFORE `build_agtype_props` is called for each row. Smallest-diff approach: add a per-label hook keyed on `label == "Person"`:
+
+```python
+if label == "Person":
+    bday_str = row.get("birthday", "")
+    if bday_str:
+        try:
+            ts = int(bday_str)
+            from datetime import datetime, timezone
+            dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
+            row["birthMonth"] = str(dt.month)
+            row["birthDay"]   = str(dt.day)
+        except (ValueError, OverflowError):
+            pass
+```
+
+`row` is a `dict` from `csv.DictReader` — mutating it before `build_agtype_props(row.items())` is sufficient. The added keys are picked up by the existing iteration in `build_agtype_props`. Because `birthMonth` and `birthDay` are in `NUMERIC_PROPS`, `agtype_value()` emits them as bare integer literals (`5`, `21`), not quoted strings.
+
+This keeps the loader idempotent for fresh loads. Existing loaded data is NOT updated — the backfill script in §12.5 handles that.
+
+### 12.5 Backfill script — `scripts/backfill-person-birth-month-day.sql`
+
+Goal: compute `birthMonth` and `birthDay` for every existing Person row without re-loading. PostgreSQL's `to_timestamp` + `EXTRACT` give us month and day directly from the epoch-ms `birthday` value. We then merge these into the agtype `properties` column via JSONB round-trip (agtype's text format is a strict superset of JSON for the types we use).
+
+```sql
+-- Run via:
+--   psql "postgresql://postgres:postgres@localhost:5432/postgres" \
+--     -f scripts/backfill-person-birth-month-day.sql
+--
+-- Idempotent: skips rows where birthMonth is already set.
+-- Single UPDATE on ldbc_snb."Person" — completes in seconds at SF0.1.
+
+LOAD 'age';
+SET search_path = ag_catalog, ldbc_snb, public;
+
+BEGIN;
+
+UPDATE ldbc_snb."Person"
+SET properties = (
+    (properties::text)::jsonb
+    || jsonb_build_object(
+        'birthMonth',
+            EXTRACT(MONTH FROM
+              to_timestamp(
+                (agtype_object_field_text(properties, 'birthday'))::bigint / 1000.0
+              ) AT TIME ZONE 'UTC'
+            )::int,
+        'birthDay',
+            EXTRACT(DAY FROM
+              to_timestamp(
+                (agtype_object_field_text(properties, 'birthday'))::bigint / 1000.0
+              ) AT TIME ZONE 'UTC'
+            )::int
+    )
+)::text::agtype
+WHERE agtype_object_field_text(properties, 'birthday') IS NOT NULL
+  AND agtype_object_field_text(properties, 'birthMonth') IS NULL;
+
+COMMIT;
+
+-- Verify: spot-check a known row.
+SELECT * FROM cypher('ldbc_snb', $$
+  MATCH (p:Person {id: 933})
+  RETURN p.birthday, p.birthMonth, p.birthDay
+$$) AS (bd agtype, bm agtype, bday agtype);
+-- Expected for id=933: birthday=628646400000 → birthMonth=12, birthDay=2
+-- (1989-12-02 UTC)
+```
+
+If the JSONB round-trip path errors on a particular AGE build (the `agtype` ↔ `jsonb` conversion is well-supported in 1.5+, but verify), the fallback is a Python script that issues per-Person `MATCH ... SET ...` cypher() statements in batches. Add only if the SQL path fails. Do not write the Python fallback speculatively.
+
+### 12.6 Apply backfill and verify indexes
+
+```bash
+psql "postgresql://postgres:postgres@localhost:5432/postgres" \
+  -f /Users/waleed/repositories/ldbc_snb_interactive_v1_impls/age/scripts/backfill-person-birth-month-day.sql
+```
+
+The existing GIN index on `properties` already supports `MATCH (friend:Person {birthMonth: $month})` containment lookups, so no new index is required for IC10 — but IC10 doesn't use that pattern (it filters post-traversal, not at the initial MATCH). At SF0.1 with at most a few hundred candidate friends, no targeted index is needed. Document this decision in a comment at the top of the new SQL file:
+
+```sql
+-- No B-tree on birthMonth/birthDay needed: IC10 filters them post-MATCH,
+-- against a small candidate set (<200 at SF0.1, <2000 at SF1).
+```
+
+Run `VACUUM ANALYZE ldbc_snb."Person"` after the backfill so the planner sees correct stats.
+
+### 12.7 Rewrite — `queries/interactive-complex-10.sql`
+
+Replace the entire file with:
+
+```sql
+SELECT * FROM cypher('$graphName', $$
+  MATCH (p:Person {id: $personId})-[:KNOWS]->()-[:KNOWS]->(friend:Person)
+  WHERE friend.id <> $personId
+  OPTIONAL MATCH (p)-[direct:KNOWS]->(friend)
+  WITH p, friend, direct
+  WHERE direct IS NULL
+    AND ((friend.birthMonth = $month AND friend.birthDay >= 21)
+      OR (friend.birthMonth = ($month % 12) + 1 AND friend.birthDay < 22))
+  WITH DISTINCT p, friend
+  MATCH (friend)-[:IS_LOCATED_IN]->(city:City)
+  OPTIONAL MATCH (friend)<-[:HAS_CREATOR]-(post:Post)
+  WITH p, friend, city, count(DISTINCT post) AS postCount
+  OPTIONAL MATCH (friend)<-[:HAS_CREATOR]-(commonPost:Post)-[:HAS_TAG]->(:Tag)<-[:HAS_INTEREST]-(p)
+  WITH friend, city, postCount, count(DISTINCT commonPost) AS commonPostCount
+  WITH friend, city, commonPostCount - (postCount - commonPostCount) AS commonInterestScore
+  RETURN friend.id, friend.firstName, friend.lastName,
+         commonInterestScore, friend.gender, city.name
+  ORDER BY commonInterestScore DESC, friend.id ASC
+  LIMIT 10
+$$) AS (personId agtype, personFirstName agtype, personLastName agtype,
+        commonInterestScore agtype, personGender agtype, personCityName agtype);
+```
+
+Notes for the implementer:
+- **The birthday window check moves up** to the friend-discovery WITH stage, before any post traversal. This is a deliberate optimisation: filtering candidates early reduces the cardinality of the OPTIONAL MATCHes that follow, which are the dominant cost.
+- **`ORDER BY` references the WITH-bound `commonInterestScore` and `friend.id`**, not RETURN aliases. AGE Cypher's ORDER BY cannot resolve RETURN aliases (verified §11.3).
+- **Do NOT change the result ordering or LIMIT** — the LDBC validator compares row-by-row.
+- The `prepareTemplate()` machinery already handles `$graphName` substitution and appends `, ?` to the cypher() argument list. No edits to `AgeQueryStore.prepareTemplate()` needed.
+
+### 12.8 Handler change — `AgeDb.java`
+
+Locate the existing `InteractiveQuery10` static inner class (around line 324). Add the two missing overrides exactly as `InteractiveQuery11` already has them (around line 354), and remove the comment that says IC10 is legacy-only. The `getQueryString` method stays as a fallback for the case where someone removes Query10 from `age_parameterized_queries`.
+
+```java
+public static class InteractiveQuery10
+        extends AgeListOperationHandler<LdbcQuery10, LdbcQuery10Result> {
+
+    @Override
+    public String getQueryString(AgeDbConnectionState state, LdbcQuery10 operation) {
+        return state.getQueryStore().getQuery10(operation);
+    }
+
+    @Override
+    protected String getQueryTemplate(AgeDbConnectionState state, LdbcQuery10 operation) {
+        return state.getQueryStore().prepareTemplate(QueryType.InteractiveComplexQuery10);
+    }
+
+    @Override
+    protected Map<String, Object> getQueryParameterMap(AgeDbConnectionState state, LdbcQuery10 operation) {
+        Map<String, Object> m = new HashMap<>();
+        m.put("personId", operation.getPersonIdQ10());
+        m.put("month",    (long) operation.getMonth());
+        return m;
+    }
+
+    @Override
+    protected LdbcQuery10Result toResult(ResultSet row) throws SQLException {
+        return new LdbcQuery10Result(
+                AgeConverter.toLong(row.getObject(1)),
+                AgeConverter.toStr(row.getObject(2)),
+                AgeConverter.toStr(row.getObject(3)),
+                (int) AgeConverter.toLong(row.getObject(4)),
+                AgeConverter.toStr(row.getObject(5)),
+                AgeConverter.toStr(row.getObject(6))
+        );
+    }
+}
+```
+
+`month` is cast to `long` so `AgeAgtypeJson.appendValue` emits a bare integer literal (its `Integer` branch also works, but `long` matches the convention used by every other handler in this file).
+
+### 12.9 Properties — append `Query10`
+
+Both files have an `age_parameterized_queries=...` line. Append `,Query10` at the end of the comma-separated value:
+
+- `driver/validate.properties` (line ~77): add `,Query10`. Update the comment from "IC3 and IC10 excluded: they use $params in outer SQL" to "IC3 excluded: outer-SQL $countryXName/$countryYName references (see §11). IC10 migrated in Phase F."
+- `driver/benchmark.properties`: same edit.
+
+### 12.10 Build, restore, validate
+
+```bash
+cd /Users/waleed/repositories/ldbc_snb_interactive_v1_impls/age
+mvn -q clean package -DskipTests
+bash scripts/restore-database.sh
+psql "postgresql://postgres:postgres@localhost:5432/postgres" \
+  -f scripts/backfill-person-birth-month-day.sql
+psql "postgresql://postgres:postgres@localhost:5432/postgres" \
+  -c 'VACUUM ANALYZE ldbc_snb."Person"'
+
+# 2K subset
+java --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
+  -Xmx8g \
+  -cp target/age-1.2.0-SNAPSHOT.jar \
+  org.ldbcouncil.snb.driver.Client -P driver/validate.properties \
+  2>&1 | tee /tmp/validate-phase-F.log
+
+python3 scripts/diagnose-failures.py \
+  /tmp/ldbc_sf01/validation_params-sf0.1-subset-failed-actual.json \
+  /tmp/ldbc_sf01/validation_params-sf0.1-subset-failed-expected.json
+```
+
+### 12.11 Phase F done criteria
+
+- [ ] `scripts/load-production-data.py`: `NUMERIC_PROPS` contains `birthMonth` and `birthDay`; the per-label hook for Person populates them from `birthday`.
+- [ ] `scripts/backfill-person-birth-month-day.sql` exists and runs successfully on the live DB.
+- [ ] After backfill: `MATCH (p:Person {id: 933}) RETURN p.birthMonth, p.birthDay` returns `12, 2` (December 2nd, 1989-12-02 UTC).
+- [ ] `queries/interactive-complex-10.sql` is a single `cypher()` call with no outer SQL, references `friend.birthMonth` and `friend.birthDay`, and `ORDER BY` uses WITH-bound variables (not RETURN aliases).
+- [ ] `AgeDb.InteractiveQuery10` has both `getQueryTemplate` and `getQueryParameterMap` overrides.
+- [ ] `age_parameterized_queries` in both `validate.properties` and `benchmark.properties` includes `Query10`.
+- [ ] 2K-subset validation: Incorrect set is exactly `{IC13: 96, IC14: 96}`. No new failure types. IC10 reports 0 incorrect.
+- [ ] Spot-check via the benchmark properties at thread_count=4 with operation_count=2000 (small smoke run): IC10 mean drops below 2,000 ms. Target ~1,500 ms; >2,000 ms means the rewrite did not achieve the expected speedup and warrants investigation.
+
+### 12.12 Rollback
+
+If Phase F validation fails:
+
+```bash
+git checkout -- \
+  age/queries/interactive-complex-10.sql \
+  age/src/main/java/org/ldbcouncil/snb/impls/workloads/age/AgeDb.java \
+  age/driver/validate.properties \
+  age/driver/benchmark.properties \
+  age/scripts/load-production-data.py
+rm -f age/scripts/backfill-person-birth-month-day.sql
+```
+
+The `birthMonth` and `birthDay` properties on Person nodes can be left in place — they're harmless extra fields. To remove them:
+
+```sql
+LOAD 'age';
+SELECT * FROM cypher('ldbc_snb', $$
+  MATCH (p:Person)
+  REMOVE p.birthMonth, p.birthDay
+$$) AS (a agtype);
+```

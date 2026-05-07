@@ -6,6 +6,8 @@ SELECT * FROM cypher('$graphName', $$
     lastName: $personLastName,
     gender: $gender,
     birthday: $birthday,
+    birthMonth: $birthMonth,
+    birthDay: $birthDay,
     creationDate: $creationDate,
     locationIP: $locationIP,
     browserUsed: $browserUsed,

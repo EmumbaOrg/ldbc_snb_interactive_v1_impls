@@ -47,10 +47,12 @@ ENTRY_ID_BITS = 48            # graphid = (ag_label.id << 48) | entry_sequence
 #
 # Other numeric-looking props (birthday, length, classYear, workFrom) are kept
 # as strings: the queries that touch them either cast explicitly
-# (IC10: `birthday::text::bigint`, IC11: `toInteger(work.workFrom)`) or never
-# compare them, so storing as int gives no correctness benefit.
+# (IC11: `toInteger(work.workFrom)`) or never compare them directly.
+# birthMonth and birthDay are derived from birthday at load time (see Person hook
+# in load_vertex_csv) and stored as integers for IC10's parameterized Cypher filter.
 NUMERIC_PROPS = frozenset({
     "id", "creationDate", "joinDate",
+    "birthMonth", "birthDay",
 })
 
 VERTEX_LABELS = [
@@ -203,6 +205,19 @@ def load_vertex_csv(conn, cur, graph_name, label, csv_path):
             graphid = make_graphid(label_id, entry_id)
             orig_id = row.get("id", str(entry_id))
             id_map[orig_id] = graphid
+
+            if label == "Person":
+                bday_str = row.get("birthday", "")
+                if bday_str:
+                    try:
+                        from datetime import datetime, timezone
+                        ts = int(bday_str)
+                        # UTC matches LDBC reference: datetime({epochMillis: birthday}).month
+                        dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
+                        row["birthMonth"] = str(dt.month)
+                        row["birthDay"] = str(dt.day)
+                    except (ValueError, OverflowError):
+                        pass
 
             props_str = build_agtype_props(row.items())
             lines.append(f'{graphid},"{escape_for_csv(props_str)}"\n')

@@ -11,6 +11,9 @@ import org.ldbcouncil.snb.impls.workloads.age.operationhandlers.AgeUpdateOperati
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -320,13 +323,25 @@ public class AgeDb extends BaseDb<AgeQueryStore> {
         }
     }
 
-    // IC10 has $month in both Cypher and outer SQL — legacy path only
     public static class InteractiveQuery10
             extends AgeListOperationHandler<LdbcQuery10, LdbcQuery10Result> {
 
         @Override
         public String getQueryString(AgeDbConnectionState state, LdbcQuery10 operation) {
             return state.getQueryStore().getQuery10(operation);
+        }
+
+        @Override
+        protected String getQueryTemplate(AgeDbConnectionState state, LdbcQuery10 operation) {
+            return state.getQueryStore().prepareTemplate(QueryType.InteractiveComplexQuery10);
+        }
+
+        @Override
+        protected Map<String, Object> getQueryParameterMap(AgeDbConnectionState state, LdbcQuery10 operation) {
+            Map<String, Object> m = new HashMap<>();
+            m.put("personId", operation.getPersonIdQ10());
+            m.put("month", (long) operation.getMonth());
+            return m;
         }
 
         @Override
@@ -676,7 +691,11 @@ public class AgeDb extends BaseDb<AgeQueryStore> {
             m.put("personFirstName", operation.getPersonFirstName());
             m.put("personLastName", operation.getPersonLastName());
             m.put("gender", operation.getGender());
-            m.put("birthday", operation.getBirthday().getTime());
+            long birthdayMs = operation.getBirthday().getTime();
+            LocalDate bd = Instant.ofEpochMilli(birthdayMs).atZone(ZoneOffset.UTC).toLocalDate();
+            m.put("birthday", birthdayMs);
+            m.put("birthMonth", (long) bd.getMonthValue());
+            m.put("birthDay",   (long) bd.getDayOfMonth());
             m.put("creationDate", operation.getCreationDate().getTime());
             m.put("locationIP", operation.getLocationIp());
             m.put("browserUsed", operation.getBrowserUsed());

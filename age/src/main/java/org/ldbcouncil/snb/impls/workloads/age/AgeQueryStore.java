@@ -232,12 +232,17 @@ public class AgeQueryStore extends QueryStore {
 
     @Override
     public Map<String, Object> getUpdate1SingleMap(LdbcUpdate1AddPerson operation) {
+        long birthdayMs = operation.getBirthday().getTime();
+        java.time.LocalDate bd = java.time.Instant.ofEpochMilli(birthdayMs)
+                .atZone(java.time.ZoneOffset.UTC).toLocalDate();
         return new ImmutableMap.Builder<String, Object>()
                 .put(LdbcUpdate1AddPerson.PERSON_ID, Long.toString(operation.getPersonId()))
                 .put(LdbcUpdate1AddPerson.PERSON_FIRST_NAME, getConverter().convertString(operation.getPersonFirstName()))
                 .put(LdbcUpdate1AddPerson.PERSON_LAST_NAME, getConverter().convertString(operation.getPersonLastName()))
                 .put(LdbcUpdate1AddPerson.GENDER, getConverter().convertString(operation.getGender()))
-                .put(LdbcUpdate1AddPerson.BIRTHDAY, Long.toString(operation.getBirthday().getTime()))
+                .put(LdbcUpdate1AddPerson.BIRTHDAY, Long.toString(birthdayMs))
+                .put("birthMonth", Long.toString(bd.getMonthValue()))
+                .put("birthDay", Long.toString(bd.getDayOfMonth()))
                 .put(LdbcUpdate1AddPerson.CREATION_DATE, Long.toString(operation.getCreationDate().getTime()))
                 .put(LdbcUpdate1AddPerson.LOCATION_IP, getConverter().convertString(operation.getLocationIp()))
                 .put(LdbcUpdate1AddPerson.BROWSER_USED, getConverter().convertString(operation.getBrowserUsed()))

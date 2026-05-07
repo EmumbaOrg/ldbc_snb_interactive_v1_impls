@@ -209,22 +209,27 @@ def load_vertices(cur, conn, static_dir, dynamic_dir):
     bulk_insert_vertices(cur, conn, "Company", by_type["company"])
 
     # Person (language → speaks, email → list)
+    # birthMonth/birthDay (UTC) precomputed for IC10's birthday-window filter.
+    from datetime import datetime, timezone as _tz
     rows = read_csv(os.path.join(dynamic_dir, "person_0_0.csv"))
-    bulk_insert_vertices(cur, conn, "Person", [
-        {
+    def _person_row(r):
+        bday_ms = int(r["birthday"])
+        dt = datetime.fromtimestamp(bday_ms / 1000.0, tz=_tz.utc)
+        return {
             "id": int(r["id"]),
             "firstName": r["firstName"],
             "lastName": r["lastName"],
             "gender": r["gender"],
-            "birthday": int(r["birthday"]),
+            "birthday": bday_ms,
+            "birthMonth": dt.month,
+            "birthDay": dt.day,
             "creationDate": int(r["creationDate"]),
             "locationIP": r["locationIP"],
             "browserUsed": r["browserUsed"],
             "speaks": r["language"].split(";"),
             "email": r["email"].split(";"),
         }
-        for r in rows
-    ])
+    bulk_insert_vertices(cur, conn, "Person", [_person_row(r) for r in rows])
 
     # Forum
     rows = read_csv(os.path.join(dynamic_dir, "forum_0_0.csv"))
