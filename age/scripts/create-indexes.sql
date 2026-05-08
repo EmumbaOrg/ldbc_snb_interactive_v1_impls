@@ -128,3 +128,33 @@ CREATE INDEX IF NOT EXISTS idx_comment_date_id ON ldbc_snb."Comment"
 CREATE INDEX IF NOT EXISTS idx_post_date_id    ON ldbc_snb."Post"
   (CAST(agtype_object_field_text(properties, 'creationDate') AS bigint) DESC,
    CAST(agtype_object_field_text(properties, 'id') AS bigint));
+
+-- ---------------------------------------------------------------------------
+-- Per-label B-tree indexes on the graphid `id` column
+--
+-- AGE inherits all label tables from `_ag_label_vertex`, which has
+--   PRIMARY KEY (id).
+-- PostgreSQL inheritance does NOT propagate the parent's PK to children, so
+-- `Post`, `Comment`, `Forum`, `Person` and the rest of the vertex labels have
+-- NO usable index on the graphid column. Any join of the form
+--   JOIN <Label> v ON v.id = <some_graphid>
+-- falls back to a Seq Scan on the entire label table — fine at SF0.1 (table
+-- sizes in the tens of thousands), catastrophic at SF100+ (Post and Comment
+-- exceed 1B rows at SF1000).
+--
+-- These indexes are required by the SQ6 pure-SQL rewrite (see
+-- queries/interactive-short-6.sql) and benefit any other query that joins
+-- back to a label table by graphid. Storage cost is negligible (8 bytes per
+-- vertex; tiny vs the GIN on properties).
+-- ---------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_person_graphid     ON ldbc_snb."Person"     (id);
+CREATE INDEX IF NOT EXISTS idx_comment_graphid    ON ldbc_snb."Comment"    (id);
+CREATE INDEX IF NOT EXISTS idx_post_graphid       ON ldbc_snb."Post"       (id);
+CREATE INDEX IF NOT EXISTS idx_forum_graphid      ON ldbc_snb."Forum"      (id);
+CREATE INDEX IF NOT EXISTS idx_tag_graphid        ON ldbc_snb."Tag"        (id);
+CREATE INDEX IF NOT EXISTS idx_tagclass_graphid   ON ldbc_snb."TagClass"   (id);
+CREATE INDEX IF NOT EXISTS idx_city_graphid       ON ldbc_snb."City"       (id);
+CREATE INDEX IF NOT EXISTS idx_country_graphid    ON ldbc_snb."Country"    (id);
+CREATE INDEX IF NOT EXISTS idx_continent_graphid  ON ldbc_snb."Continent"  (id);
+CREATE INDEX IF NOT EXISTS idx_company_graphid    ON ldbc_snb."Company"    (id);
+CREATE INDEX IF NOT EXISTS idx_university_graphid ON ldbc_snb."University" (id);
