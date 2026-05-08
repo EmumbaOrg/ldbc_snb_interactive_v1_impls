@@ -8,6 +8,14 @@
 #   export CONNECTION_STRING="postgresql://user:pass@host:5432/db"
 #   ./load-data.sh --sf 0.1
 #   ./load-data.sh --sf 100
+#   ./load-data.sh --sf 3 --skip-preprocess   # reuse already-converted CSVs
+#
+# Flags:
+#   --sf <N>            Scale factor (required). E.g. 0.1, 1, 3, 10, 100.
+#   --skip-preprocess   Skip the CSV preprocessing step (Step 1). Assumes
+#                       converted CSVs already exist under
+#                       age/scripts/converted/sf<N>/{vertices,edges}/.
+#                       The sanity check will fail if they are missing.
 #
 # Optional overrides (env vars):
 #   LDBC_DATA_DIR    directory containing the social_network-sf<N>-CsvComposite-LongDateFormatter
@@ -48,7 +56,7 @@ else
   if [[ -n "${LDBC_DATA_DIR:-}" ]]; then
     PREPROCESS_ARGS+=(--data-dir "${LDBC_DATA_DIR}")
   fi
-  python3 "${SCRIPT_DIR}/preprocess_ldbc.py" "${PREPROCESS_ARGS[@]}"
+  "${PY}" "${SCRIPT_DIR}/preprocess_ldbc.py" "${PREPROCESS_ARGS[@]}"
 fi
 
 # Sanity check — preprocessing must produce exactly 11 vertex CSVs and 15 edge CSVs.

@@ -9,7 +9,7 @@
 # What this script does:
 #   1. Installs system dependencies (git, curl, build-essential)
 #   2. Installs OpenJDK 11
-#   3. Installs Maven 3.9+
+#   3. Installs Maven (from Ubuntu apt)
 #   4. Builds the common and age Maven packages
 #   5. Checks for Python 3.13; installs if not present
 #   6. Creates a .venv in the age/ folder using Python 3.13
@@ -50,9 +50,10 @@ if java -version 2>&1 | grep -q "11\." ; then
   echo "  OpenJDK 11 already installed."
 else
   sudo apt-get install -y -qq openjdk-11-jdk
-  # Set JAVA_HOME if not already set
   export JAVA_HOME="/usr/lib/jvm/java-11-openjdk-amd64"
-  echo "export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64" >> ~/.bashrc
+  if ! grep -q 'JAVA_HOME=.*/java-11-openjdk' ~/.bashrc 2>/dev/null; then
+    echo "export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64" >> ~/.bashrc
+  fi
   echo "  OpenJDK 11 installed."
 fi
 java -version

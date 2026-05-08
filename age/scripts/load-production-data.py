@@ -93,7 +93,7 @@ def agtype_value(key, val):
     Format a string value from CSV as the correct agtype literal.
 
     - Numeric columns (id, creationDate, …): bare integer, e.g. 933
-    - JSON arrays / objects (speaks, email): pass through as agtype literal
+    - JSON arrays (speaks, email): pass through as agtype array literal
     - Everything else: double-quoted string with escaping
     """
     if val is None or val == "":
