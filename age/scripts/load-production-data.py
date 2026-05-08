@@ -105,10 +105,26 @@ def agtype_value(key, val):
         except (ValueError, TypeError):
             pass  # fall through to string
     stripped = val.strip()
-    if stripped.startswith("[") or stripped.startswith("{"):
-        # JSON array / object — store as agtype compound value (not a string)
-        return stripped
+    if stripped.startswith("["):
+        # JSON arrays (speaks, email) — pass through as agtype array literal.
+        # We only allow arrays, never objects starting with '{', because free-text
+        # fields (e.g. Comment.content) can contain valid JSON objects that AGE's
+        # COPY format rejects as nested property values.
+        try:
+            json.loads(stripped)
+            return stripped
+        except (json.JSONDecodeError, ValueError):
+            pass  # fall through to quoted string
     escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+    # Escape control characters that agtype requires to be escaped
+    escaped = (
+        escaped
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\x08", "\\b")
+        .replace("\x0c", "\\f")
+    )
     return f'"{escaped}"'
 
 

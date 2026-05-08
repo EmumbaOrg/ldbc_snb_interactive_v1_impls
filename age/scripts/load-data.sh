@@ -18,9 +18,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SF=""
+SKIP_PREPROCESS=false
 while [[ $# -gt 0 ]]; do
   case $1 in
     --sf) SF="$2"; shift 2 ;;
+    --skip-preprocess) SKIP_PREPROCESS=true; shift ;;
     *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
@@ -38,12 +40,16 @@ fi
 PY="${VENV}/bin/python3"
 
 # ---------------------------------------------------------------------------
-echo "=== Step 1: Preprocessing LDBC SF${SF} data ==="
-PREPROCESS_ARGS=(--sf "${SF}")
-if [[ -n "${LDBC_DATA_DIR:-}" ]]; then
-  PREPROCESS_ARGS+=(--data-dir "${LDBC_DATA_DIR}")
+if [[ "$SKIP_PREPROCESS" == true ]]; then
+  echo "=== Step 1: Skipping preprocessing (--skip-preprocess) ==="
+else
+  echo "=== Step 1: Preprocessing LDBC SF${SF} data ==="
+  PREPROCESS_ARGS=(--sf "${SF}")
+  if [[ -n "${LDBC_DATA_DIR:-}" ]]; then
+    PREPROCESS_ARGS+=(--data-dir "${LDBC_DATA_DIR}")
+  fi
+  python3 "${SCRIPT_DIR}/preprocess_ldbc.py" "${PREPROCESS_ARGS[@]}"
 fi
-"${PY}" "${SCRIPT_DIR}/preprocess_ldbc.py" "${PREPROCESS_ARGS[@]}"
 
 # Sanity check — preprocessing must produce exactly 11 vertex CSVs and 15 edge CSVs.
 V_COUNT=$(ls "${CONVERTED_DIR}/vertices/" 2>/dev/null | wc -l | tr -d ' ')
