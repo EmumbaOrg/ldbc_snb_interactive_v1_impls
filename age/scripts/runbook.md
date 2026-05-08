@@ -232,7 +232,7 @@ ldbc.snb.interactive.scale_factor=0.1
 # Benchmark size
 operation_count=1000000
 warmup=10000
-thread_count=16
+thread_count=8
 ```
 
 Key notes:
@@ -241,9 +241,14 @@ Key notes:
   If your archive unpacks as `substitution_parameters-sf0.1/substitution_parameters-sf0.1/`,
   point to the inner one.
 - `operation_count` is the number of operations **after** warmup.
-- `thread_count=16` is sized for a 32-vCPU PostgreSQL host. The Hikari JDBC pool
-  in `AgeDbConnectionState` mirrors this value, so each driver thread gets its
-  own dedicated connection. For smaller hosts (e.g. 8 vCPUs), drop to 4.
+- `thread_count` is sized to the **benchmark host's vCPU count**, not the DB host's.
+  Default 8 matches a Standard_D8ds_v4 (8 vCPU / 32 GB) driver VM. The Hikari JDBC
+  pool (`age_connection_pool_size`) must mirror this value — each driver thread
+  gets its own dedicated connection. For a 16-vCPU driver bump both to 16; for
+  a 4-vCPU driver drop both to 4.
+- The DB host's parallelism (`max_parallel_workers=24`) is recruited *per query*
+  by each driver thread, so DB cores aren't a constraint on driver thread count
+  unless you push driver threads above the DB's parallel-worker pool.
 
 ---
 
@@ -258,7 +263,7 @@ bash scripts/restore-database.sh
 
 # Step 2 — run benchmark
 java --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
-  -Xmx16g \
+  -Xmx8g \
   -cp target/age-1.2.0-SNAPSHOT.jar \
   org.ldbcouncil.snb.driver.Client -P driver/benchmark.properties \
   2>&1 | tee /tmp/benchmark.log
@@ -282,7 +287,7 @@ re-running:
 ```bash
 bash scripts/restore-database.sh
 java --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
-  -Xmx16g \
+  -Xmx8g \
   -cp target/age-1.2.0-SNAPSHOT.jar \
   org.ldbcouncil.snb.driver.Client -P driver/benchmark.properties \
   2>&1 | tee /tmp/benchmark.log
@@ -344,7 +349,7 @@ failures (both are intentionally disabled). All other queries should pass.
 | Build JAR | `mvn -q clean package -DskipTests` |
 | Load data (first time) | `bash scripts/load-data.sh --sf 0.1` |
 | Restore before benchmark | `bash scripts/restore-database.sh` |
-| Run benchmark | `java --add-opens java.base/sun.nio.ch=ALL-UNNAMED -Xmx16g -cp target/age-1.2.0-SNAPSHOT.jar org.ldbcouncil.snb.driver.Client -P driver/benchmark.properties` |
+| Run benchmark | `java --add-opens java.base/sun.nio.ch=ALL-UNNAMED -Xmx8g -cp target/age-1.2.0-SNAPSHOT.jar org.ldbcouncil.snb.driver.Client -P driver/benchmark.properties` |
 | Run validation | `bash scripts/run-local-validation.sh` |
 | Apply PostgreSQL tuning | See §4 above / `scripts/postgres-tuning.md` |
 | Take a manual snapshot | `bash scripts/snapshot-database.sh` |
