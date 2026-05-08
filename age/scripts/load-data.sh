@@ -68,7 +68,7 @@ echo "=== Step 2: Loading graph into AGE via load-production-data.py ==="
 echo "=== Step 3: Creating query-performance indexes ==="
 # Set maintenance_work_mem high so index builds on large edge tables don't spill to disk.
 psql "$CONNECTION_STRING" \
-    -c "SET maintenance_work_mem = '2GB';" \
+    -c "SET maintenance_work_mem = '4GB';" \
     -f "${SCRIPT_DIR}/create-indexes.sql" \
     2>&1 | grep -v NOTICE || true
 

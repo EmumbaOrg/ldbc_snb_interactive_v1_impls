@@ -82,6 +82,9 @@ export SNAPSHOT_FILE=/data/snapshots/ldbc_sf100.dump
 
 ## 4. Apply PostgreSQL tuning
 
+Recommended values below assume a **32-vCPU / 256 GB RAM** PostgreSQL host.
+For other host sizes, scale by the rules in `scripts/postgres-tuning.md`.
+
 ### Managed service (HorizonDB on Azure, RDS, Flexible Server, etc.)
 
 Run the following SQL once via psql or the service portal. Scale `work_mem`
@@ -89,15 +92,25 @@ and `maintenance_work_mem` to your scale factor (see `scripts/postgres-tuning.md
 for guidance):
 
 ```sql
-ALTER DATABASE postgres SET work_mem                        = '256MB';   -- SF10–SF100; use 512MB for SF1000
-ALTER DATABASE postgres SET maintenance_work_mem            = '2GB';     -- required for index builds
-ALTER DATABASE postgres SET max_parallel_workers_per_gather = 4;
-ALTER DATABASE postgres SET max_parallel_workers            = 8;
+ALTER DATABASE postgres SET work_mem                        = '512MB';   -- SF10–SF100; use 1GB for SF1000, 128MB for SF≤1
+ALTER DATABASE postgres SET maintenance_work_mem            = '4GB';     -- required for index builds
+ALTER DATABASE postgres SET max_parallel_workers_per_gather = 8;
 ALTER DATABASE postgres SET random_page_cost                = 1.1;       -- SSD/NVMe
-ALTER DATABASE postgres SET effective_cache_size            = '24GB';
+ALTER DATABASE postgres SET effective_cache_size            = '192GB';
 ALTER DATABASE postgres SET checkpoint_completion_target    = 0.9;
 ALTER DATABASE postgres SET wal_buffers                     = '256MB';
-ALTER DATABASE postgres SET max_wal_size                    = '4GB';
+ALTER DATABASE postgres SET max_wal_size                    = '16GB';
+ALTER DATABASE postgres SET min_wal_size                    = '2GB';
+```
+
+The following must be set in the service's server-parameters portal (require
+a restart and cannot be set via `ALTER DATABASE`):
+
+```
+shared_buffers        = 64GB
+max_worker_processes  = 32
+max_parallel_workers  = 24
+max_connections       = 200
 ```
 
 ### Self-managed VM
@@ -106,8 +119,9 @@ ALTER DATABASE postgres SET max_wal_size                    = '4GB';
 sudo bash scripts/configure-postgres.sh --sf 100   # adjust SF
 ```
 
-`shared_buffers` (set to 8 GB by the script) requires a PostgreSQL restart
-to take effect. All other settings reload immediately.
+`shared_buffers = 64 GB`, `max_worker_processes`, `max_connections`, and
+`max_prepared_transactions` all require a full PostgreSQL restart to take
+effect (not just a reload). All other settings reload immediately.
 
 If `postgresql.conf` is not found automatically (non-Debian host), set `PGCONF`:
 
@@ -216,9 +230,9 @@ ldbc.snb.interactive.updates_dir=/path/to/social_network-sf0.1-CsvComposite-Long
 ldbc.snb.interactive.scale_factor=0.1
 
 # Benchmark size
-operation_count=10000
-warmup=1000
-thread_count=4
+operation_count=1000000
+warmup=10000
+thread_count=16
 ```
 
 Key notes:
@@ -227,8 +241,9 @@ Key notes:
   If your archive unpacks as `substitution_parameters-sf0.1/substitution_parameters-sf0.1/`,
   point to the inner one.
 - `operation_count` is the number of operations **after** warmup.
-- `thread_count=4` is a good default for an 8-vCPU host. Lower it if running on
-  a smaller VM.
+- `thread_count=16` is sized for a 32-vCPU PostgreSQL host. The Hikari JDBC pool
+  in `AgeDbConnectionState` mirrors this value, so each driver thread gets its
+  own dedicated connection. For smaller hosts (e.g. 8 vCPUs), drop to 4.
 
 ---
 
@@ -243,7 +258,7 @@ bash scripts/restore-database.sh
 
 # Step 2 — run benchmark
 java --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
-  -Xmx8g \
+  -Xmx16g \
   -cp target/age-1.2.0-SNAPSHOT.jar \
   org.ldbcouncil.snb.driver.Client -P driver/benchmark.properties \
   2>&1 | tee /tmp/benchmark.log
@@ -267,7 +282,7 @@ re-running:
 ```bash
 bash scripts/restore-database.sh
 java --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
-  -Xmx8g \
+  -Xmx16g \
   -cp target/age-1.2.0-SNAPSHOT.jar \
   org.ldbcouncil.snb.driver.Client -P driver/benchmark.properties \
   2>&1 | tee /tmp/benchmark.log
@@ -329,7 +344,7 @@ failures (both are intentionally disabled). All other queries should pass.
 | Build JAR | `mvn -q clean package -DskipTests` |
 | Load data (first time) | `bash scripts/load-data.sh --sf 0.1` |
 | Restore before benchmark | `bash scripts/restore-database.sh` |
-| Run benchmark | `java --add-opens java.base/sun.nio.ch=ALL-UNNAMED -Xmx8g -cp target/age-1.2.0-SNAPSHOT.jar org.ldbcouncil.snb.driver.Client -P driver/benchmark.properties` |
+| Run benchmark | `java --add-opens java.base/sun.nio.ch=ALL-UNNAMED -Xmx16g -cp target/age-1.2.0-SNAPSHOT.jar org.ldbcouncil.snb.driver.Client -P driver/benchmark.properties` |
 | Run validation | `bash scripts/run-local-validation.sh` |
 | Apply PostgreSQL tuning | See §4 above / `scripts/postgres-tuning.md` |
 | Take a manual snapshot | `bash scripts/snapshot-database.sh` |

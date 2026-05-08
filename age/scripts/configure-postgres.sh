@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Apply recommended PostgreSQL settings for LDBC SNB Interactive benchmarks.
-# Targets Apache AGE 1.6 on PostgreSQL 17 with 32 GB RAM.
+# Targets Apache AGE 1.6 on PostgreSQL 17 with 32 vCPUs and 256 GB RAM.
 #
 # Usage:
 #   sudo ./configure-postgres.sh --sf 0.1
@@ -8,9 +8,9 @@
 #   sudo ./configure-postgres.sh --sf 1000
 #
 # The --sf argument scales work_mem and maintenance_work_mem:
-#   SF0.1–SF1  : work_mem=64MB,  maintenance_work_mem=512MB
-#   SF10–SF100 : work_mem=256MB, maintenance_work_mem=2GB
-#   SF1000     : work_mem=512MB, maintenance_work_mem=4GB
+#   SF0.1–SF1  : work_mem=128MB, maintenance_work_mem=2GB
+#   SF10–SF100 : work_mem=512MB, maintenance_work_mem=4GB
+#   SF1000     : work_mem=1GB,   maintenance_work_mem=8GB
 #
 # The script finds postgresql.conf via pg_lsclusters (Debian/Ubuntu) or
 # pg_config (generic). Override by setting PGCONF env var.
@@ -29,20 +29,23 @@ done
 # ---------------------------------------------------------------------------
 # Scale work_mem and maintenance_work_mem based on SF.
 # Rule of thumb: at SF N, the largest hash aggregations see ~N × baseline rows.
-# Each of the 4 parallel workers can consume work_mem simultaneously, so
-# total memory for sort/hash = 4 × work_mem per query.
+# Each of the 8 parallel workers per gather can consume work_mem simultaneously,
+# so total memory for sort/hash = 8 × work_mem per query, multiplied by the
+# number of concurrent driver threads (16 by default).
+# Peak worst case at SF1000:  16 threads × 8 workers × 1 GB = 128 GB → fits
+# in 256 GB box alongside 64 GB shared_buffers and OS page cache.
 # ---------------------------------------------------------------------------
 SF_NUM=$(echo "$SF" | awk '{printf "%f", $0}')
 
 if awk "BEGIN{exit !($SF_NUM <= 1)}"; then
-  WORK_MEM="64MB"
-  MAINT_WORK_MEM="512MB"
-elif awk "BEGIN{exit !($SF_NUM <= 100)}"; then
-  WORK_MEM="256MB"
+  WORK_MEM="128MB"
   MAINT_WORK_MEM="2GB"
-else
+elif awk "BEGIN{exit !($SF_NUM <= 100)}"; then
   WORK_MEM="512MB"
   MAINT_WORK_MEM="4GB"
+else
+  WORK_MEM="1GB"
+  MAINT_WORK_MEM="8GB"
 fi
 
 echo "SF=${SF}  →  work_mem=${WORK_MEM}, maintenance_work_mem=${MAINT_WORK_MEM}"
@@ -88,17 +91,18 @@ set_param() {
 echo "--- Memory ---"
 set_param "work_mem"                 "$WORK_MEM"
 set_param "maintenance_work_mem"     "$MAINT_WORK_MEM"
-# shared_buffers: 25% of RAM for dedicated DB hosts. On a 32GB machine = 8GB.
-# Only set if not already 8GB to avoid stomping a custom value.
-if ! grep -qE "^shared_buffers[[:space:]]*=[[:space:]]*8GB" "$CONF_FILE"; then
-  set_param "shared_buffers"         "8GB"
-fi
+# shared_buffers: 25% of RAM for dedicated DB hosts. On a 256GB machine = 64GB.
+# Requires a full restart (not just reload) to take effect.
+set_param "shared_buffers"           "64GB"
 
 echo "--- Parallelism ---"
-# AGE graph traversals benefit from parallel workers when the plan has
-# parallel-safe nodes.  4 workers matches a typical 8–16 vCPU benchmark host.
-set_param "max_parallel_workers_per_gather" "4"
-set_param "max_parallel_workers"            "8"
+# 32 vCPUs: allow the planner to use up to 8 parallel workers per gather and
+# keep ~24 of 32 cores available for parallel work, leaving ~8 for client
+# connections, autovacuum, and the leader process.
+set_param "max_worker_processes"            "32"
+set_param "max_parallel_workers"            "24"
+set_param "max_parallel_workers_per_gather" "8"
+set_param "max_parallel_maintenance_workers" "8"
 set_param "parallel_setup_cost"             "100"
 set_param "parallel_tuple_cost"             "0.01"
 
@@ -107,21 +111,27 @@ echo "--- Planner cost (SSD / NVMe assumed) ---"
 # This prevents it from preferring nested-loop seq scans over index scans on
 # large edge tables at SF10+.
 set_param "random_page_cost"         "1.1"
-set_param "effective_cache_size"     "24GB"
+# effective_cache_size: planner hint, set to ~75% of total RAM so the planner
+# prefers index scans by accounting for OS page cache. Does not allocate.
+set_param "effective_cache_size"     "192GB"
 
 echo "--- WAL / checkpoint ---"
 set_param "wal_buffers"                     "256MB"
 set_param "checkpoint_completion_target"    "0.9"
-# max_wal_size: generous to reduce checkpoint frequency during bulk loads.
-set_param "max_wal_size"                    "4GB"
+# max_wal_size: generous to reduce checkpoint frequency during bulk loads and
+# IU-heavy benchmark runs on a host with plenty of disk and RAM.
+set_param "max_wal_size"                    "16GB"
+set_param "min_wal_size"                    "2GB"
 
 echo "--- Connections / resources ---"
+# 16 driver threads × Hikari pool + admin/autovacuum/replication overhead.
+set_param "max_connections"                 "200"
 # allow AGE's cypher() plans to stay in shared cache across connections
 set_param "max_prepared_transactions"       "0"
 
 echo ""
 echo "--- Resulting settings ---"
-grep -E "^(work_mem|maintenance_work_mem|shared_buffers|max_worker_processes|max_parallel_workers|max_parallel_workers_per_gather|max_parallel_maintenance_workers|parallel_setup_cost|parallel_tuple_cost|random_page_cost|effective_cache_size|wal_buffers|checkpoint_completion_target|max_wal_size)" "$CONF_FILE" | sort
+grep -E "^(work_mem|maintenance_work_mem|shared_buffers|max_connections|max_worker_processes|max_parallel_workers|max_parallel_workers_per_gather|max_parallel_maintenance_workers|parallel_setup_cost|parallel_tuple_cost|random_page_cost|effective_cache_size|wal_buffers|checkpoint_completion_target|max_wal_size|min_wal_size)" "$CONF_FILE" | sort
 
 # ---------------------------------------------------------------------------
 # Reload PostgreSQL
@@ -149,5 +159,6 @@ echo ""
 echo "Settings applied. Verify with:"
 echo "  psql -U postgres -c \"SHOW work_mem; SHOW maintenance_work_mem; SHOW shared_buffers;\""
 echo ""
-echo "NOTE: shared_buffers requires a full restart (not just reload) to take effect."
-echo "      All other settings take effect immediately after reload."
+echo "NOTE: shared_buffers, max_worker_processes, max_connections, and"
+echo "      max_prepared_transactions all require a full RESTART (not just reload)"
+echo "      to take effect. Other settings reload immediately."
