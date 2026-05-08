@@ -64,6 +64,19 @@ fi
 
 cd "${AGE_DIR}"
 
+# ---- Step 0: Restore snapshot (reset any IU mutations from prior runs) -------
+# create_validation must run against the same clean state validate_database will see,
+# otherwise Update operations re-create entities (CREATE, not MERGE) and the captured
+# expected results contain duplicates that the post-restore validate_database can't reproduce.
+if [[ ! -f "${SNAPSHOT_FILE}" ]]; then
+  echo "ERROR: Snapshot not found at ${SNAPSHOT_FILE}." >&2
+  echo "       Run with --load first, or run scripts/snapshot-database.sh manually." >&2
+  exit 1
+fi
+echo ""
+echo "=== Pre-validation: restoring snapshot ==="
+bash scripts/restore-database.sh
+
 # ---- Step 1: Generate validation_params.csv ----------------------------------
 echo ""
 echo "=== Generating validation_params.csv ==="
@@ -73,11 +86,6 @@ java -cp "${JAR}" org.ldbcouncil.snb.driver.Client \
 # ---- Step 2: Restore snapshot (reset IU mutations) ---------------------------
 echo ""
 echo "=== Restoring snapshot ==="
-if [[ ! -f "${SNAPSHOT_FILE}" ]]; then
-  echo "ERROR: Snapshot not found at ${SNAPSHOT_FILE}." >&2
-  echo "       Run with --load first, or run scripts/snapshot-database.sh manually." >&2
-  exit 1
-fi
 bash scripts/restore-database.sh
 
 # ---- Step 3: Validate --------------------------------------------------------

@@ -17,17 +17,23 @@ connection) or through the service's server-parameter portal.
 --   SF10–SF100  →  256MB
 --   SF1000      →  512MB
 
-ALTER DATABASE postgres SET work_mem                        = '256MB';
-ALTER DATABASE postgres SET maintenance_work_mem            = '2GB';
-ALTER DATABASE postgres SET max_parallel_workers_per_gather = 4;
-ALTER DATABASE postgres SET max_parallel_workers            = 8;
-ALTER DATABASE postgres SET parallel_setup_cost             = 100;
-ALTER DATABASE postgres SET parallel_tuple_cost             = 0.01;
-ALTER DATABASE postgres SET random_page_cost                = 1.1;
-ALTER DATABASE postgres SET effective_cache_size            = '24GB';
-ALTER DATABASE postgres SET checkpoint_completion_target    = 0.9;
-ALTER DATABASE postgres SET wal_buffers                     = '256MB';
-ALTER DATABASE postgres SET max_wal_size                    = '4GB';
+ALTER DATABASE postgres SET work_mem                         = '256MB';
+ALTER DATABASE postgres SET maintenance_work_mem             = '2GB';
+ALTER DATABASE postgres SET max_parallel_workers_per_gather  = 8;
+ALTER DATABASE postgres SET max_parallel_maintenance_workers = 4;
+ALTER DATABASE postgres SET parallel_setup_cost              = 100;
+ALTER DATABASE postgres SET parallel_tuple_cost              = 0.01;
+ALTER DATABASE postgres SET random_page_cost                 = 1.1;
+ALTER DATABASE postgres SET effective_cache_size             = '24GB';
+ALTER DATABASE postgres SET checkpoint_completion_target     = 0.9;
+ALTER DATABASE postgres SET wal_buffers                      = '256MB';
+ALTER DATABASE postgres SET max_wal_size                     = '4GB';
+
+-- The following two require server-wide config (postgresql.conf) and a
+-- reload/restart — they cannot be set via ALTER DATABASE. On managed services,
+-- set these through the portal/server-parameters page.
+--   max_worker_processes  = 16   (requires restart; cap on background workers)
+--   max_parallel_workers  = 16   (requires reload; subset of max_worker_processes)
 ```
 
 Verify after connecting:

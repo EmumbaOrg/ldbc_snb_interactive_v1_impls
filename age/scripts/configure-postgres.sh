@@ -121,7 +121,7 @@ set_param "max_prepared_transactions"       "0"
 
 echo ""
 echo "--- Resulting settings ---"
-grep -E "^(work_mem|maintenance_work_mem|shared_buffers|max_parallel_workers|parallel_setup_cost|parallel_tuple_cost|random_page_cost|effective_cache_size|wal_buffers|checkpoint_completion_target|max_wal_size)" "$CONF_FILE" | sort
+grep -E "^(work_mem|maintenance_work_mem|shared_buffers|max_worker_processes|max_parallel_workers|max_parallel_workers_per_gather|max_parallel_maintenance_workers|parallel_setup_cost|parallel_tuple_cost|random_page_cost|effective_cache_size|wal_buffers|checkpoint_completion_target|max_wal_size)" "$CONF_FILE" | sort
 
 # ---------------------------------------------------------------------------
 # Reload PostgreSQL

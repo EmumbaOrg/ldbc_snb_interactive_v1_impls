@@ -28,6 +28,14 @@ done
 : "${CONNECTION_STRING:?CONNECTION_STRING environment variable must be set}"
 
 CONVERTED_DIR="${SCRIPT_DIR}/converted/sf${SF}"
+AGE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+VENV="${AGE_DIR}/.venv"
+if [[ ! -x "${VENV}/bin/python3" ]]; then
+  echo "Creating venv and installing psycopg2-binary..."
+  python3 -m venv "${VENV}"
+  "${VENV}/bin/pip" install -q psycopg2-binary
+fi
+PY="${VENV}/bin/python3"
 
 # ---------------------------------------------------------------------------
 echo "=== Step 1: Preprocessing LDBC SF${SF} data ==="
@@ -35,7 +43,7 @@ PREPROCESS_ARGS=(--sf "${SF}")
 if [[ -n "${LDBC_DATA_DIR:-}" ]]; then
   PREPROCESS_ARGS+=(--data-dir "${LDBC_DATA_DIR}")
 fi
-python3 "${SCRIPT_DIR}/preprocess_ldbc.py" "${PREPROCESS_ARGS[@]}"
+"${PY}" "${SCRIPT_DIR}/preprocess_ldbc.py" "${PREPROCESS_ARGS[@]}"
 
 # Sanity check — preprocessing must produce exactly 11 vertex CSVs and 15 edge CSVs.
 V_COUNT=$(ls "${CONVERTED_DIR}/vertices/" 2>/dev/null | wc -l | tr -d ' ')
@@ -52,7 +60,7 @@ echo "=== Step 2: Loading graph into AGE via load-production-data.py ==="
 # load-production-data.py stores id/creationDate/joinDate/birthMonth/birthDay
 # as agtype integers so Cypher equality lookups (MATCH (n {id: X})) work correctly.
 # It also derives birthMonth and birthDay from birthday at load time for IC10.
-python3 "${SCRIPT_DIR}/load-production-data.py" \
+"${PY}" "${SCRIPT_DIR}/load-production-data.py" \
     --config "${CONVERTED_DIR}/agefreighter_config.json" \
     --connection-string "$CONNECTION_STRING"
 

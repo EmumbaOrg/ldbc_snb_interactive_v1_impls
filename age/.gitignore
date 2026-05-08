@@ -16,3 +16,5 @@ validation_params.csv
 results/
 driver/*-local.properties
 *.pyc
+queries-for-review
+converted
