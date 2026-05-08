@@ -16,7 +16,6 @@
 -- filters (creationDate ranges, name equality) where the planner can use a functional index.
 -- These are NOT created by agefreighter.
 
-LOAD 'age';
 SET search_path = ag_catalog, '$user', public;
 
 -- ---------------------------------------------------------------------------
