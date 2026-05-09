@@ -110,7 +110,7 @@ public class AgeDbConnectionState extends BaseDbConnectionState<AgeQueryStore> {
         config.setAutoCommit(true);
         // LOAD 'age' is per-session and must run before any cypher() call.
         // connectionInitSql runs once per new physical connection.
-        // config.setConnectionInitSql("LOAD 'age'");
+        config.setConnectionInitSql("SET search_path = ag_catalog, '$user', public;");
         config.setPoolName("age-ldbc");
         config.setConnectionTimeout(connectionTimeoutMs);
         config.setValidationTimeout(5_000);
