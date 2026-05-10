@@ -1,55 +1,49 @@
 -- LdbcQuery10 — Similar persons (friends-of-friends with shared interests)
 --
--- Why this Cypher form (V3): four cooperating reorderings collapse the
--- per-call execution from ~148 ms to ~29 ms at SF0.1 (5x at the SQL level)
--- without changing semantics. Phase F earlier moved this query from a
--- two-call hybrid (3422 ms) to a single parameterised AGE call (455 ms
--- benchmark mean / 853 ms p99). V3 builds on Phase F.
+-- Why this Cypher form (V4 — collect+UNWIND barrier for SF3+ planner stability):
 --
---   (1) Early `WITH DISTINCT p, friend` after the 2-hop KNOWS — the raw
---       2-hop produces ~2 184 (intermediate, friend) rows with
---       multiplicity. Deduping immediately collapses to ~39 unique
---       friends. Every downstream operator runs N times instead of NxM.
+-- V3 had four cooperating reorderings (early WITH DISTINCT, deferred city,
+-- single HAS_CREATOR walk with chained interest-tag check) that worked
+-- beautifully at SF0.1: ~150 ms benchmark mean. At SF3 V3 catastrophically
+-- regressed — single calls timing out at 120s, multi-thread stuck queries
+-- running >1 hour.
 --
---   (2) Birth-month filter applied right after the DISTINCT (pre-direct,
---       pre-city). Surviving set drops to ~28 friends; everything below
---       pays per-friend cost on this small set.
+-- Root cause at SF3: after the friend tree expands (~329-4900 surviving
+-- friends after birth-month filter), AGE 1.6's planner stops choosing NL
+-- via idx_islocatedin_start and instead picks a Merge Join over the full
+-- IS_LOCATED_IN table (9M rows at SF3, would be 90M+ at SF1000). The
+-- merge-join inner is `Index Scan using idx_islocatedin_end on
+-- "IS_LOCATED_IN" rows=9042640` — effectively a full table scan masked
+-- as an index scan. Same pathology then propagates to the
+-- HAS_CREATOR / HAS_TAG joins downstream.
 --
---   (3) `OPTIONAL MATCH (p)-[direct:KNOWS]->(friend)` runs after the
---       DISTINCT — once per unique friend instead of once per
---       (intermediate, friend) tuple. Same idx_knows_start path, fewer
---       loops.
+-- V4 inserts a `WITH p, collect(friend) AS friends UNWIND friends AS
+-- friend` materialisation barrier between the direct-check and the
+-- city/post traversals. This forces AGE's planner to:
+--   (1) Materialise the small surviving friend set (a few hundred items).
+--   (2) NL-iterate per friend through idx_islocatedin_start, idx_hascreator_end,
+--       idx_hastag_start, idx_hasinterest_start.
 --
---   (4) `MATCH (friend)-[:IS_LOCATED_IN]->(city:City)` deferred to AFTER
---       the birth-month filter. Only the ~28 surviving friends look up
---       their city via idx_islocatedin_start, not the full ~39 candidate
---       set.
+-- Same pattern that won for IC7 W3 (post-binding NL via idx_likes_end)
+-- and is the dual of the IC10 V3 pre-collect step that won at SF0.1.
 --
---   (5) Single-pass `OPTIONAL MATCH (friend)<-[:HAS_CREATOR]-(post)` plus
---       a chained `OPTIONAL MATCH (post)-[:HAS_TAG]->(t)<-[:HAS_INTEREST]-(p)`,
---       counting via `count(DISTINCT post)` and
---       `count(DISTINCT CASE WHEN t IS NOT NULL THEN post END)`. Same
---       semantics as the original two-pass form
---       (count(DISTINCT post) for postCount,
---        count(DISTINCT commonPost) for commonPostCount), with the post
---       row stream traversed once instead of twice. ~12 028 post lookups
---       collapsed to ~6 014.
+-- Measured at SF3:
+--   sample 1 (personId=4398046536251, month=4): V3 ~2 s → V4 ~2 s (no change)
+--   sample 2 (personId=26388279087663, month=3, friend tree=4899→421):
+--     V3 timed out at 120 s → V4 ~16.9 s (≥7× improvement, no longer pathological)
+-- Same exact result rows on both samples.
 --
--- The original Phase F form is preserved in git history (commit before
--- this change). Embedding the original literal block here as a comment
--- would corrupt AgeQueryStore.prepareTemplate's substitution count — see
--- the IC5 file's note on the same gotcha.
+-- SF1000 outlook: V4 stays index-driven NL throughout. Per-friend cost is
+-- O(posts-per-friend × tags-per-post) bounded by indexes. At SF1000 with
+-- ~3000 surviving friends × ~10 800 posts each, the bound is ~32 M post
+-- probes (~30-60 sec). Past that scale, denormalising
+-- `Person.post_count` and adding a side table for `Person.has_interest`
+-- → tag-id list (or covering index on HAS_INTEREST.start_id) is the
+-- next step.
 --
--- AGE 1.6 limitations encountered (and worked around):
---   - No label-OR predicates, so the per-post tag-existence check uses
---     CASE WHEN over the chained OPTIONAL MATCH instead of pattern
---     comprehension or EXISTS subquery (both either unsupported or
---     pathological in AGE 1.6 — see IC5 V9/V10 measurements).
---   - The OR predicate on (birthMonth, birthDay) prevents pushing into a
---     single property-containment MATCH; splitting into a 2-arm UNION
---     would re-introduce friend-set computation twice. Keeping the OR
---     post-traversal filter is the right trade-off given V3's small
---     post-DISTINCT candidate set.
+-- Why not VLE: AGE 1.6 VLE compiles to wide hash join over per-depth
+-- materialised paths — 5× slower than fixed-depth chains for shallow
+-- patterns (per IC12 W2 measurements).
 
 SELECT * FROM cypher('$graphName', $$
   MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(friend:Person)
@@ -63,9 +57,15 @@ SELECT * FROM cypher('$graphName', $$
   OPTIONAL MATCH (p)-[direct:KNOWS]->(friend)
   WITH p, friend, direct
   WHERE direct IS NULL
-  // (4) City lookup deferred to surviving friends only.
+  // (4) collect+UNWIND barrier — forces planner to NL the downstream
+  // traversals via idx_islocatedin_start / idx_hascreator_end. Without
+  // this barrier, AGE 1.6 picks Merge Join on full IS_LOCATED_IN at
+  // SF3+ (9M rows scanned per call → query times out).
+  WITH p, collect(friend) AS friends
+  UNWIND friends AS friend
+  // (5) City lookup deferred to surviving friends only, NL-driven.
   MATCH (friend)-[:IS_LOCATED_IN]->(city:City)
-  // (5) Single HAS_CREATOR sweep with chained tag-interest existence check.
+  // (6) Single HAS_CREATOR sweep with chained tag-interest existence check.
   OPTIONAL MATCH (friend)<-[:HAS_CREATOR]-(post:Post)
   OPTIONAL MATCH (post)-[:HAS_TAG]->(t:Tag)<-[:HAS_INTEREST]-(p)
   WITH friend, city, post, t
@@ -81,29 +81,26 @@ $$) AS (personId agtype, personFirstName agtype, personLastName agtype,
         commonInterestScore agtype, personGender agtype, personCityName agtype);
 
 -- ----------------------------------------------------------------------------
--- Future optimization steps (queue when SF100+ benchmarks demand it):
+-- Future optimization steps (queue when SF1000+ benchmarks demand it):
 --
--- 1. Denormalize `Person.post_count` onto the Person vertex (mirrors the
---    Phase F birthMonth/birthDay precomputation). Maintained at IU6
---    (AddPost) and IU1 (AddPerson) + load backfill. Replaces the
---    postCount OPTIONAL MATCH with a property read — saves ~50% of
---    per-call cost at SF1000 (where ~7 000 surviving friends each fetch
---    ~215 posts via idx_post_graphid for the count alone).
+-- 1. Denormalize `Person.post_count` onto the Person vertex. Maintained
+--    at IU6 (AddPost) and IU1 (AddPerson) + load backfill. Replaces the
+--    HAS_CREATOR walk with a property read — saves ~50% of per-call cost
+--    at SF1000.
 --
--- 2. Composite index `(HAS_CREATOR.end_id, post_id)` if we ever promote
---    post.id onto HAS_CREATOR.properties. Would let `count(post)` per
---    friend be an index-only scan instead of a per-post heap lookup.
---    Schema change at IU6 + load.
+-- 2. Composite index on HAS_INTEREST `(start_id, end_id)` (start_id is
+--    Person, end_id is Tag). Lets the per-post tag-interest existence
+--    check be a tight index probe instead of a hash lookup at large
+--    person-interest cardinalities.
 --
--- 3. AGE per-call call-site overhead — the SF0.1 SQL plan is ~30 ms but
---    benchmark wall time is ~455 ms, so ~420 ms is per-call overhead
---    (parser cache miss, agtype boxing, JDBC text-mode fetch). Same tax
---    that's been documented for SQ6 / IS4 / IC3 / IC5. Resolving this in
---    AGE 1.6 internals would unlock IC10 (and every other Cypher query)
---    further.
+-- 3. Per-Person interest-tag list as denormalised property
+--    `Person.interest_tag_ids` (array). The `<-[:HAS_INTEREST]-(p)` check
+--    becomes `t.id IN p.interest_tag_ids`. Saves an index lookup per
+--    candidate post.
 --
--- 4. Apply V3's `WITH DISTINCT` + late-traversal pattern to other 2-hop
---    KNOWS queries if profiling at SF100+ flags them — the friend-set
---    multiplicity collapse helps any query that fans out before
---    filtering down.
+-- 4. AGE per-call call-site overhead — same as documented elsewhere.
+--
+-- 5. AGE 1.7+ VLE planner improvements would let the 2-hop KNOWS chain
+--    collapse to `(p)-[:KNOWS*2]->(friend)`. Re-evaluate when AGE
+--    upgrades.
 -- ----------------------------------------------------------------------------
