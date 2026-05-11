@@ -1,3 +1,6 @@
+-- LdbcUpdate1AddPerson — also maintains:
+--   Person.city_id              (iter-1 column denorm)
+--   PersonPostCount(person_id)  (iter-2 side table — initialise to 0)
 SELECT * FROM cypher('$graphName', $$
   MATCH (city:City {id: $cityId})
   CREATE (p:Person {
@@ -28,3 +31,12 @@ SELECT * FROM cypher('$graphName', $$
     CREATE (p)-[:WORK_AT {workFrom: w.year}]->(comp)
   RETURN count(*)
 $$) AS (result agtype);
+UPDATE ldbc_snb."Person" pr
+   SET city_id = (SELECT end_id FROM ldbc_snb."IS_LOCATED_IN" WHERE start_id = pr.id LIMIT 1)
+ WHERE CAST(ag_catalog.agtype_object_field_text(pr.properties, 'id') AS bigint) = $personId
+;
+INSERT INTO ldbc_snb."PersonPostCount" (person_id, post_count)
+SELECT id, 0 FROM ldbc_snb."Person"
+ WHERE CAST(ag_catalog.agtype_object_field_text(properties, 'id') AS bigint) = $personId
+ON CONFLICT (person_id) DO NOTHING
+;
