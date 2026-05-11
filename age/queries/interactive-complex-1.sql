@@ -1,5 +1,13 @@
 -- LdbcQuery1 — Friends by firstName (V6 — hybrid SQL CTE reach + Cypher candidates)
 --
+-- CLASSIFICATION NOTE (cypher-restore pass, 2026-05-11):
+--   IC1 V6 IS a genuine hybrid — the Cypher candidates call (step 3 below) does
+--   substantive graph work: firstName MATCH + IS_LOCATED_IN + OPTIONAL MATCH
+--   STUDY_AT/WORK_AT + collect. This is not a trivial seed; it pulls per-person
+--   bio data via graph traversal. Future passes should NOT strip this call.
+--   The SQL recursive CTE (step 2) is the SF1000-safe BFS — the structural
+--   reason is documented below (3-hop var-length pathology, 18× measured).
+--
 -- V1 (the previously-reverted person-driven cypher) ran the entire 3-hop
 -- KNOWS expansion + firstName filter + bio gather as one cypher() call.
 -- At SF3 the 3-hop expansion alone produced ~125 K paths per call →

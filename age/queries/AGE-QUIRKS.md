@@ -128,7 +128,46 @@ and `coalesce()` to pick the deepest non-null.
   miss the post — the SQL has no detection for that case. (Intentional;
   matches the LDBC spec's expected depth.)
 
-## 10. Cypher inside `cypher()` is plan-cached only when parameterised
+## 10. `NOT (p)-[:REL_TYPE]-(n)` pattern negation with typed relationship is rejected by the parser
+
+AGE 1.6 rejects the standard Cypher negated-pattern predicate `NOT (p)-[:KNOWS]-(f2)`
+when the relationship pattern includes an explicit type label. The error is
+`syntax error at or near ":"` — the parser fails on the `:` inside `[:KNOWS]`.
+
+The accepted workaround is `OPTIONAL MATCH (p)-[direct:KNOWS]-(f2) ... WITH ... WHERE direct IS NULL`,
+which is semantically equivalent but verbose. In practice (IC9 V4) this idiom was tested
+and found to scan the full KNOWS table in the 2-hop arm (see quirk §11), so IC9 V4
+uses UNION deduplication instead: the 1-hop arm and the 2-hop arm both filter `friend.id <> $personId`,
+and `UNION` naturally deduplicates the combined set. See the IC9 V4 header for the
+full semantic equivalence argument.
+
+## 11. Undirected `[:REL_TYPE]-` traversal disables index lookup for seed node
+
+When traversing an **undirected** relationship (`-[:KNOWS]-` rather than `-[:KNOWS]->` or
+`<-[:KNOWS]-`), AGE 1.6's planner falls back to a sequential scan on the entire edge table,
+even when the seed node is pinned by a GIN property predicate. The `idx_knows_start` /
+`idx_knows_end` indexes are not used because the planner generates a `JOIN Filter` that
+evaluates both directions after a full edge scan rather than probing each direction index
+separately.
+
+**Implications:**
+- At SF3, the KNOWS edge table has 1.13 M rows. An undirected 2-hop KNOWS traversal
+  (as required for the friends-and-FoF query set) takes **4–5 seconds** regardless of
+  the seed person — the full table is scanned twice (once per hop).
+- Directed traversal (`-[:KNOWS]->`) uses `idx_knows_start` and runs in ~50–130 ms.
+  This is **semantically correct** because IU8 stores KNOWS edges bidirectionally: for
+  every friendship (p1, p2) it creates both `p1->p2` and `p2->p1` edges. Therefore
+  `MATCH (p)-[:KNOWS]->(f)` finds **all** of p's friends via outgoing edges — the same
+  set as undirected traversal. Verified at SF3: directed and undirected return identical
+  friend counts (e.g. 5226 for personId=32985348853480, 4656 for personId=10995116278566).
+- **Affected queries (round 2 fix):** IC9 V4 and IC5 V11 were previously blocked by this
+  pathology when using undirected `-[:KNOWS]-`. Both have now been fixed by switching to
+  directed `->`. IC9 V4 `all_friends` CTE: 4,900 ms → 56 ms (87x speedup). IC5 V11
+  friends CTE: 4,600 ms (undirected) → 231 ms (directed, with OPTIONAL MATCH dedup).
+- **Rule:** Always use `-[:KNOWS]->` in Cypher for KNOWS traversal. Undirected is never
+  needed since IU8 guarantees both directions are stored.
+
+## 12. `cypher()` is plan-cached only when parameterised
 
 If we inline parameter values into the Cypher source as text (e.g.
 `MATCH (p:Person {id: 933})`), every call is a fresh parse + plan.
@@ -160,4 +199,6 @@ shape — a 30–60% improvement on hot queries.
 | 7 | agtype type strictness | loader stores numerics as integers |
 | 8 | GIN required for MATCH | INDEXES.md (every node label has GIN) |
 | 9 | Var-length paths slow | IS2, IS6, IC12 (unrolled OPTIONAL MATCH) |
-| 10 | Plan caching needs params | every query (parameterised path) |
+| 10 | `NOT (p)-[:TYPE]-(n)` negation rejected by parser | IC9 V4 (uses UNION dedup instead) |
+| 11 | Undirected traversal disables seed-node index | IC9 V4, IC5 V11 (fixed round 3: use directed `->`, IU8 guarantees symmetry) |
+| 12 | Plan caching needs params | every query (parameterised path) |

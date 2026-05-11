@@ -1,42 +1,27 @@
--- LdbcQuery8 — Recent replies (V2 — denormalised; mirrors postgres ref)
+-- LdbcQuery8 — Recent replies (V3 — Cypher-only, idiomatic 1-hop)
 --
--- Postgres reference impl pattern:
---   select p1.m_creatorid, p_firstname, p_lastname, p1.m_creationdate, p1.m_messageid, p1.m_content
---     from message p1, message p2, person
---    where p1.m_c_replyof = p2.m_messageid
---      and p2.m_creatorid = :personId
---      and p_personid = p1.m_creatorid
---    order by p1.m_creationdate desc, p1.m_messageid asc limit 20;
+-- V2 did the whole query as SQL JOINs on Comment.reply_of_id and creator_id
+-- (denorm columns). The denorm made it fast (~470 ms at SF3), but the query
+-- no longer expressed any graph navigation — it was pure relational.
 --
--- Uses `m_c_replyof` (REPLY_OF target denormalised onto Comment) and
--- `m_creatorid` (HAS_CREATOR denormalised). Direct indexed JOIN, no edge
--- traversal. We mirror via Comment.reply_of_id and Comment.creator_id +
--- Comment.reply_of_id index, Post.creator_id index.
+-- V3 restores the idiomatic Cypher form. The 1-hop reply pattern is safe:
+--   - No variable-length path (no AGE-QUIRKS §4 risk).
+--   - The untyped `message` intermediate (both Post and Comment can be replied
+--     to) causes AGE 1.6 to plan this as UNION over labels — but the seed is
+--     pinned to a single Person, so cost is bounded to that person's messages.
+--   - AGE's HAS_CREATOR and REPLY_OF native indexes hash-probe directly.
+--   - The fixed ~150 ms Cypher per-call overhead is acceptable for an
+--     SF1000 budget of < 1 s (was ~470 ms SQL; regression accepted for
+--     graph-identity restoration).
 --
--- Hot path: find user's messages (Comment + Post), find Comments whose
--- reply_of_id is in that set, JOIN to author Person.
+-- SF3 budget: < 1 s mean. SF1000 budget: < 1 s mean.
 
-WITH user_gid AS (
-  SELECT id FROM ldbc_snb."Person"
-  WHERE CAST(ag_catalog.agtype_object_field_text(properties, 'id') AS bigint) = $personId
-),
-user_msg_ids AS (
-  SELECT id AS msg_id FROM ldbc_snb."Comment" m
-  WHERE m.creator_id = (SELECT id FROM user_gid)
-  UNION ALL
-  SELECT id FROM ldbc_snb."Post" m
-  WHERE m.creator_id = (SELECT id FROM user_gid)
-)
-SELECT
-  ag_catalog.agtype_object_field_text(au.properties, 'id')::bigint::ag_catalog.agtype                AS personId,
-  ag_catalog.agtype_access_operator(VARIADIC ARRAY[au.properties, '"firstName"'::ag_catalog.agtype])  AS personFirstName,
-  ag_catalog.agtype_access_operator(VARIADIC ARRAY[au.properties, '"lastName"'::ag_catalog.agtype])   AS personLastName,
-  ag_catalog.agtype_object_field_text(reply.properties, 'creationDate')::bigint::ag_catalog.agtype   AS commentCreationDate,
-  ag_catalog.agtype_object_field_text(reply.properties, 'id')::bigint::ag_catalog.agtype             AS commentId,
-  ag_catalog.agtype_access_operator(VARIADIC ARRAY[reply.properties, '"content"'::ag_catalog.agtype]) AS commentContent
-FROM ldbc_snb."Comment" reply
-JOIN user_msg_ids ums ON ums.msg_id = reply.reply_of_id
-JOIN ldbc_snb."Person" au ON au.id = reply.creator_id
-ORDER BY (ag_catalog.agtype_object_field_text(reply.properties, 'creationDate')::bigint) DESC,
-         (ag_catalog.agtype_object_field_text(reply.properties, 'id')::bigint) ASC
-LIMIT 20;
+SELECT * FROM cypher('$graphName', $$
+  MATCH (start:Person {id: $personId})<-[:HAS_CREATOR]-(message)
+        <-[:REPLY_OF]-(reply:Comment)-[:HAS_CREATOR]->(author:Person)
+  RETURN author.id, author.firstName, author.lastName,
+         reply.creationDate, reply.id, reply.content
+  ORDER BY reply.creationDate DESC, reply.id ASC
+  LIMIT 20
+$$) AS (personId agtype, personFirstName agtype, personLastName agtype,
+        commentCreationDate agtype, commentId agtype, commentContent agtype);

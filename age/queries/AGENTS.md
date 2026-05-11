@@ -59,6 +59,8 @@ For each query, read both the YAML spec and the SQL file, then verify:
 
 11. **IU single-statement rule** — each `interactive-update-N.sql` must contain exactly one `cypher()` call. All operations (CREATE node + edges) go inside a single `$$...$$` block using `WITH ... CREATE` chaining. Do not split into multiple SELECT statements.
 
+12. **Never write `cypher(` literally in SQL comments for parameterized queries.** The JDBC handler binds one agtype JSON parameter per `cypher(` occurrence found in the SQL via naive `indexOf("cypher(")` — it does NOT strip comments. If a comment contains `cypher()` or `cypher(` literally, the handler will try to bind more parameters than there are `?` placeholders and the query crashes with `column index is out of range: N, number of columns: M`. Write "Cypher" (no parens) or "the Cypher call" in commentary instead. Applies to any query listed in `age_parameterized_queries` in `driver/*-local.properties` — currently IC4, IC6-IC8, IC10-IC12, IS1-IS5, IS7, IU2, IU3, IU5, IU8. Tracked durable fix: strip SQL comments in `countCypherCalls()` in `AgeUpdateOperationHandler` / `AgeSingletonOperationHandler` / `AgeListOperationHandler`.
+
 ## Known Intentional Deviations — Do NOT Flag as Bugs
 
 | Query | Deviation | Reason |
