@@ -56,7 +56,7 @@ SELECT
     friend_id AS personId,
     friend_fn AS personFirstName,
     friend_ln AS personLastName,
-    ('[' || string_agg(DISTINCT tag_name::text, ', ') || ']')::ag_catalog.agtype AS tagNames,
+    ('[' || string_agg(DISTINCT '"' || (tag_name::text) || '"', ', ') || ']')::ag_catalog.agtype AS tagNames,
     count(DISTINCT comment_id)::text::ag_catalog.agtype AS replyCount
 FROM matched
 GROUP BY friend_id, friend_fn, friend_ln
