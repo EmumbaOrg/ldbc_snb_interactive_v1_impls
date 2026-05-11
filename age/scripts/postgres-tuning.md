@@ -83,6 +83,60 @@ these via the server-parameters portal (which usually handles the restart).
 
 ---
 
+## Local development sizing — macOS / 16 GB Mac
+
+For local SF0.1–SF3 benchmarks on a developer laptop (Apple M2 Pro, 12 cores,
+16 GB RAM, running the AGE Docker container), the 256 GB / 32 vCPU sizing
+above is far too large. Apply these scaled-down values instead. They were
+applied via `ALTER SYSTEM` + a container restart against the
+`apache/age:release_PG18_1.7.0` container and tested at SF3 + thread_count=4:
+
+```sql
+-- Reload-only (no restart needed):
+ALTER SYSTEM SET effective_cache_size           = '10GB';
+ALTER SYSTEM SET work_mem                       = '64MB';
+ALTER SYSTEM SET maintenance_work_mem           = '1GB';
+ALTER SYSTEM SET max_parallel_workers_per_gather = 4;
+ALTER SYSTEM SET max_parallel_workers            = 8;
+ALTER SYSTEM SET max_parallel_maintenance_workers = 4;
+ALTER SYSTEM SET parallel_setup_cost             = 100;
+ALTER SYSTEM SET parallel_tuple_cost             = 0.01;
+ALTER SYSTEM SET random_page_cost                = 1.1;
+ALTER SYSTEM SET effective_io_concurrency        = 200;
+ALTER SYSTEM SET checkpoint_completion_target    = 0.9;
+ALTER SYSTEM SET jit                             = off;
+SELECT pg_reload_conf();
+
+-- Restart-required (need `docker restart <container>` after these):
+ALTER SYSTEM SET shared_buffers       = '4GB';   -- 25% of 16 GB
+ALTER SYSTEM SET wal_buffers          = '64MB';
+ALTER SYSTEM SET max_wal_size         = '4GB';   -- caution: must fit in container volume
+ALTER SYSTEM SET min_wal_size         = '1GB';
+ALTER SYSTEM SET max_connections      = 50;
+ALTER SYSTEM SET max_worker_processes = 12;      -- one per M2 Pro core
+```
+
+**Volume sizing pitfall**: The default Docker Desktop disk allocation may be
+60 GB or less. `max_wal_size = 4GB` plus the SF3 snapshot (~11 GB) plus the
+Docker build cache and other images can fill the VM disk during a restart's
+WAL replay, causing PG to abort recovery with `No space left on device`. If
+that happens, run `docker builder prune -af` to free build cache before
+restarting, or lower `max_wal_size` to `512MB` for tight-disk setups.
+
+| Setting | Production (256 GB / 32 vCPU) | Laptop (16 GB / 12 core) |
+|---|---|---|
+| `shared_buffers` | 64 GB | 4 GB |
+| `effective_cache_size` | 192 GB | 10 GB |
+| `work_mem` | 512 MB | 64 MB |
+| `maintenance_work_mem` | 4 GB | 1 GB |
+| `max_worker_processes` | 32 | 12 |
+| `max_parallel_workers` | 24 | 8 |
+| `max_parallel_workers_per_gather` | 8 | 4 |
+| `max_connections` | 200 | 50 |
+| `max_wal_size` | 16 GB | 4 GB |
+
+---
+
 ## maintenance_work_mem for index builds
 
 The `create-indexes.sql` script is called from `load-data.sh` with:
