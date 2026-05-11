@@ -37,18 +37,21 @@ _LOCAL_HOSTPORT="${_hostportdb%%/*}"
 _LOCAL_DB="${_hostportdb##*/}"
 _LOCAL_ENDPOINT="${_LOCAL_HOSTPORT}/${_LOCAL_DB}"
 
-# ---- Build local properties from templates -----------------------------------
+# ---- Refresh CONNECTION endpoint in *-local.properties files -----------------
+# The *-local.properties files are the canonical source for local SF runs and
+# already point to local SF3 paths. We just refresh the endpoint/user/password
+# from CONNECTION_STRING so the tester can override via env var.
 fill_local_props() {
-  local src="$1" dst="$2"
-  sed \
+  local file="$1"
+  sed -i.bak \
     -e "s|age_endpoint=.*|age_endpoint=${_LOCAL_ENDPOINT}|" \
     -e "s|age_user=.*|age_user=${_LOCAL_USER}|" \
     -e "s|age_password=.*|age_password=${_LOCAL_PASS}|" \
-    "$src" > "$dst"
+    "$file" && rm -f "$file.bak"
 }
 
-fill_local_props "${AGE_DIR}/driver/validate.properties" "${LOCAL_VALIDATE}"
-fill_local_props "${AGE_DIR}/driver/create-validation-parameters.properties" "${LOCAL_CREATE_PARAMS}"
+fill_local_props "${LOCAL_VALIDATE}"
+fill_local_props "${LOCAL_CREATE_PARAMS}"
 
 # ---- Optionally load test data -----------------------------------------------
 if [[ "${1:-}" == "--load" ]]; then
