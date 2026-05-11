@@ -113,20 +113,24 @@ containment predicate, which is only supported by GIN indexes with
 - Every node label has a GIN index on `properties`. Without it, every
   property-keyed MATCH degenerates to a sequential scan. See INDEXES.md.
 
-## 9. Subclass / reply hierarchies are unrolled to fixed depth
+## 9. Subclass / reply hierarchies require alternative traversal strategies
 
-For the same reason as quirk 4 — variable-length paths don't push
-predicates and are slow — we hand-unroll `[:REPLY_OF*]` and
-`[:IS_SUBCLASS_OF*]` to a fixed depth using chained `OPTIONAL MATCH`
-and `coalesce()` to pick the deepest non-null.
+Variable-length paths don't push predicates and are slow (see quirk 4).
+For REPLY_OF and IS_SUBCLASS_OF we use two different strategies:
 
-**Implications:**
-- IS2, IS6 unroll REPLY_OF to depth 8.
-- IC12 unrolls IS_SUBCLASS_OF to depth 6.
-- These depths exceed the maximum observed in LDBC reference data.
-  If a real reply chain were deeper than 8, the query would silently
-  miss the post — the SQL has no detection for that case. (Intentional;
-  matches the LDBC spec's expected depth.)
+**REPLY_OF (IS2, IS6):** Uses a SQL `WITH RECURSIVE` CTE on the REPLY_OF
+edge table directly (depth cap 20). Each step is one indexed lookup on
+`idx_replyof_start`. LDBC reply chains are bounded ~8 across all SFs; the
+depth-20 cap is a safety margin. This completely sidesteps the Cypher
+path-enumeration pathology and the earlier 8-level `OPTIONAL MATCH` ladder
+(which caused untyped-intermediate Parallel Append seq-scans — see quirk 4).
+
+**IS_SUBCLASS_OF (IC12):** Uses a SQL `WITH RECURSIVE` CTE on the
+`TagClass.subclass_of_id` denorm column (iter-3). PostgreSQL terminates the
+recursion naturally when no new rows are produced (the hierarchy is acyclic),
+so no explicit depth cap is needed.
+
+Both strategies avoid the variable-length Cypher pathology entirely.
 
 ## 10. `NOT (p)-[:REL_TYPE]-(n)` pattern negation with typed relationship is rejected by the parser
 
@@ -160,12 +164,14 @@ separately.
   `MATCH (p)-[:KNOWS]->(f)` finds **all** of p's friends via outgoing edges — the same
   set as undirected traversal. Verified at SF3: directed and undirected return identical
   friend counts (e.g. 5226 for personId=32985348853480, 4656 for personId=10995116278566).
-- **Affected queries (round 2 fix):** IC9 V4 and IC5 V11 were previously blocked by this
+- **Affected queries (round 3 fix):** IC9 V4 and IC5 V11 were previously blocked by this
   pathology when using undirected `-[:KNOWS]-`. Both have now been fixed by switching to
   directed `->`. IC9 V4 `all_friends` CTE: 4,900 ms → 56 ms (87x speedup). IC5 V11
   friends CTE: 4,600 ms (undirected) → 231 ms (directed, with OPTIONAL MATCH dedup).
 - **Rule:** Always use `-[:KNOWS]->` in Cypher for KNOWS traversal. Undirected is never
-  needed since IU8 guarantees both directions are stored.
+  needed since IU8 guarantees both directions are stored. This rule applies to ALL queries
+  that traverse KNOWS: IC1, IC2, IC3, IC5, IC6, IC9, IC10, IC11, IS3, IS7, and any new
+  query involving friends or FOF. See AGENTS.md rule 4 for the review checklist entry.
 
 ## 12. `cypher()` is plan-cached only when parameterised
 
@@ -198,7 +204,7 @@ shape — a 30–60% improvement on hot queries.
 | 6 | UNION over nodes hangs | every UNION arm projects scalars |
 | 7 | agtype type strictness | loader stores numerics as integers |
 | 8 | GIN required for MATCH | INDEXES.md (every node label has GIN) |
-| 9 | Var-length paths slow | IS2, IS6, IC12 (unrolled OPTIONAL MATCH) |
+| 9 | Var-length paths slow | IS2, IS6 (SQL recursive CTE on REPLY_OF); IC12 (SQL recursive CTE on TagClass.subclass_of_id denorm) |
 | 10 | `NOT (p)-[:TYPE]-(n)` negation rejected by parser | IC9 V4 (uses UNION dedup instead) |
-| 11 | Undirected traversal disables seed-node index | IC9 V4, IC5 V11 (fixed round 3: use directed `->`, IU8 guarantees symmetry) |
+| 11 | Undirected traversal disables seed-node index | IC1, IC2, IC3, IC5, IC6, IC9, IC10, IC11, IS3, IS7 (all fixed: use directed `->`, IU8 guarantees symmetry) |
 | 12 | Plan caching needs params | every query (parameterised path) |

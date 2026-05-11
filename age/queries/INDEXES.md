@@ -129,21 +129,82 @@ CREATE INDEX idx_post_date_id    ON ldbc_snb."Post"
 
 | Query | Primary indexes used |
 |---|---|
-| IC1 | `gin_person` (entry), `idx_knows_start/end` × 3, `idx_person_firstname` (filter) |
-| IC2, IC8, IC9 | `gin_person` (entry), `idx_knows_start/end`, `idx_hascreator_*`, `idx_comment_date_id` / `idx_post_date_id` |
+| IC1 | `gin_person` (seed graphid + firstName candidate), `idx_knows_start` (BFS walk via KNOWS edge table directly) |
+| IC2 | `gin_person` (entry), `idx_knows_start/end`, `idx_hascreator_*`, `idx_comment_date_id` / `idx_post_date_id` |
 | IC3 | `gin_person`, `idx_knows_*`, `idx_hascreator_*`, `idx_comment_date` / `idx_post_date`, `idx_country_name`, `gin_country` |
 | IC4 | `gin_person`, `idx_knows_*`, `idx_hascreator_*`, `idx_hastag_*`, `idx_post_date` |
-| IC5 | `gin_person`, `idx_knows_*`, `idx_hasmember_*`, `idx_hascreator_*`, `idx_containerof_*` |
+| IC5 | `gin_person` (entry), `idx_knows_start` (directed friend graphids via Cypher UNION), `idx_hasmember_end` (friend→forum), `idx_fmpc_member` (`ForumMemberPostCount` side-table lookup) |
 | IC6 | `gin_person`, `idx_knows_*`, `idx_hascreator_*`, `idx_hastag_*`, `idx_tag_name` |
 | IC7 | `gin_person`, `idx_hascreator_*`, `idx_likes_*` |
-| IC10 | `gin_person`, `idx_knows_*`, `idx_islocatedin_*`, `idx_hascreator_*`, `idx_hastag_*`, `idx_hasinterest_*` |
+| IC8 | `gin_person` (entry), `idx_hascreator_*` (untyped intermediate; AGE plans as label UNION internally — bounded cost) |
+| IC9 | `gin_person` (entry), `idx_knows_start` (directed friend graphids), `idx_comment_date_id` / `idx_post_date_id` (date-DESC walk + semi-join on `hc.end_id`), `idx_hascreator_start` (semi-join probe) |
+| IC10 | `gin_person` (entry), `idx_knows_start` (directed 2-hop FoF), `idx_islocatedin_*` (city), `idx_post_creator_id` (denorm: per-FoF post scan), `idx_hastag_*`, `idx_hasinterest_start_end` (composite), `PersonPostCount` PK (total post count) |
 | IC11 | `gin_person`, `idx_knows_*`, `idx_workat_*`, `idx_islocatedin_*`, `idx_country_name` |
-| IC12 | `gin_tagclass` + `idx_tagclass_name` (entry), `gin_person`, `idx_knows_*`, `idx_hascreator_*`, `idx_replyof_*`, `idx_hastag_*`, `idx_hastype_*`, `idx_issubclassof_*` |
-| IS1, IS3 | `gin_person`, `idx_islocatedin_*` (IS1), `idx_knows_*` (IS3) |
-| IS2 | `gin_person`, `idx_hascreator_*`, `idx_replyof_*`, `idx_comment_date_id` / `idx_post_date_id` |
+| IC12 | `gin_person` (friends), `gin_tagclass` (root TagClass seed), `idx_tagclass_subclass_of_id` (recursive subclass walk), `idx_tag_tagclass_id` (valid tags), `idx_comment_creator_id` (denorm), `idx_comment_reply_of_id` (denorm), `idx_hastag_*` |
+| IS1, IS3 | `gin_person`, `idx_islocatedin_*` (IS1), `idx_knows_start` (IS3 — directed) |
+| IS2 | `gin_person`, `idx_hascreator_*`, `idx_replyof_start` (recursive CTE REPLY_OF walk), `idx_comment_date_id` / `idx_post_date_id` |
 | IS4, IS5 | `gin_comment` / `gin_post`, `idx_hascreator_*` (IS5) |
-| IS6, IS7 | `gin_comment` / `gin_post`, `idx_replyof_*`, `idx_containerof_*` (IS6), `idx_hasmoderator_*` (IS6), `idx_knows_*` (IS7) |
-| IU1–IU8 | `gin_*` for entry MATCHes; edge `idx_*_start/end` for existence checks |
+| IS6 | `gin_post` / `gin_comment` (seed), `idx_replyof_start` (recursive CTE REPLY_OF walk), `idx_containerof_end`, `idx_hasmoderator_start` |
+| IS7 | `gin_comment` / `gin_post`, `idx_replyof_end`, `idx_hascreator_*`, `idx_knows_start` (directed, know-check) |
+| IU1–IU8 | `gin_*` for entry MATCHes; edge `idx_*_start/end` for existence checks; denorm-column indexes for UPDATE lookups |
+
+---
+
+## Denorm column indexes (iter-1/2/3)
+
+These B-tree indexes back the denormalized graphid columns added by
+`age/scripts/denormalize-schema.sql`. They enable direct indexed JOINs
+on the entity tables without going through the AGE edge tables.
+
+### Single-column denorm indexes
+
+```sql
+-- Post
+CREATE INDEX idx_post_creator_id    ON ldbc_snb."Post"    (creator_id);
+CREATE INDEX idx_post_forum_id      ON ldbc_snb."Post"    (forum_id);
+CREATE INDEX idx_post_country_id    ON ldbc_snb."Post"    (country_id);
+-- Comment
+CREATE INDEX idx_comment_creator_id  ON ldbc_snb."Comment" (creator_id);
+CREATE INDEX idx_comment_reply_of_id ON ldbc_snb."Comment" (reply_of_id);
+CREATE INDEX idx_comment_country_id  ON ldbc_snb."Comment" (country_id);
+-- Forum / Person
+CREATE INDEX idx_forum_moderator_id  ON ldbc_snb."Forum"   (moderator_id);
+CREATE INDEX idx_person_city_id      ON ldbc_snb."Person"  (city_id);
+-- Tag / TagClass / Place hierarchy
+CREATE INDEX idx_tag_tagclass_id           ON ldbc_snb."Tag"      (tagclass_id);
+CREATE INDEX idx_tagclass_subclass_of_id   ON ldbc_snb."TagClass" (subclass_of_id);
+CREATE INDEX idx_city_country_id           ON ldbc_snb."City"     (country_id);
+CREATE INDEX idx_country_continent_id      ON ldbc_snb."Country"  (continent_id);
+CREATE INDEX idx_university_city_id        ON ldbc_snb."University" (city_id);
+CREATE INDEX idx_company_country_id        ON ldbc_snb."Company"  (country_id);
+```
+
+### Composite covering indexes (hot JOIN patterns)
+
+```sql
+-- IC5: forum_id = X AND creator_id = Y (Post LEFT JOIN in ForumMemberPostCount)
+CREATE INDEX idx_post_forum_creator ON ldbc_snb."Post" (forum_id, creator_id);
+
+-- IC2/IC8: per-friend top-K messages (creator_id + creationDate DESC).
+-- The creationDate expression uses the AGE agtype operator so the index
+-- backs the same agtype DESC comparisons used in the SQL outer arms.
+CREATE INDEX idx_post_creator_creationdate
+    ON ldbc_snb."Post"
+    (creator_id, ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"creationDate"'::ag_catalog.agtype]) DESC);
+CREATE INDEX idx_comment_creator_creationdate
+    ON ldbc_snb."Comment"
+    (creator_id, ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"creationDate"'::ag_catalog.agtype]) DESC);
+```
+
+### Side-table indexes
+
+```sql
+-- ForumMemberPostCount: PK is (forum_id, member_id); secondary on member_id for IC5 probe
+CREATE INDEX idx_fmpc_member ON ldbc_snb."ForumMemberPostCount" (member_id);
+
+-- HAS_INTEREST composite covering (IC10 per-post interest check)
+CREATE INDEX idx_hasinterest_start_end ON ldbc_snb."HAS_INTEREST" (start_id, end_id);
+```
 
 ---
 

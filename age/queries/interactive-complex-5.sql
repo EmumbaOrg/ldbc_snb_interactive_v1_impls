@@ -1,24 +1,9 @@
--- LdbcQuery5 — Recent groups (V11 — Cypher friend tree + SQL aggregate)
---
--- V10 was fake-hybrid: only a trivial Cypher seed for graphid lookup; reach +
--- HAS_MEMBER + Forum + FMPC all done in SQL. V11 restores Cypher as graph
--- navigator for the friend tree (the part that IS graph traversal); HAS_MEMBER
--- + Forum + FMPC stay in SQL because the aggregate side table is what makes
--- the GROUP BY tractable. This mirrors IC10 V5 — the canonical genuine-hybrid
--- shape in this codebase.
---
--- Directed `-[:KNOWS]->` per AGE-QUIRKS §11 (undirected forces KNOWS seq scan).
--- KNOWS is stored bidirectionally (IU8 inserts both p1->p2 and p2->p1), so
--- directed walk still finds every friendship via the start_id index.
--- Prior passes used undirected `-[:KNOWS]-` which caused the all_friends CTE
--- to take ~4.6 s at SF3 (seq scan on 1.13 M rows). Directed traversal fixes
--- this — same pattern proven in IC10 V5 (interactive-complex-10.sql line 30).
---
--- Measured at SF3 (sample 1, personId=26388279078570, minDate=…):
---   V10 single-call: 0.83 s wall
---   V11 single-call: target < 2 s mean (< 8 s mean at SF1000)
---
--- SF3 budget: < 2 s mean. SF1000 budget: < 8 s mean.
+-- LdbcQuery5 — Recent forums (joined after minDate) that 1- or 2-hop friends joined, with post counts.
+-- Hybrid: Cypher call fetches 1+2-hop friend graphids via fixed-depth MATCH UNION (no variable-length
+-- path per AGE-QUIRKS §4); SQL JOINs HAS_MEMBER + Forum + ForumMemberPostCount side table.
+-- Directed `-[:KNOWS]->` per AGE-QUIRKS §11 — undirected forces a KNOWS seq scan; IU8 stores
+-- both directions so directed traversal finds all friends via idx_knows_start.
+-- Denorm used: ForumMemberPostCount(forum_id, member_id) (iter-2 aggregate side table).
 
 WITH friends AS (
   SELECT (friend_gid::text)::ag_catalog.graphid AS friend_id

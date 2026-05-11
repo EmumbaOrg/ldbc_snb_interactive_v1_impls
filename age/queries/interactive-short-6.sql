@@ -1,93 +1,10 @@
--- LdbcShortQuery6MessageForum (iter-1 — pure SQL, structural choice — see note below)
---
--- CLASSIFICATION NOTE (cypher-restore pass, 2026-05-11):
---   IS6 intentionally remains pure SQL. This is NOT an oversight — it is the
---   correct choice given AGE 1.6 pathologies. The reasoning:
---
---   1. THE GRAPH TRAVERSAL PART (REPLY_OF chain) IS ALREADY IN SQL.
---      The most "graph-like" piece of IS6 — walking a Comment back to its root
---      Post through a variable-depth REPLY_OF chain — MUST stay in SQL because
---      AGE 1.6 cannot plan variable-length paths efficiently (see AGE-QUIRKS §4,
---      §9). The pathology: each untyped intermediate is planned as a UNION ALL
---      over every vertex label, and the final `MATCH (p:Post)` triggers a full
---      Post seq-scan regardless of the seed. Measured at SF0.1: ~950 ms Cypher
---      vs ~0.5 ms SQL. At SF1000 the Post seq-scan would dominate. Structural.
---
---   2. THE TRAILING LOOKUP (Forum + HAS_MODERATOR + Person) IS NOT GRAPH TRAVERSAL.
---      After the SQL walk identifies the rootPost graphid, the remaining work is
---      3 indexed-JOIN dereferences on well-known, typed relationships. Moving
---      these into a cypher() call would:
---        (a) Add ~150 ms constant cypher() per-call overhead.
---        (b) Require scanning all (Post, Forum, Person) tuples and filtering by
---            rootPost graphid in SQL — wasteful at SF1000 (millions of tuples).
---        (c) Provide zero graph-identity benefit: looking up a forum by a known
---            graphid is not "graph traversal" any more than a B-tree join is.
---
---   CONCLUSION: IS6 is a "structurally pure-SQL" query, not a "fake-hybrid".
---   The graph traversal (REPLY_OF chain walk) is in SQL for AGE-documented
---   structural reasons. Adding cypher() for the trailing lookup would add
---   overhead with zero identity gain. Documented here to prevent future passes
---   from incorrectly converting this query.
---
--- Original Cypher implementation, kept for reference (measured ~950-1700 ms at SF0.1):
--- ----------------------------------------------------------------------------
--- SELECT forumId, forumTitle, moderatorId, moderatorFirstName, moderatorLastName
--- FROM (
---   SELECT 1 AS src, * FROM cypher('$graphName', $$
---     MATCH (m:Comment {id: $messageId})-[:REPLY_OF]->(r1)
---     OPTIONAL MATCH (r1)-[:REPLY_OF]->(r2)
---     OPTIONAL MATCH (r2)-[:REPLY_OF]->(r3)
---     OPTIONAL MATCH (r3)-[:REPLY_OF]->(r4)
---     OPTIONAL MATCH (r4)-[:REPLY_OF]->(r5)
---     OPTIONAL MATCH (r5)-[:REPLY_OF]->(r6)
---     OPTIONAL MATCH (r6)-[:REPLY_OF]->(r7)
---     OPTIONAL MATCH (r7)-[:REPLY_OF]->(r8)
---     WITH coalesce(r8, r7, r6, r5, r4, r3, r2, r1) AS rootPost
---     MATCH (p:Post)<-[:CONTAINER_OF]-(forum:Forum)-[:HAS_MODERATOR]->(mod:Person)
---     WHERE id(p) = id(rootPost)
---     RETURN forum.id, forum.title, mod.id, mod.firstName, mod.lastName
---   $$) AS (forumId agtype, forumTitle agtype, moderatorId agtype,
---           moderatorFirstName agtype, moderatorLastName agtype)
---   UNION ALL
---   SELECT 2 AS src, * FROM cypher('$graphName', $$
---     MATCH (post:Post {id: $messageId})<-[:CONTAINER_OF]-(forum:Forum)-[:HAS_MODERATOR]->(mod:Person)
---     RETURN forum.id, forum.title, mod.id, mod.firstName, mod.lastName
---   $$) AS (forumId agtype, forumTitle agtype, moderatorId agtype,
---           moderatorFirstName agtype, moderatorLastName agtype)
--- ) forum
--- ORDER BY src
--- LIMIT 1;
--- ----------------------------------------------------------------------------
---
--- Original Cypher implementation, kept for reference:
--- ----------------------------------------------------------------------------
--- SELECT forumId, forumTitle, moderatorId, moderatorFirstName, moderatorLastName
--- FROM (
---   SELECT 1 AS src, * FROM cypher('$graphName', $$
---     MATCH (m:Comment {id: $messageId})-[:REPLY_OF]->(r1)
---     OPTIONAL MATCH (r1)-[:REPLY_OF]->(r2)
---     OPTIONAL MATCH (r2)-[:REPLY_OF]->(r3)
---     OPTIONAL MATCH (r3)-[:REPLY_OF]->(r4)
---     OPTIONAL MATCH (r4)-[:REPLY_OF]->(r5)
---     OPTIONAL MATCH (r5)-[:REPLY_OF]->(r6)
---     OPTIONAL MATCH (r6)-[:REPLY_OF]->(r7)
---     OPTIONAL MATCH (r7)-[:REPLY_OF]->(r8)
---     WITH coalesce(r8, r7, r6, r5, r4, r3, r2, r1) AS rootPost
---     MATCH (p:Post)<-[:CONTAINER_OF]-(forum:Forum)-[:HAS_MODERATOR]->(mod:Person)
---     WHERE id(p) = id(rootPost)
---     RETURN forum.id, forum.title, mod.id, mod.firstName, mod.lastName
---   $$) AS (forumId agtype, forumTitle agtype, moderatorId agtype,
---           moderatorFirstName agtype, moderatorLastName agtype)
---   UNION ALL
---   SELECT 2 AS src, * FROM cypher('$graphName', $$
---     MATCH (post:Post {id: $messageId})<-[:CONTAINER_OF]-(forum:Forum)-[:HAS_MODERATOR]->(mod:Person)
---     RETURN forum.id, forum.title, mod.id, mod.firstName, mod.lastName
---   $$) AS (forumId agtype, forumTitle agtype, moderatorId agtype,
---           moderatorFirstName agtype, moderatorLastName agtype)
--- ) forum
--- ORDER BY src
--- LIMIT 1;
--- ----------------------------------------------------------------------------
+-- LdbcShortQuery6MessageForum — return the containing forum and moderator for a message.
+-- Structurally pure SQL — no Cypher calls. This is intentional, not an oversight:
+--   1. REPLY_OF chain walk (Comment → root Post) must be SQL because AGE variable-length
+--      paths hit an untyped-intermediate seq-scan pathology (AGE-QUIRKS §4, §9).
+--   2. Trailing Forum+HAS_MODERATOR+Person lookup is 3 indexed B-tree JOINs on known
+--      graphids — adding a Cypher block would add per-call overhead with zero graph-identity
+--      benefit. Do NOT convert this query to a Cypher call in future passes.
 
 WITH RECURSIVE
   post_seed AS MATERIALIZED (

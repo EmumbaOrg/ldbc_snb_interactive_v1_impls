@@ -1,3 +1,8 @@
+-- LdbcShortQuery3PersonFriends — list direct friends of a person, sorted by friendship date.
+-- Pure Cypher: single MATCH (Person)-[:KNOWS]->(Person) with ORDER BY on the edge property.
+-- Directed `-[:KNOWS]->` traversal per AGE-QUIRKS §11; IU8 stores both directions so all
+-- friends are found via idx_knows_start without a full edge-table scan.
+
 SELECT * FROM cypher('$graphName', $$
   MATCH (n:Person {id: $personId})-[r:KNOWS]->(friend:Person)
   RETURN friend.id, friend.firstName, friend.lastName, r.creationDate

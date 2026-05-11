@@ -1,15 +1,10 @@
--- LdbcUpdate7AddComment
---
--- Split into TWO cypher() calls to avoid the AGE MVCC concurrency trigger
--- documented in age/AGE-1.6-MVCC-BUG.md. The prior single-block form had:
---   (1) Untyped MATCH (replyTo {id: ...}) — AGE-QUIRKS §9 label-explosion,
---   (2) WITH comment + UNWIND $tagIds + CREATE (comment)-[:HAS_TAG]->(t) —
---       re-reads the just-created comment vertex per iteration inside the
---       same Cypher block, which under concurrency hits issue #1954
---       ("vertex assigned to variable comment was deleted").
--- Splitting into two cypher() calls puts the HAS_TAG fan-out in a fresh
--- transaction-visibility window where `comment` is already committed.
--- Also maintains Comment.creator_id, reply_of_id, country_id denorm columns.
+-- LdbcUpdate7AddComment — create a Comment vertex with HAS_CREATOR/REPLY_OF/IS_LOCATED_IN/HAS_TAG edges.
+-- Hybrid: TWO Cypher calls split to avoid the AGE MVCC concurrency trigger (see AGE-1.6-MVCC-BUG.md).
+--   Call 1: creates Comment + HAS_CREATOR + REPLY_OF + IS_LOCATED_IN.
+--   Call 2: MATCH existing Comment + UNWIND $tagIds + CREATE HAS_TAG — runs in a fresh
+--           visibility window where the Comment is already committed, avoiding issue #1954.
+-- Untyped MATCH avoided by using OPTIONAL MATCH (rp:Post) + OPTIONAL MATCH (rc:Comment) (AGE-QUIRKS §9).
+-- SQL UPDATE maintains Comment.{creator_id, reply_of_id, country_id} (iter-1 column denorm).
 
 SELECT * FROM cypher('$graphName', $$
   MATCH (author:Person {id: $authorPersonId}),

@@ -1,21 +1,10 @@
--- LdbcQuery10 — Similar persons (V5 — hybrid using PersonPostCount + denorm)
---
--- V4 used Cypher walks for everything: 2-hop KNOWS + DISTINCT + birth filter +
--- direct exclusion + city lookup + per-friend post enumeration + per-post
--- tag-interest check. SF3: 23.8 s → 13.2 s after collect+UNWIND barrier.
--- The per-friend post enumeration (~108 posts/friend at SF3 → ~10 800 at
--- SF1000) is the dominant remaining cost.
---
--- V5 keeps Cypher for the friend tree (KNOWS is N:N — same as postgres ref's
--- `knows` join table) but moves all post-counting to SQL using the iter-2
--- aggregate side tables + iter-1 column denorms:
---   - `PersonPostCount.post_count` replaces postCount enumeration with a
---     single index lookup per friend.
---   - `Post.creator_id` (denorm) + `HAS_TAG` + composite
---     `idx_hasinterest_start_end(start_id, end_id)` give the common-interest
---     post count via a 3-table indexed JOIN — no Cypher OPTIONAL MATCH walk.
---
--- Estimated SF3 mean: 13.2 s → ~1.5 s. SF1000: ~50 s → ~6 s.
+-- LdbcQuery10 — FoF with birth-window match, scored by common-interest posts vs total posts.
+-- Hybrid: Cypher call computes 2-hop FoF with birth filter (birthMonth/birthDay precomputed
+-- per AGE-QUIRKS §1) and direct-friend exclusion; SQL computes commonInterestScore using
+-- PersonPostCount side table + Post.creator_id denorm + HAS_TAG/HAS_INTEREST indexed JOIN.
+-- Directed `-[:KNOWS]->` per AGE-QUIRKS §11. Fixed-depth MATCH UNION instead of variable-length
+-- path per AGE-QUIRKS §4.
+-- Denorm used: Post.creator_id (iter-1), PersonPostCount(person_id) (iter-2 aggregate).
 
 WITH surviving_friends AS (
   SELECT

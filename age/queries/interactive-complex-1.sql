@@ -1,43 +1,11 @@
--- LdbcQuery1 — Friends by firstName (V6 — hybrid SQL CTE reach + Cypher candidates)
---
--- CLASSIFICATION NOTE (cypher-restore pass, 2026-05-11):
---   IC1 V6 IS a genuine hybrid — the Cypher candidates call (step 3 below) does
---   substantive graph work: firstName MATCH + IS_LOCATED_IN + OPTIONAL MATCH
---   STUDY_AT/WORK_AT + collect. This is not a trivial seed; it pulls per-person
---   bio data via graph traversal. Future passes should NOT strip this call.
---   The SQL recursive CTE (step 2) is the SF1000-safe BFS — the structural
---   reason is documented below (3-hop var-length pathology, 18× measured).
---
--- V1 (the previously-reverted person-driven cypher) ran the entire 3-hop
--- KNOWS expansion + firstName filter + bio gather as one cypher() call.
--- At SF3 the 3-hop expansion alone produced ~125 K paths per call →
--- mean 13.9 s, p99 22.8 s.
---
--- V6 splits the work:
---   (1) Cypher seed call: convert business `$personId` to graphid (cheap).
---   (2) SQL recursive CTE on the `KNOWS` table walks 1–3 hops with shortest
---       distance (MIN(dist) per node). Pure-SQL BFS is what TigerGraph
---       does via per-vertex `@distance` accumulators with early
---       termination; PostgreSQL recursive CTE is the relational
---       equivalent.
---   (3) Cypher candidates call: pull all Persons matching $firstName
---       with their bio columns (city, universities, companies) — small
---       set, indexed via gin_person + idx_person_firstname.
---   (4) SQL JOIN: filter candidates by reach.dist, order by
---       (dist, lastName, id), LIMIT 20.
---
--- Why hybrid not pure SQL: project constraint requires Cypher or
--- Cypher+SQL. The recursive CTE alone would work, but we keep two
--- cypher() calls for the small lookups so the query is auditable as
--- graph-shaped.
---
--- Measured at SF3 (sample 1, personId=4398046536251, firstName=Joseph):
---   V1 single-call: ~10-15 s wall (multi-thread)
---   V6 single-call: 0.75 s wall (~18× faster)
---
--- SF1000 outlook: 3-hop reach with branching factor ~36 → ~125K KNOWS
--- traversals + ~50K unique reach nodes. Cypher candidates: ~1000
--- firstName matches with bio. Estimated SF1000 mean: 1.5–3 s.
+-- LdbcQuery1 — Persons within 3 KNOWS-hops matching a firstName, with bio data, sorted by distance.
+-- Hybrid: Cypher seed call converts $personId to graphid; SQL recursive CTE walks KNOWS 1-3 hops
+-- (BFS with MIN-distance per node); second Cypher call fetches firstName-matching candidates with
+-- city/university/company data via OPTIONAL MATCH; SQL JOIN filters by reach and orders.
+-- 3-hop variable-length Cypher hits path-enumeration at scale (AGE-QUIRKS §4) — SQL CTE is the fix.
+-- Directed `-[:KNOWS]->` traversal per AGE-QUIRKS §11 (IU8 stores both directions).
+-- TODO: when gin_person firstName selectivity weakens at SF1000+, add a btree index on
+--       extracted firstName and rewrite the Cypher candidates call as a SQL scan.
 
 SELECT
   c.friend_id        AS friendId,

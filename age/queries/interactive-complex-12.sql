@@ -1,15 +1,10 @@
--- LdbcQuery12 — Expert search (V2 — iter-3 denorm + MATERIALIZED + agtype casts)
---
--- V1: hybrid Cypher (TagClass hierarchy + friends) + SQL edge-table JOINs.
---     SF3 mean 875 ms.
--- V2 review fixes:
---   1. Denorm columns: Comment.creator_id, Comment.reply_of_id,
---      Tag.tagclass_id, TagClass.subclass_of_id — two fewer edge-table JOINs.
---   2. ldbc_snb.* literal schema refs; explicit graphid casts on cross-type joins.
---   3. Result columns cast to ag_catalog.agtype for handler compatibility.
---   4. valid_tags AS MATERIALIZED — prevents planner from inlining into HAS_TAG
---      at SF1000 (valid_tags ≈ 50-200 rows vs HAS_TAG ≈ 240 M rows).
---   5. All $params kept inside cypher calls so parameterized mode works.
+-- LdbcQuery12 — Friends who replied to posts tagged under a TagClass subtree, with tag names.
+-- Hybrid: two Cypher calls (TagClass root graphid, direct friend graphids); SQL walks
+-- TagClass.subclass_of_id denorm recursively, filters valid Tags via tagclass_id denorm,
+-- then JOINs Comment.{creator_id, reply_of_id} denorm + HAS_TAG for matched comments.
+-- valid_tags AS MATERIALIZED prevents planner from inlining into HAS_TAG at scale.
+-- Denorm used: Comment.creator_id, Comment.reply_of_id, Tag.tagclass_id,
+--              TagClass.subclass_of_id (all iter-3).
 
 WITH RECURSIVE
 valid_classes(class_id) AS (

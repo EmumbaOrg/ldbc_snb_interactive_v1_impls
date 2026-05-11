@@ -1,20 +1,8 @@
--- LdbcQuery8 — Recent replies (V3 — Cypher-only, idiomatic 1-hop)
---
--- V2 did the whole query as SQL JOINs on Comment.reply_of_id and creator_id
--- (denorm columns). The denorm made it fast (~470 ms at SF3), but the query
--- no longer expressed any graph navigation — it was pure relational.
---
--- V3 restores the idiomatic Cypher form. The 1-hop reply pattern is safe:
---   - No variable-length path (no AGE-QUIRKS §4 risk).
---   - The untyped `message` intermediate (both Post and Comment can be replied
---     to) causes AGE 1.6 to plan this as UNION over labels — but the seed is
---     pinned to a single Person, so cost is bounded to that person's messages.
---   - AGE's HAS_CREATOR and REPLY_OF native indexes hash-probe directly.
---   - The fixed ~150 ms Cypher per-call overhead is acceptable for an
---     SF1000 budget of < 1 s (was ~470 ms SQL; regression accepted for
---     graph-identity restoration).
---
--- SF3 budget: < 1 s mean. SF1000 budget: < 1 s mean.
+-- LdbcQuery8 — Recent replies to any of the user's messages, with author info.
+-- Pure Cypher: single call walks HAS_CREATOR ← message ← REPLY_OF ← Comment → HAS_CREATOR → author.
+-- Untyped `message` intermediate causes AGE to plan as UNION over labels internally (AGE-QUIRKS §3),
+-- but cost is bounded to the seed Person's messages so no seq-scan risk. No variable-length path
+-- (AGE-QUIRKS §4 does not apply). ORDER+LIMIT inside the Cypher block is a final RETURN — safe.
 
 SELECT * FROM cypher('$graphName', $$
   MATCH (start:Person {id: $personId})<-[:HAS_CREATOR]-(message)

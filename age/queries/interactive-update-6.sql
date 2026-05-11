@@ -1,4 +1,6 @@
--- LdbcUpdate6AddPost — maintains:
+-- LdbcUpdate6AddPost — create a Post vertex with HAS_CREATOR/CONTAINER_OF/IS_LOCATED_IN/HAS_TAG edges.
+-- Hybrid: Cypher block creates Post + all edges in one chained WITH/UNWIND block.
+-- SQL UPDATE/INSERT maintains:
 --   Post.{creator_id, forum_id, country_id}     (iter-1 column denorm)
 --   ForumMemberPostCount(forum_id, member_id)   (iter-2 aggregate)
 --   PersonPostCount(person_id)                  (iter-2 aggregate)
@@ -32,7 +34,7 @@ UPDATE ldbc_snb."Post" p
 ;
 -- Aggregate INSERTs: SELECT DISTINCT ... LIMIT 1 guards against pre-existing
 -- duplicate label rows (e.g. data has a Forum with the same business id
--- twice — would otherwise cause the cypher() CREATE to fan-out and produce
+-- twice — would otherwise cause the Cypher block CREATE to fan-out and produce
 -- duplicate Posts, which would then violate ON CONFLICT). The single
 -- (forum_id, creator_id) tuple is what we want to record either way.
 INSERT INTO ldbc_snb."ForumMemberPostCount" (forum_id, member_id, post_count)

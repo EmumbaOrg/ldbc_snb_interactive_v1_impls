@@ -1,38 +1,14 @@
--- LdbcQuery9 — Recent messages by friends and friends-of-friends (V4 — hybrid: Cypher reach + SQL walk)
---
--- V3 was pure SQL. The 2-hop friend reach is now in Cypher (one cypher() call
--- using fixed-depth MATCH UNION — no variable-length path per AGE-QUIRKS §4).
--- SQL retains the date-DESC index walk on idx_comment_date_id / idx_post_date_id
--- with a Nested Loop Semi Join against the friend set — the planner stops the
--- index walk as soon as 20 friend-authored rows accumulate. This is the
--- SF1000-critical optimisation; it is not a cosmetic detour.
---
--- Why Cypher UNION is semantically equivalent to V3 SQL's (direct UNION foaf):
---   V3 computed: all_friends = 1-hop UNION (2-hop MINUS 1-hop MINUS self).
---   V4 Cypher computes: UNION of {1-hop MINUS self} and {2-hop MINUS self}.
---   UNION deduplication ensures each graphid appears once. The result set is
---   identical: every person within 2 hops of the seed person, excluding self.
---   Verified byte-for-byte against V3 on 2 SF3 sample inputs.
---
--- AGE 1.6 note: `NOT (p)-[:KNOWS]-(f2)` with relationship type in pattern
--- negation is rejected by the parser ("syntax error at or near ':'"). The
--- UNION deduplication approach is used instead — semantically equivalent.
---
--- DIRECTED TRAVERSAL REQUIRED (AGE-QUIRKS §11): This query uses `-[:KNOWS]->`
--- (directed) rather than `-[:KNOWS]-` (undirected). Undirected KNOWS traversal
--- forces a sequential scan of the entire KNOWS edge table (1.13 M rows at SF3,
--- ~80 M rows at SF1000), causing the all_friends CTE to take ~4.9 s at SF3 —
--- a 25x budget overrun. Directed `->` traversal uses idx_knows_start and runs
--- in ~50–100 ms. This is semantically correct because IU8 stores KNOWS edges
--- bidirectionally: every friendship (p1, p2) creates both p1->p2 AND p2->p1
--- edges. So MATCH (p)-[:KNOWS]->(f) finds ALL of p's friends via outgoing edges.
--- This is the same pattern used by IC10 V5 (see interactive-complex-10.sql line 30).
---
--- Parameterization: stays OUT of age_parameterized_queries — the cypher()
--- call uses $personId (Cypher param) while the outer SQL uses $maxDate
--- (string-interpolated). The two can't share a single agtype JSON bind.
---
--- SF3 budget: < 200 ms mean. SF1000 budget: < 800 ms mean.
+-- LdbcQuery9 — Top-20 recent messages (before maxDate) by friends and FoF.
+-- Hybrid: one Cypher call builds the 1+2-hop friend graphid set via fixed-depth MATCH UNION
+-- (no variable-length path per AGE-QUIRKS §4); SQL walks idx_comment_date_id / idx_post_date_id
+-- backwards and stops via Nested Loop Semi Join once 20 friend-authored rows accumulate.
+-- Directed `-[:KNOWS]->` per AGE-QUIRKS §11 — undirected forces a KNOWS seq scan at scale.
+-- Typed-relationship pattern negation `NOT (p)-[:KNOWS]-(f)` is rejected by the AGE parser
+-- (AGE-QUIRKS §10); UNION deduplication is semantically equivalent and used here.
+-- Excluded from age_parameterized_queries: the Cypher block uses $personId while outer SQL
+-- uses $maxDate — they cannot share a single agtype JSON bind.
+-- TODO: if at SF1000+ the date-DESC walk runs long before hitting 20 friend rows, push
+--       creationDate onto HAS_CREATOR edge and add composite idx_hascreator_end_creationdate.
 
 WITH all_friends AS (
   SELECT (g::text)::ag_catalog.graphid AS friend_id
@@ -89,30 +65,3 @@ FROM (SELECT * FROM top_comments UNION ALL SELECT * FROM top_posts) t
 JOIN ldbc_snb."Person" per ON per.id = t.author_gid
 ORDER BY t.cdate DESC, t.msg_id_biz ASC
 LIMIT 20;
-
--- ----------------------------------------------------------------------------
--- Future optimization steps (pick up when needed):
---
--- 1. Schema denormalization for SF1000 — at higher SFs, friend density of the
---    date window can drop, lengthening the date-DESC index walk before 20
---    friend-authored rows are found. The fix is to push creationDate into the
---    HAS_CREATOR edge itself (populated by IU6/IU7 and backfilled at load),
---    then add a composite index:
---      ALTER TABLE ldbc_snb."HAS_CREATOR" ADD COLUMN creation_date bigint;
---      CREATE INDEX idx_hascreator_end_creationdate
---        ON ldbc_snb."HAS_CREATOR" (end_id, creation_date DESC);
---    With that, IC9 becomes a k-way merge of per-friend top-20 streams —
---    O(log N + 20) per friend, robust regardless of friend density. Touches
---    IU operations, schema, and load — out of scope for the query rewrite.
---
--- 2. Apply the same V3 pattern to IC2 — sibling query (recent messages by
---    direct friends only, no FoF). Same 2-branch UNION ALL shape; replacing
---    with a date-driven semi-join CTE should drop IC2 from ~115 ms mean to
---    single-digit ms. Quick follow-up if it shows up in profiling again.
---
--- 3. Investigate AGE's per-call cypher() overhead — the SQ6, IS4, and IC9
---    rewrites have all sidestepped a fixed ~150 ms tax that appears whenever
---    cypher() returns string content. Worth a profiling session to identify
---    where in AGE's parse → execute → serialize path that overhead lives,
---    so it can be fixed for queries that genuinely need Cypher.
--- ----------------------------------------------------------------------------

@@ -1,25 +1,8 @@
--- LdbcQuery2 — Recent messages by friends (V2 — denormalised; mirrors postgres ref)
---
--- Postgres reference impl pattern:
---   select p_personid, ..., m_messageid, COALESCE(m_ps_imagefile, m_content), m_creationdate
---   from person, message, knows
---   where p_personid = m_creatorid
---     and m_creationdate <= :maxDate
---     and k_person1id = :personId
---     and k_person2id = p_personid
---   order by m_creationdate desc, m_messageid asc limit 20;
---
--- The reference uses `m_creatorid` (HAS_CREATOR denormalised onto Comment+Post).
--- We mirror this via Comment.creator_id and Post.creator_id columns +
--- composite indexes idx_*_creator_creationdate.
---
--- The friend set comes from Cypher (KNOWS is N:N edge → kept as edge table,
--- same as postgres ref's `knows`). Then SQL JOIN against Comment + Post
--- via creator_id to pick top-20 messages.
---
--- Two-arm UNION ALL because Comment and Post are separate AGE labels (the
--- postgres ref unions them into one `message` table at load time; we keep
--- them separate to preserve AGE vertex-label semantics elsewhere).
+-- LdbcQuery2 — Top-20 recent messages by direct friends (before maxDate).
+-- Hybrid: Cypher call fetches direct friend graphids via KNOWS; SQL filters Comment + Post
+-- tables via creator_id denorm column with creationDate <= $maxDate.
+-- Two-arm UNION ALL because AGE has no multi-label MATCH (AGE-QUIRKS §3).
+-- Denorm used: Comment.creator_id, Post.creator_id (iter-1) + idx_*_creator_creationdate.
 
 SELECT
   ag_catalog.agtype_object_field_text(au.properties, 'id')::bigint::ag_catalog.agtype                       AS personId,

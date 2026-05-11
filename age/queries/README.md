@@ -24,135 +24,14 @@ Use the `./check-feature.sh` script to check for Cypher features used across que
 - All dates are stored and compared as epoch milliseconds (bigint).
 - Pattern predicates in `WHERE` or `CASE WHEN` are not supported by AGE; these are rewritten using `OPTIONAL MATCH` + null checks.
 
+### IS2 implementation note
 
+IS2 was previously implemented with an 8-level chained `OPTIONAL MATCH` ladder in Cypher to walk the REPLY_OF chain. This caused Parallel Append seq-scans over all vertex labels at each level (the "unlabeled intermediate" pathology documented in AGE-QUIRKS §9) and produced ~2.8 s latency at SF0.1. The current implementation (V2) eliminates this pathology:
 
-### Known performance issue: IS2 (LdbcShortQuery2PersonPosts)
+- Two Cypher calls (`Comment` branch, `Post` branch) fetch the top-10 messages via `HAS_CREATOR`, each with `ORDER BY … LIMIT 10` as a final `RETURN` — safe because there is no mid-query `LIMIT` feeding further Cypher clauses.
+- A SQL `WITH RECURSIVE` CTE walks the `REPLY_OF` edge table directly (depth cap 20) to find each comment's root Post. Each step is one indexed lookup on `idx_replyof_start`. LDBC reply chains are bounded ~8 across all SFs; the depth-20 cap is a safety margin.
 
-**TL;DR.** IS2 is the slowest query in the workload by an order of magnitude.
-At SF0.1 it averages ~8.4 s per invocation (p99 ~16.9 s), versus <50 ms p50
-for sibling short reads (IS1, IS3, IS5, IS7). On a real benchmark run this
-is the single largest contributor to LDBC schedule-audit failures
-("TOO_MANY_LATE_OPERATIONS"). **This is a known limitation of AGE 1.6's
-planner, not an implementation bug — do not interpret high IS2 latency as
-a regression.**
-
-#### Reference query
-
-`queries/interactive-short-2.sql`:
-
-```sql
-SELECT * FROM (
-  SELECT * FROM cypher('$graphName', $$
-    MATCH (p:Person {id: $personId})<-[:HAS_CREATOR]-(msg:Comment)
-    WITH msg ORDER BY msg.creationDate DESC, msg.id ASC LIMIT 10
-    MATCH (msg)-[:REPLY_OF]->(r1)
-    OPTIONAL MATCH (r1)-[:REPLY_OF]->(r2)
-    OPTIONAL MATCH (r2)-[:REPLY_OF]->(r3)
-    OPTIONAL MATCH (r3)-[:REPLY_OF]->(r4)
-    OPTIONAL MATCH (r4)-[:REPLY_OF]->(r5)
-    OPTIONAL MATCH (r5)-[:REPLY_OF]->(r6)
-    OPTIONAL MATCH (r6)-[:REPLY_OF]->(r7)
-    OPTIONAL MATCH (r7)-[:REPLY_OF]->(r8)
-    WITH msg, coalesce(r8, r7, r6, r5, r4, r3, r2, r1) AS rootPost
-    MATCH (post:Post)-[:HAS_CREATOR]->(author:Person)
-    WHERE id(post) = id(rootPost)
-    RETURN msg.id, coalesce(msg.content, msg.imageFile), msg.creationDate,
-           post.id, author.id, author.firstName, author.lastName
-  $$) AS (...)
-  UNION ALL
-  -- Post branch (fast — runs in ~10 ms, not the cost center)
-  SELECT * FROM cypher('$graphName', $$
-    MATCH (p:Person {id: $personId})<-[:HAS_CREATOR]-(msg:Post) ...
-  $$) AS (...)
-) all_msgs ORDER BY messageCreationDate DESC, messageId ASC LIMIT 10;
-```
-
-The Comment branch must walk up the REPLY_OF chain to find the original
-root Post. The chain is structurally bounded — every Comment ultimately
-roots at a Post — so the spec uses an 8-level `OPTIONAL MATCH` ladder to
-unwind it.
-
-#### Root cause (verified via EXPLAIN ANALYZE)
-
-The 8-level ladder leaves intermediate variables `r1` … `r8` **unlabeled**.
-AGE's planner cannot infer label types from a graphid even though the
-graphid encoding (`label_id << 48 | entry_id`) makes it possible. So at
-each of the 8 levels it produces this Parallel Append:
-
-```
-Parallel Append over all 11 vertex labels at every OPTIONAL MATCH level
-├─ Parallel Seq Scan on "Comment"      151,043 rows
-├─ Parallel Seq Scan on "Post"          67,850 rows
-├─ Parallel Seq Scan on "Tag"           16,080 rows
-├─ Parallel Seq Scan on "Forum"         13,750 rows
-├─ Parallel Seq Scan on "University"     6,380 rows
-├─ Parallel Seq Scan on "Person"         1,528 rows
-├─ Parallel Seq Scan on "Company"        1,575 rows
-├─ Parallel Seq Scan on "City"           1,343 rows
-├─ Parallel Seq Scan on "Country"          111 rows
-├─ Parallel Seq Scan on "TagClass"          71 rows
-└─ Parallel Seq Scan on "Continent"          6 rows
-```
-
-Per invocation: ~327 K vertex rows × 8 levels = ~2.6 M rows of vertex
-scans plus 8 × Parallel Seq Scan on REPLY_OF (151 K rows) — for chains
-that, in real LDBC data, are rarely deeper than 1–3 hops.
-
-A second issue compounds it: after the climb, the query does
-`MATCH (post:Post) WHERE id(post) = id(rootPost)`. The agtype-wrapping
-(`age_id(_agtype_build_vertex(post.id, …, post.properties))`) on both
-sides of the equality defeats the `idx_post_id` B-tree. The planner
-falls back to `Seq Scan on "Post"` (135 K rows at SF0.1) hash-joined
-against the 10-row rootPost set.
-
-EXPLAIN ANALYZE (SF0.1, heavy poster id 2199023256816, single thread,
-warm cache) — total **2768 ms**. About 2.4 s in the OPTIONAL MATCH
-ladder, ~200 ms in the Post seq scan, ~100 ms in the rest.
-
-#### Solutions explored and why each was rejected
-
-| Approach | Result | Status |
-|---|---|---|
-| Add label predicates `(r1:Comment)` to climb steps | AGE rejects with "multiple labels for variable not supported" | ❌ syntactically blocked |
-| Variable-length pattern `[:REPLY_OF*1..8]` | AGE produces a 452 M-row Cartesian estimate; ~2.55 s execution | ❌ no improvement |
-| Drop redundant `MATCH (post:Post) WHERE id()=id()` block | ~10% win (2768 → 2507 ms); ladder still dominates | ❌ insufficient |
-| Denormalize `rootPostId` on each Comment at preprocess time | Verified **30× speedup** (88 ms) end-to-end with `MATCH (post:Post {id: msg.rootPostId})` lookup hitting `gin_post`. NumPy-backed chain walker. | ⚠️ scales to ~SF300 on a 32 GB host; SF1000 needs ~25 GB resident + ~75 GB transient peak during sort, exceeds the benchmark host. Preprocess cannot be moved to the DB host (operational constraint). |
-| Denormalize `rootPostId` post-load on the DB host (recursive CTE + UPDATE) | Bounded by indexed REPLY_OF lookups; works at all SFs on the 32 vCPU / 256 GB DB host | ⚠️ adds ~30–60 minutes to load time at SF1000; UPDATE creates dead tuples on the Comment table requiring extra VACUUM cycle |
-
-The denormalization approaches both work technically. They were not
-adopted because (a) the load-time cost at large SF was deemed too high
-relative to the benefit, and (b) the implementation complexity and
-operational coupling (preprocess host vs. DB host vs. file shipping)
-weren't worth the latency improvement at this stage.
-
-#### Open path
-
-The clean fix is in AGE itself: teach the planner to use the graphid's
-embedded `label_id` (high 16 bits) to prune the all-label Append when
-`MATCH (n)-[:R]->(m)` references an unlabeled `m`. With that planner
-change, the existing 8-level OPTIONAL MATCH would hit only the relevant
-label table at each level and complete in tens of milliseconds with no
-denormalization required.
-
-Until that lands upstream, **expect IS2 latency to dominate the workload
-mix**. When reporting benchmark numbers, call this out explicitly so
-readers don't conclude that AGE is intrinsically slow on neighborhood
-reads — IS1, IS3, IS5, IS7 (which don't traverse REPLY_OF chains)
-demonstrate the actual short-read latency profile.
-
-For investigation continuity, the EXPLAIN ANALYZE traces and exploration
-notes are in this repo's commit history around the SQ2 investigation
-session. Reproduction of the 2768 ms baseline:
-
-```sql
-LOAD 'age'; SET search_path = ag_catalog, public;
-EXPLAIN (ANALYZE, BUFFERS) <contents of interactive-short-2.sql with
-                            $graphName='ldbc_snb' and $personId substituted
-                            for any heavy-poster id, e.g. 2199023256816
-                            at SF0.1>;
-```
-
-
+The historical investigation notes (EXPLAIN ANALYZE traces, solutions explored) are preserved in the git commit history around the SQ2 investigation session.
 
 
 ## Implementation overview
@@ -178,10 +57,14 @@ implementation pattern is:
   many `Message` patterns expand to two-arm UNIONs. The PostgreSQL planner
   handles each arm independently, which is in fact faster than a single
   `WHERE label(m) IN ['Comment','Post']` would be.
-- **Variable-length REPLY_OF traversal is unrolled to a fixed depth (8) with
-  chained `OPTIONAL MATCH`** — see IS2/IS6. AGE's `[:REPLY_OF*]` planner
-  enumerates all paths first and joins late, which is much slower than the
-  unrolled form for the typical reply-thread depth in the dataset.
+- **Variable-length REPLY_OF traversal uses a SQL `WITH RECURSIVE` CTE** (depth
+  cap 20) for IS2 and IS6. AGE's `[:REPLY_OF*]` planner enumerates all paths
+  and joins late, which is much slower at scale. The SQL CTE walks the
+  `REPLY_OF` edge table directly with one indexed lookup per step and avoids
+  the unlabeled-intermediate seq-scan pathology (AGE-QUIRKS §9). IC12 still
+  uses chained Cypher `OPTIONAL MATCH` for `IS_SUBCLASS_OF` (depth 6), which
+  is acceptable because the tag-class hierarchy is shallow and the candidate
+  set is small.
 - **All sorting and `LIMIT` happens in the outer SQL** when results need to
   be combined across UNION arms. This lets the PostgreSQL planner pick the
   best sort strategy and avoids materialising large intermediate sets in
@@ -200,17 +83,17 @@ This section can be consulted while reviewing the queries
 ### IC1 — friends with a given first name (3-hop)
 
 Find people up to 3 friend-hops away whose first name matches a given value;
-return their bio and education/work history. We run **three separate
-`cypher()` blocks** for the 1-hop, 2-hop, and 3-hop neighborhoods, tag each
-with its hop distance, then `UNION ALL` and **deduplicate by friend ID
-keeping the smallest hop**. Sort by `(distance, lastName, friendId)` and
-take the top 20 in outer SQL.
+return their bio and education/work history. The current implementation
+(V6) is a **genuine hybrid**:
 
-> **Why UNION ALL + dedup, not three exclusive arms?** Excluding 1-hop friends
-> from the 2-hop arm would require an outer `WHERE NOT EXISTS` against the
-> 1-hop result set — adding a join and a probe per row. UNION ALL with
-> outer `DISTINCT ON (friendId) ORDER BY distance` is one extra sort, no
-> join, and the planner picks an index-scan for the sort.
+- One Cypher call converts `$personId` to a graphid (`MATCH (p:Person {id: $personId}) RETURN id(p) LIMIT 1`).
+- A SQL `WITH RECURSIVE` BFS walks `KNOWS` 1–3 hops via the `KNOWS` edge table (directed `-[:KNOWS]->` per AGE-QUIRKS §11), recording `MIN(dist)` per reachable person.
+- A second Cypher call fetches all `firstName`-matching candidates (excluding `$personId`) with city, university, and company data via `OPTIONAL MATCH`.
+- The outer SQL `JOIN`s the BFS reach table to the candidates, applies the firstName filter, sorts by `(distance, lastName, friendId)`, and takes the top 20.
+
+The SQL BFS replaces the earlier three-separate-`cypher()` approach because
+3-hop variable-length Cypher paths trigger path-enumeration at scale
+(AGE-QUIRKS §4).
 
 ### IC2 — friends' recent messages
 
@@ -242,17 +125,11 @@ Single Cypher block computes `inWindow` and `preWindow` flags per
 
 ### IC5 — most-used forums by recent friends-of-friends
 
-For each (friend, forum) where the friend joined after `minDate`, count the
-friend's posts in that forum. **Two-arm UNION** for 1-hop and 2-hop friends.
-Outer SQL deduplicates `(friendId, forumId)` pairs (a friend reachable both
-ways shouldn't be double-counted) and sums posts per forum.
+The current implementation (V11) is **hybrid**:
 
-> **Why dedup outside instead of `WHERE direct IS NULL` like IC3?** The
-> 2-hop arm here filters by `friend.id <> $personId` and de-dupes friend via
-> `WITH DISTINCT friend`, but does *not* exclude direct friends — the LDBC
-> spec wants both 1-hop and 2-hop friends counted, just not double-counted.
-> So we dedup `(friendId, forumId)` in outer SQL, which is cheaper than a
-> NOT-EXISTS join inside Cypher.
+- One Cypher call returns the graphids of all 1- and 2-hop friends using a `UNION` inside the Cypher block: the 2-hop arm uses `OPTIONAL MATCH (p)-[direct:KNOWS]->(friend) WITH friend, direct WHERE direct IS NULL` to exclude direct friends (which are already covered by the 1-hop arm). Directed `-[:KNOWS]->` per AGE-QUIRKS §11.
+- The SQL outer query JOINs to `HAS_MEMBER` (filtering `joinDate > $minDate`) and `Forum`, then LEFT JOINs to the `ForumMemberPostCount` side table (iter-2 aggregate, maintained by IU6) to get per-`(forum, member)` post counts in one index lookup.
+- `GROUP BY (forum)` + `SUM(post_count)` + `ORDER BY postCount DESC, forumId ASC LIMIT 20` all happen in outer SQL.
 
 ### IC6 — co-occurring tags
 
@@ -281,40 +158,58 @@ then re-sorts by `likeCreationDate DESC`.
 ### IC8 — recent replies to own messages
 
 Most recent 20 replies (Comments) to messages authored by `$personId`.
-**Two-arm UNION** because the original message can be a Comment or a Post.
-Sort and `LIMIT 20` in outer SQL.
+The current implementation (V3) is **pure Cypher**: a single `cypher()` call
+with an untyped `(message)` intermediate node (`(start:Person)<-[:HAS_CREATOR]-(message)<-[:REPLY_OF]-(reply:Comment)`).
+AGE plans this internally as a UNION over labels, but the cost is bounded
+to the seed person's messages so there is no seq-scan risk (AGE-QUIRKS §3).
+`ORDER BY … LIMIT 20` is the final `RETURN`, which is safe. No outer UNION needed.
 
 ### IC9 — recent messages from friends and FOFs
 
-Most recent 20 messages (before `$maxDate`) from friends *or*
-friends-of-friends. **Four-arm UNION**: {1-hop, 2-hop} × {Comment, Post}.
-The 2-hop arms `OPTIONAL MATCH` a direct edge and exclude
-`direct IS NULL` to keep the spec's "FoF excludes direct friends" rule.
+Most recent 20 messages (before `$maxDate`) from friends or FOF. The current
+implementation (V4) is **hybrid**:
 
-### IC10 — common-interest friend recommendations *(Phase F: precomputed)*
+- One Cypher call builds the full 1+2-hop friend graphid set using `UNION`
+  inside Cypher (1-hop arm + 2-hop arm, both filtering `friend.id <> $personId`).
+  The `UNION` (not `UNION ALL`) naturally deduplicates friends reachable via
+  multiple paths. Typed-relationship negation `NOT (p)-[:KNOWS]-(f)` is
+  rejected by the AGE parser (AGE-QUIRKS §10), so UNION deduplication is the
+  workaround. Directed `-[:KNOWS]->` per AGE-QUIRKS §11.
+- Two SQL CTEs (`top_comments`, `top_posts`) walk `idx_comment_date_id` /
+  `idx_post_date_id` backwards from `< $maxDate` and semi-join against the
+  friend set. The planner stops each index walk as soon as 20 friend-authored
+  rows accumulate (Nested Loop Semi Join).
+- Outer SQL combines both CTEs with `UNION ALL`, re-sorts by `creationDate
+  DESC, messageId ASC`, and takes `LIMIT 20`.
+
+### IC10 — common-interest friend recommendations
 
 Friends-of-friends (excluding direct friends) born in a 30-day window
 straddling a given month, ranked by how their post tags overlap with
-`$personId`'s interests. **Single Cypher block** — no UNION needed.
+`$personId`'s interests. The current implementation is **hybrid**:
 
-The 30-day birthday window crossed a month boundary, which Cypher cannot
-compute natively (no datetime support). We **precomputed `birthMonth` and
-`birthDay` integer properties on every Person at data load time** =, so the window check becomes a simple
-integer comparison. This eliminated a per-call `EXTRACT(...)` in outer SQL
-and lets IC10 use the cached prepared statement path. IC10 saw 40% latency improvement after this. 
-Disclaimer, we are not sure if this is allowed with ldbc. If in future, we go for audit, this may needs to be changed. However, the alternative approach we had was much slower. 
+- One Cypher call computes the surviving FoF set: 2-hop directed `KNOWS` traversal,
+  birth-window filter using precomputed `birthMonth`/`birthDay` integer properties
+  (AGE-QUIRKS §1), `OPTIONAL MATCH` direct-friend exclusion, and `IS_LOCATED_IN`
+  city lookup. Returns graphids + scalar bio columns.
+- The SQL outer query computes `commonInterestScore = 2×common_posts − total_posts`
+  using: (a) `Post.creator_id` denorm (iter-1) for a fast per-friend post scan,
+  (b) `HAS_TAG` + `HAS_INTEREST` indexed JOIN for common-interest posts, and
+  (c) `PersonPostCount` side table (iter-2 aggregate) for total post count per
+  person in a single index lookup.
+- Directed `-[:KNOWS]->` per AGE-QUIRKS §11.
 
-> **What about Persons added by IU1 mid-benchmark?** The IU1 query
-> (add-Person) also writes `birthMonth` and `birthDay` at creation time,
-> derived in the Java handler from the LDBC `birthday` field. So newly
-> inserted Persons are immediately queryable by IC10 without any backfill.
+The 30-day birthday window crosses a month boundary, which Cypher cannot
+compute natively (no datetime support). The `birthMonth` and `birthDay` integer
+properties are precomputed at load time and also written by IU1 at creation time,
+so newly inserted Persons are immediately queryable without backfill.
 
 > **Does bidirectional KNOWS double-count FoFs?** No. The pattern
 > `(p)-[:KNOWS]->(:Person)-[:KNOWS]->(friend)` traverses two distinct
 > KNOWS edges; the intermediate node is a different Person each time, so
 > the same FoF reached via two different intermediate friends *is* counted
-> twice — but the `WITH DISTINCT p, friend, city` collapses these to one
-> row per (FoF) before the post traversal.
+> twice — but `WITH DISTINCT p, friend` before the city MATCH collapses
+> these to one row per FoF.
 
 ### IC11 — friends working abroad
 
@@ -325,23 +220,30 @@ since before `$workFromYear`. **Two-arm UNION**. Outer SQL sorts by
 ### IC12 — replies to posts in a tag class hierarchy
 
 Friends' Comments that reply to Posts whose tags belong to a given TagClass
-or any subclass thereof. **Single Cypher block**, but the subclass hierarchy
-is **unrolled to 6 levels with chained `OPTIONAL MATCH IS_SUBCLASS_OF`**
-because variable-length subclass paths are slow in AGE 1.6. The WHERE clause
-checks if `tc` or any ancestor matches the given base class.
+or any subclass thereof. The current implementation is **hybrid**:
 
-> **Why depth 6?** The LDBC reference TagClass hierarchy has a maximum
-> depth of 4 (Thing → Person → Athlete → SoccerPlayer). Depth 6 gives
-> headroom without measurable cost — each `OPTIONAL MATCH` becomes a
-> nullable join the planner short-circuits when prior levels return null.
-> If a real dataset had a deeper hierarchy, queries would silently miss
-> the deepest classes; matches LDBC spec assumptions.
+- One Cypher call resolves the root `TagClass` graphid by name.
+- A SQL `WITH RECURSIVE` CTE walks the `TagClass.subclass_of_id` denorm column
+  (iter-3) to collect all subclass ids.
+- A `valid_tags` CTE filters `Tag` rows via `Tag.tagclass_id` denorm (iter-3).
+- SQL JOINs use `Comment.creator_id` and `Comment.reply_of_id` denorm columns
+  (iter-1) plus `HAS_TAG` for matched comments — no Cypher traversal required
+  for the main join.
+- A second Cypher call fetches direct friends of `$personId`.
+
+This replaces the earlier single-Cypher approach that unrolled `IS_SUBCLASS_OF`
+to 6 levels with chained `OPTIONAL MATCH`. The recursive CTE on denorm columns
+is cleaner and scales better than Cypher unrolling.
+
+> **Why depth cap in the CTE?** PostgreSQL's recursive CTE terminates naturally
+> when no new rows are produced. No explicit depth cap is needed for `IS_SUBCLASS_OF`
+> because the LDBC TagClass hierarchy is acyclic.
 
 ### IC13 / IC14 — shortest path queries
 
 `SingleShortestPath` (IC13) and `AllShortestPaths` (IC14) require AGE
 Cypher's `shortestPath()` / `allShortestPaths()` functions, **which are not
-implemented in AGE 1.6**. The SQL files are placeholders — a Java handler
+implemented in AGE 1.7**. The SQL files are placeholders — a Java handler
 (`AgeIC13OperationHandler` / `AgeIC14OperationHandler`) returns the LDBC
 "no path" sentinel value (`-1` for IC13, empty list for IC14). Both queries
 are disabled in `benchmark.properties` / `validate.properties` until AGE
@@ -365,17 +267,18 @@ Single `MATCH` on Person by id, plus `IS_LOCATED_IN -> City`.
 ### IS2 — recent messages with original post
 
 Last 10 messages by `$personId` plus the root Post each is rooted in.
-**Two-arm UNION**: Comment branch unrolls REPLY_OF to depth 8 with chained
-`OPTIONAL MATCH` and uses `coalesce(r8, r7, …, r1)` to find the root; Post
-branch is direct (a Post is its own root). The unrolled walk is much
-faster than `[:REPLY_OF*]` because AGE evaluates variable-length paths
-without predicate pushdown.
+The current implementation (V2) is **hybrid**:
 
-> **Why depth 8?** LDBC reference data has reply chains observed up to
-> depth 7 at SF1000; depth 8 is one level of headroom. A reply chain
-> deeper than 8 would silently match the deepest hop's value as the
-> root — acceptable per the LDBC spec assumption that chains are
-> bounded.
+- Two Cypher calls (Comment branch, Post branch) each return up to 10 messages
+  via `HAS_CREATOR`, with `ORDER BY … LIMIT 10` as a final `RETURN` (safe).
+- A SQL `WITH RECURSIVE` CTE walks the `REPLY_OF` edge table to find each
+  comment's root Post (depth cap 20; each step is one indexed lookup on
+  `idx_replyof_start`).
+- The outer SQL joins root graphids back to the `Post` and `Person` tables
+  for author info, then re-sorts and returns the top 10.
+
+See the IS2 implementation note at the top of this file for the history of
+why the earlier 8-level Cypher unroll was replaced.
 
 ### IS3 — friends sorted by friendship date
 
@@ -393,17 +296,19 @@ Same shape as IS4 — two-arm UNION → return the author.
 
 ### IS6 — message's forum and moderator
 
-For a given message, walk back through the reply chain (8-deep
-`OPTIONAL MATCH`) to find the root Post, then jump to its containing Forum
-and the forum's moderator. **Two-arm UNION** (Comment with reply-walk /
-Post direct), with a `src` tag column so outer SQL can prefer the comment
-branch when both rows are present.
+For a given message, walk back through the reply chain to find the root Post,
+then return its containing Forum and moderator. The current implementation is
+**pure SQL** — no Cypher calls:
 
-> **Why a `src` tag column rather than relying on label disjointness?**
-> The input `$messageId` is unique across Comments and Posts in LDBC, so
-> exactly one arm should match. The `src ORDER BY` is defensive — it
-> guarantees deterministic single-row output if a future dataset
-> violated that uniqueness, costing one extra integer comparison.
+- A materialized CTE seeds from `Post` or `Comment` (whichever matches `$messageId`).
+- A `WITH RECURSIVE` CTE walks `REPLY_OF` up to depth 20 via `idx_replyof_start`
+  to find the root Post (Comments have no outgoing `REPLY_OF`; the walk terminates naturally).
+- The outer SQL JOINs `CONTAINER_OF` → `Forum` → `HAS_MODERATOR` → `Person`
+  using indexed B-tree joins on known graphids.
+
+The query header explicitly documents that this should NOT be converted to a
+Cypher call — the SQL approach is structurally sound and adding Cypher overhead
+would provide no benefit.
 
 ### IS7 — replies to a message
 
@@ -415,8 +320,11 @@ input id can be either label.
 
 ## Update operations (IU1–IU8)
 
-These are write transactions. Each is a single `cypher()` call that
-`MATCH`es the referenced nodes and `CREATE`s the new edges/nodes.
+These are write transactions. Most contain a single `cypher()` call that
+`MATCH`es the referenced nodes and `CREATE`s the new edges/nodes. IU7 is
+the exception — it uses two `cypher()` calls to avoid an AGE MVCC concurrency
+bug (see IU7 below and the file header comment). Several IUs also include a
+SQL `UPDATE` after the Cypher `CREATE` to maintain denorm columns (iter-1).
 
 ### IU1 — add Person
 
@@ -459,9 +367,13 @@ not both — we never store empty strings as content).
 
 ### IU7 — add Comment
 
-Creates a Comment with `HAS_CREATOR` to author, `REPLY_OF` to its target
-(which can be a Comment or a Post — handled by an unlabelled MATCH on the
-target id), `IS_LOCATED_IN` to country, and `HAS_TAG` per tag.
+Creates a Comment with `HAS_CREATOR`, `REPLY_OF`, `IS_LOCATED_IN`, and
+`HAS_TAG` edges. The implementation uses **two `cypher()` calls** split to
+avoid an AGE MVCC concurrency bug (issue #1954):
+
+- **Call 1**: resolves the `replyTo` target using `OPTIONAL MATCH (rp:Post {id: $replyToId})` + `OPTIONAL MATCH (rc:Comment {id: $replyToId})` with `COALESCE(rp, rc) AS replyTo` — typed OPTIONAL MATCH avoids the untyped-intermediate pathology (AGE-QUIRKS §9). Creates the Comment vertex plus `HAS_CREATOR`, `REPLY_OF`, and `IS_LOCATED_IN` edges.
+- **Call 2**: MATCHes the newly committed Comment, `UNWIND $tagIds`, and creates `HAS_TAG` edges. Runs in a fresh visibility window where the Comment is already visible, avoiding the MVCC trigger.
+- A SQL `UPDATE` maintains `Comment.{creator_id, reply_of_id, country_id}` denorm columns (iter-1).
 
 ### IU8 — add Friendship
 

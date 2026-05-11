@@ -118,3 +118,95 @@ about direction. IU8 (add friendship) creates both rows in one transaction.
   bigints. Date arithmetic (`maxDate < creationDate`, etc.) is integer
   comparison. IC10's birthday-window logic uses the precomputed
   `birthMonth`/`birthDay` integer fields to avoid date math in the query path.
+
+---
+
+## Denormalization columns (iter-1/2/3)
+
+Added by `age/scripts/denormalize-schema.sql`. These columns store graphids
+copied from the corresponding edge tables, enabling direct B-tree joins in
+hybrid SQL/Cypher queries without an extra edge-table lookup.
+
+Columns are populated at load time by `denormalize-schema.sql` and maintained
+on subsequent writes by the IU operations listed. All columns are of type
+`ag_catalog.graphid` (nullable — NULL until backfilled or inserted).
+
+### `ldbc_snb."Post"`
+
+| Column | Source edge | Maintained by |
+|---|---|---|
+| `creator_id` | `HAS_CREATOR`.end_id | IU6 (SQL UPDATE) |
+| `forum_id` | `CONTAINER_OF`.start_id (inverse) | IU6 (SQL UPDATE) |
+| `country_id` | `IS_LOCATED_IN`.end_id | IU6 (SQL UPDATE) |
+
+### `ldbc_snb."Comment"`
+
+| Column | Source edge | Maintained by |
+|---|---|---|
+| `creator_id` | `HAS_CREATOR`.end_id | IU7 (SQL UPDATE) |
+| `reply_of_id` | `REPLY_OF`.end_id | IU7 (SQL UPDATE) |
+| `country_id` | `IS_LOCATED_IN`.end_id | IU7 (SQL UPDATE) |
+
+### `ldbc_snb."Forum"`
+
+| Column | Source edge | Maintained by |
+|---|---|---|
+| `moderator_id` | `HAS_MODERATOR`.end_id | IU4 (SQL UPDATE) |
+
+### `ldbc_snb."Person"`
+
+| Column | Source edge | Maintained by |
+|---|---|---|
+| `city_id` | `IS_LOCATED_IN`.end_id | IU1 (SQL UPDATE) |
+
+### Additional denorm columns (also in `denormalize-schema.sql`)
+
+The following columns are also added by the schema script but are not yet
+used by the current IC/IS/IU queries. They are present for potential future
+query optimizations:
+
+| Table | Column | Source |
+|---|---|---|
+| `Tag` | `tagclass_id` | `HAS_TYPE`.end_id |
+| `TagClass` | `subclass_of_id` | `IS_SUBCLASS_OF`.end_id — used by IC12 |
+| `City` | `country_id` | `IS_PART_OF`.end_id |
+| `Country` | `continent_id` | `IS_PART_OF`.end_id |
+| `University` | `city_id` | `IS_LOCATED_IN`.end_id |
+| `Company` | `country_id` | `IS_LOCATED_IN`.end_id |
+
+Note: `Tag.tagclass_id` and `TagClass.subclass_of_id` are actively used by IC12.
+
+---
+
+## Side tables (iter-2)
+
+Plain PostgreSQL tables (not AGE label tables) that store precomputed
+aggregates. AGE 1.7 cannot add `NOT NULL DEFAULT` or array columns to its
+managed label tables without triggering a segfault in the Cypher CREATE path,
+so these aggregates live in separate tables. See `denormalize-schema.sql`
+section 5 for the DDL.
+
+### `ldbc_snb."ForumMemberPostCount"`
+
+```sql
+(forum_id ag_catalog.graphid, member_id ag_catalog.graphid, post_count int, PRIMARY KEY (forum_id, member_id))
+```
+
+- Stores the count of Posts each Person (member) made in each Forum.
+- Used by IC5 V11: replaces a per-pair `Post` LEFT JOIN with a single index lookup.
+- Maintained by IU6 (AddPost): `INSERT … ON CONFLICT … DO UPDATE SET post_count = post_count + 1`.
+- Populated at load time by `denormalize-schema.sql` section 6 (aggregate from `Post.creator_id` + `Post.forum_id`).
+- Secondary index: `idx_fmpc_member` on `member_id`.
+
+### `ldbc_snb."PersonPostCount"`
+
+```sql
+(person_id ag_catalog.graphid PRIMARY KEY, post_count int NOT NULL DEFAULT 0)
+```
+
+- Stores total post count per Person.
+- Used by IC10 V5: provides `total_posts` in a single primary-key lookup,
+  avoiding a count over all Posts by the FoF candidate.
+- Maintained by IU6 (AddPost): `UPDATE … SET post_count = post_count + 1`.
+- Populated at load time from `Post.creator_id`; every Person has a row
+  (even those with 0 posts) so IU6 can always use `UPDATE` (no INSERT race).

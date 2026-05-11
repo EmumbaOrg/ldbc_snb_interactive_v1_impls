@@ -1,36 +1,10 @@
--- LdbcShortQuery2PersonPosts (V2 — hybrid: Cypher top-10 + SQL chain walk)
---
--- Classification: Genuine hybrid — Cypher does the substantive graph fetch
--- (user's top-10 messages via HAS_CREATOR traversal); SQL retains the
--- recursive REPLY_OF chain walk for structural reasons.
---
--- Cypher top-10 fetch (V2):
---   Two Cypher calls (Comment branch, Post branch), each with a final
---   RETURN ... ORDER BY ... LIMIT 10. This is safe — the plan note
---   "mid-query WITH ... LIMIT is poisoned" applies only when the LIMIT
---   is followed by another MATCH inside the same Cypher block. Final
---   RETURN ORDER BY LIMIT is fine and correctly uses idx_hascreator_end.
---   The two branches are UNION ALL'd in SQL and the outer ORDER BY / LIMIT 10
---   picks the top-10 across both label tables.
---
--- SQL REPLY_OF chain walk (retained from iter-3):
---   AGE 1.6's variable-length path pathology + label-explosion on untyped
---   intermediates make a pure-Cypher REPLY_OF walk structurally unfit at
---   SF100+ (see AGE-QUIRKS §4, §9). Measured ceiling: ~250 ms at SF0.1
---   with linear growth in Post table size. Structural — keep SQL recursive
---   CTE. See iter-3 banner for full rationale.
---
--- Column shape for AgeConverter:
---   (1) messageId          bigint agtype   — toLong
---   (2) messageContent     text agtype     — toStr
---   (3) messageCreationDate bigint agtype  — toLong
---   (4) originalPostId     bigint agtype   — toLong
---   (5) originalPostAuthorId bigint agtype — toLong
---   (6) originalPostAuthorFirstName text agtype — toStr
---   (7) originalPostAuthorLastName  text agtype — toStr
---
--- mtype discriminator uses plain text ('C'/'P') — no agtype quote noise.
--- graphid cast: (gid::text)::ag_catalog.graphid — id(msg) returns agtype integer.
+-- LdbcShortQuery2PersonPosts — top-10 recent messages by a person, each with its root-post author.
+-- Hybrid: two Cypher calls (Comment branch, Post branch) fetch the top-10 messages via
+-- HAS_CREATOR (AGE-QUIRKS §3: no multi-label MATCH); SQL recursive CTE walks REPLY_OF to
+-- find each comment's root Post. Variable-length REPLY_OF in Cypher hits a path-enumeration
+-- pathology at scale (AGE-QUIRKS §4, §9) — SQL CTE is the structural fix.
+-- Denorm used: none (REPLY_OF chain walk uses edge table directly).
+-- mtype discriminator ('C'/'P') is plain text to avoid agtype quote noise.
 
 WITH RECURSIVE
   user_top10 AS MATERIALIZED (

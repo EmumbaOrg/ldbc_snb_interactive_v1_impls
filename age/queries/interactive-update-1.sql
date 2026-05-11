@@ -1,6 +1,8 @@
--- LdbcUpdate1AddPerson — also maintains:
+-- LdbcUpdate1AddPerson — create a Person vertex with all edges and maintain denorm state.
+-- Hybrid: Cypher block creates Person + IS_LOCATED_IN + HAS_INTEREST + STUDY_AT + WORK_AT in
+-- one chained WITH/UNWIND block. SQL UPDATE/INSERT maintains:
 --   Person.city_id              (iter-1 column denorm)
---   PersonPostCount(person_id)  (iter-2 side table — initialise to 0)
+--   PersonPostCount(person_id)  (iter-2 side table — initialised to 0)
 SELECT * FROM cypher('$graphName', $$
   MATCH (city:City {id: $cityId})
   CREATE (p:Person {

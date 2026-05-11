@@ -1,3 +1,9 @@
+-- LdbcShortQuery7MessageReplies — list direct replies to a message with knows-flag per author.
+-- Hybrid: two Cypher calls (Comment seed branch, Post seed branch) UNION ALL'd in SQL with
+-- outer ORDER BY (no LIMIT). AGE has no multi-label MATCH (AGE-QUIRKS §3); ORDER BY inside
+-- each Cypher block is safe as a final RETURN ORDER — no mid-query LIMIT follows.
+-- OPTIONAL MATCH (orig)-[:KNOWS]->(author) uses directed KNOWS per AGE-QUIRKS §11.
+
 SELECT * FROM (
   SELECT * FROM cypher('$graphName', $$
     MATCH (m:Comment {id: $messageId})<-[:REPLY_OF]-(reply:Comment)-[:HAS_CREATOR]->(author:Person)

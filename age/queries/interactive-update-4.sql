@@ -1,4 +1,6 @@
--- LdbcUpdate4AddForum — also maintains Forum.moderator_id denorm column.
+-- LdbcUpdate4AddForum — create a Forum vertex with HAS_MODERATOR + HAS_TAG edges.
+-- Hybrid: Cypher block creates Forum + edges in one chained WITH/UNWIND block.
+-- SQL UPDATE maintains Forum.moderator_id (iter-1 column denorm).
 SELECT * FROM cypher('$graphName', $$
   MATCH (mod:Person {id: $moderatorPersonId})
   CREATE (f:Forum {id: $forumId, title: $forumTitle, creationDate: $creationDate})-[:HAS_MODERATOR]->(mod)
