@@ -1,20 +1,35 @@
-WITH valid_tags AS (
-    SELECT tag_vid, tag_name
+-- LdbcQuery12 — Expert search (V2 — iter-3 denorm + MATERIALIZED + agtype casts)
+--
+-- V1: hybrid Cypher (TagClass hierarchy + friends) + SQL edge-table JOINs.
+--     SF3 mean 875 ms.
+-- V2 review fixes:
+--   1. Denorm columns: Comment.creator_id, Comment.reply_of_id,
+--      Tag.tagclass_id, TagClass.subclass_of_id — two fewer edge-table JOINs.
+--   2. ldbc_snb.* literal schema refs; explicit graphid casts on cross-type joins.
+--   3. Result columns cast to ag_catalog.agtype for handler compatibility.
+--   4. valid_tags AS MATERIALIZED — prevents planner from inlining into HAS_TAG
+--      at SF1000 (valid_tags ≈ 50-200 rows vs HAS_TAG ≈ 240 M rows).
+--   5. All $params kept inside cypher calls so parameterized mode works.
+
+WITH RECURSIVE
+valid_classes(class_id) AS (
+    -- Base: resolve root TagClass by name via Cypher
+    SELECT (tc_id::text)::ag_catalog.graphid AS class_id
     FROM cypher('$graphName', $$
-        MATCH (base:TagClass {name: $tagClassName})
-        OPTIONAL MATCH (d1:TagClass)-[:IS_SUBCLASS_OF]->(base)
-        OPTIONAL MATCH (d2:TagClass)-[:IS_SUBCLASS_OF]->(d1)
-        OPTIONAL MATCH (d3:TagClass)-[:IS_SUBCLASS_OF]->(d2)
-        OPTIONAL MATCH (d4:TagClass)-[:IS_SUBCLASS_OF]->(d3)
-        OPTIONAL MATCH (d5:TagClass)-[:IS_SUBCLASS_OF]->(d4)
-        OPTIONAL MATCH (d6:TagClass)-[:IS_SUBCLASS_OF]->(d5)
-        UNWIND [id(base), id(d1), id(d2), id(d3), id(d4), id(d5), id(d6)] AS classId
-        WITH classId WHERE classId IS NOT NULL
-        WITH collect(DISTINCT classId) AS validIds
-        MATCH (tag:Tag)-[:HAS_TYPE]->(tc:TagClass)
-        WHERE id(tc) IN validIds
-        RETURN id(tag), tag.name
-    $$) AS (tag_vid agtype, tag_name agtype)
+        MATCH (tc:TagClass {name: $tagClassName})
+        RETURN id(tc)
+    $$) AS x(tc_id agtype)
+    UNION ALL
+    -- Recursive: walk subclasses via denormalized subclass_of_id
+    SELECT tc.id
+    FROM ldbc_snb."TagClass" tc
+    JOIN valid_classes vc ON tc.subclass_of_id = vc.class_id
+),
+valid_tags AS MATERIALIZED (
+    SELECT t.id AS tag_id,
+           ag_catalog.agtype_access_operator(VARIADIC ARRAY[t.properties, '"name"'::ag_catalog.agtype]) AS tag_name
+    FROM ldbc_snb."Tag" t
+    JOIN valid_classes vc ON t.tagclass_id = vc.class_id
 ),
 friends AS (
     SELECT friend_vid, friend_id, friend_fn, friend_ln
@@ -25,25 +40,24 @@ friends AS (
 ),
 friend_replies AS (
     SELECT f.friend_id, f.friend_fn, f.friend_ln,
-           hc.start_id AS comment_id, ro.end_id AS post_id
+           c.id AS comment_id, c.reply_of_id AS post_id
     FROM friends f
-    JOIN $graphName."HAS_CREATOR" hc ON hc.end_id = f.friend_vid
-    JOIN $graphName."REPLY_OF" ro ON ro.start_id = hc.start_id
-    JOIN $graphName."Post" p ON p.id = ro.end_id
+    JOIN ldbc_snb."Comment" c ON c.creator_id = (f.friend_vid::text)::ag_catalog.graphid
+    JOIN ldbc_snb."Post" p ON p.id = c.reply_of_id
 ),
 matched AS (
     SELECT fr.friend_id, fr.friend_fn, fr.friend_ln,
            fr.comment_id, vt.tag_name
     FROM friend_replies fr
-    JOIN $graphName."HAS_TAG" ht ON ht.start_id = fr.post_id
-    JOIN valid_tags vt ON ht.end_id = vt.tag_vid
+    JOIN ldbc_snb."HAS_TAG" ht ON ht.start_id = fr.post_id
+    JOIN valid_tags vt ON ht.end_id = vt.tag_id
 )
 SELECT
     friend_id AS personId,
     friend_fn AS personFirstName,
     friend_ln AS personLastName,
-    '[' || string_agg(DISTINCT tag_name::text, ', ') || ']' AS tagNames,
-    count(DISTINCT comment_id) AS replyCount
+    ('[' || string_agg(DISTINCT tag_name::text, ', ') || ']')::ag_catalog.agtype AS tagNames,
+    count(DISTINCT comment_id)::text::ag_catalog.agtype AS replyCount
 FROM matched
 GROUP BY friend_id, friend_fn, friend_ln
 ORDER BY count(DISTINCT comment_id) DESC, (friend_id)::text::bigint ASC

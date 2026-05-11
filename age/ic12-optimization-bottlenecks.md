@@ -196,8 +196,119 @@ CREATE INDEX IF NOT EXISTS IS_SUBCLASS_OF_start_id_idx ON ldbc_snb."IS_SUBCLASS_
 CREATE INDEX IF NOT EXISTS IS_SUBCLASS_OF_end_id_idx ON ldbc_snb."IS_SUBCLASS_OF" (end_id);
 ```
 
-### DB Tuning Applied
+### DB Tuning Applied (Phase 3)
 ```sql
+-- These were reverted in Phase 4; benchmark should use postgresql.conf defaults.
 ALTER DATABASE ldbcsnb SET max_parallel_workers_per_gather = 2;
 ALTER DATABASE ldbcsnb SET work_mem = '8MB';
+```
+
+---
+
+## Phase 4: Review Fixes (V2) — iter-3 Alignment + SF1000 Hardening
+
+### Review Feedback (6 points)
+The Phase 3 query was reviewed and the following changes were requested:
+
+1. **Use iter-3 denorm columns** — `denormalize-schema.sql` already populates `Comment.creator_id`, `Comment.reply_of_id`, `Tag.tagclass_id`, `TagClass.subclass_of_id` with B-tree indexes. The V1 query was still joining through edge tables (`HAS_CREATOR`, `REPLY_OF`, `HAS_TYPE`, `IS_SUBCLASS_OF`) unnecessarily.
+
+2. **Schema reference & graphid casts** — `$graphName."HAS_CREATOR"` in raw SQL depends on token substitution outside `cypher()` calls. Changed to literal `ldbc_snb."Table"` references. Added explicit `(f.friend_vid::text)::ag_catalog.graphid` casts for cross-type joins (agtype→graphid) to ensure index usage.
+
+3. **Result column types for handler compatibility** — The Java handler (`AgeConverter.toLong`, `AgeConverter.toStr`, `AgeConverter.toStringList`) expects agtype-compatible values. Added `::ag_catalog.agtype` casts on `tagNames` and `replyCount` output columns.
+
+4. **MATERIALIZED on valid_tags** — Critical for SF1000. At SF1000 `HAS_TAG` ≈ 240M rows while `valid_tags` ≈ 50-200 rows. Without MATERIALIZED, Postgres ≥12 inlines the CTE and can flip to driving from `HAS_TAG.end_id`, materialising ~3M intermediate rows. `AS MATERIALIZED` forces Postgres to compute the small set once. Costs nothing at SF3, prevents 5-15s tail at SF1000.
+
+5. **Indexes already in place** — The 12 single-column edge indexes exist in `create-indexes.sql`. Added `ANALYZE "HAS_TAG"` to `denormalize-schema.sql` to ensure stats are fresh.
+
+6. **Reverted ALTER DATABASE tuning** — `work_mem='8MB'` and `max_parallel_workers_per_gather=2` were DB-level overrides that affect all workloads. Reverted to let `postgresql.conf` defaults apply (iter-3 runs at `work_mem='32MB'`). SF-specific tuning belongs in `run-benchmark.sh` session settings, not DB-level ALTERs.
+
+### Changes Made
+
+#### `age/queries/interactive-complex-12.sql` — Full Rewrite (V2)
+
+**TagClass hierarchy** — Replaced Cypher 6-level OPTIONAL MATCH with recursive SQL CTE using denorm `TagClass.subclass_of_id`:
+```sql
+WITH RECURSIVE
+valid_classes(class_id) AS (
+    SELECT (tc_id::text)::ag_catalog.graphid AS class_id
+    FROM cypher('$graphName', $$
+        MATCH (tc:TagClass {name: $tagClassName})
+        RETURN id(tc)
+    $$) AS x(tc_id agtype)
+    UNION ALL
+    SELECT tc.id
+    FROM ldbc_snb."TagClass" tc
+    JOIN valid_classes vc ON tc.subclass_of_id = vc.class_id
+),
+```
+
+**Tag lookup** — Uses denorm `Tag.tagclass_id` instead of `HAS_TYPE` edge + `AS MATERIALIZED` for SF1000 stability:
+```sql
+valid_tags AS MATERIALIZED (
+    SELECT t.id AS tag_id,
+           ag_catalog.agtype_access_operator(VARIADIC ARRAY[t.properties, '"name"'::ag_catalog.agtype]) AS tag_name
+    FROM ldbc_snb."Tag" t
+    JOIN valid_classes vc ON t.tagclass_id = vc.class_id
+),
+```
+
+**Friend replies** — Uses denorm `Comment.creator_id` and `Comment.reply_of_id` instead of `HAS_CREATOR`/`REPLY_OF` edge tables:
+```sql
+friend_replies AS (
+    SELECT f.friend_id, f.friend_fn, f.friend_ln,
+           c.id AS comment_id, c.reply_of_id AS post_id
+    FROM friends f
+    JOIN ldbc_snb."Comment" c ON c.creator_id = (f.friend_vid::text)::ag_catalog.graphid
+    JOIN ldbc_snb."Post" p ON p.id = c.reply_of_id
+),
+```
+
+**Result casts** — agtype casts for handler compatibility:
+```sql
+SELECT
+    friend_id AS personId,
+    friend_fn AS personFirstName,
+    friend_ln AS personLastName,
+    ('[' || string_agg(DISTINCT tag_name::text, ', ') || ']')::ag_catalog.agtype AS tagNames,
+    count(DISTINCT comment_id)::text::ag_catalog.agtype AS replyCount
+```
+
+#### `age/scripts/denormalize-schema.sql`
+- Added `ANALYZE "HAS_TAG";` to the ANALYZE block (was missing)
+
+#### Database Settings
+- Reverted all `ALTER DATABASE ldbcsnb SET ...` overrides (`RESET work_mem`, `RESET max_parallel_workers_per_gather`, etc.)
+
+### V1 → V2 Diff Summary
+
+| Aspect | V1 (Phase 3) | V2 (Phase 4) |
+|--------|-------------|-------------|
+| TagClass hierarchy | Cypher OPTIONAL MATCH ×6 | Recursive SQL CTE via `subclass_of_id` |
+| Tag lookup | Cypher HAS_TYPE traversal | SQL JOIN on `Tag.tagclass_id` + MATERIALIZED |
+| Comment→Person join | `HAS_CREATOR` edge table | `Comment.creator_id` denorm column |
+| Comment→Post join | `REPLY_OF` edge table | `Comment.reply_of_id` denorm column |
+| Schema references | `$graphName."HAS_CREATOR"` | `ldbc_snb."Comment"` (literal) |
+| Cross-type joins | Implicit agtype→graphid | Explicit `(::text)::ag_catalog.graphid` cast |
+| Result columns | Raw SQL types | `::ag_catalog.agtype` casts |
+| DB tuning | ALTER DATABASE overrides | Reverted (use postgresql.conf defaults) |
+| Edge table JOINs | 5 (HAS_CREATOR, REPLY_OF, HAS_TYPE, IS_SUBCLASS_OF, HAS_TAG) | 1 (HAS_TAG only) |
+
+### SF1000 Risk Mitigation
+- `valid_tags AS MATERIALIZED` prevents planner from inlining into 240M-row HAS_TAG scan
+- `idx_comment_creator_id` B-tree index on denorm column ensures Index Scan (not Seq Scan)
+- `idx_tag_tagclass_id`, `idx_tagclass_subclass_of_id` indexed for recursive CTE
+- Explicit graphid casts ensure operator = uses the correct index path
+- Expected SF1000: 250-500ms mean, p99 < 600ms
+
+### Indexes Used (all from denormalize-schema.sql / create-indexes.sql)
+```sql
+-- Denorm column indexes (from denormalize-schema.sql)
+idx_comment_creator_id     ON "Comment" (creator_id)
+idx_comment_reply_of_id    ON "Comment" (reply_of_id)
+idx_tag_tagclass_id        ON "Tag" (tagclass_id)
+idx_tagclass_subclass_of_id ON "TagClass" (subclass_of_id)
+
+-- Edge table indexes (from create-indexes.sql)
+HAS_TAG_start_id_idx       ON "HAS_TAG" (start_id)
+HAS_TAG_end_id_idx         ON "HAS_TAG" (end_id)
 ```

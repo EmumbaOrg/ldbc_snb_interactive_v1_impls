@@ -292,3 +292,4 @@ ANALYZE "Company";
 ANALYZE "ForumMemberPostCount";
 ANALYZE "PersonPostCount";
 ANALYZE "HAS_INTEREST";
+ANALYZE "HAS_TAG";
