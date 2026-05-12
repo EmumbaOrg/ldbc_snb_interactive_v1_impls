@@ -39,6 +39,23 @@ The benchmark targets **Apache AGE 1.6** running on PostgreSQL 17.
   psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS age;"
   ```
   See https://age.apache.org/age-manual/master/intro/install.html for full instructions.
+- **Local Docker (macOS / developer laptop)** — use the official AGE Docker image.
+  **`--shm-size=2g` is required.** The default Docker `/dev/shm` (64 MB) is exhausted
+  by PostgreSQL's parallel hash join allocations at `max_parallel_workers≥4` during
+  SF3+ benchmarks, causing a `No space left on device` crash mid-run:
+  ```bash
+  docker run -d \
+    --name Pg17Age1.6 \
+    --shm-size=2g \
+    -e POSTGRES_USER=postgres \
+    -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_DB=postgres \
+    -p 5432:5432 \
+    apache/age:release_PG17_1.6.0
+  ```
+  After starting, apply the local macOS tuning from `scripts/postgres-tuning.md`
+  (§ "Local development sizing") and restart the container once for the
+  restart-required settings (`shared_buffers`, `max_connections`, etc.).
 
 ---
 
