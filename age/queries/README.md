@@ -84,16 +84,14 @@ This section can be consulted while reviewing the queries
 
 Find people up to 3 friend-hops away whose first name matches a given value;
 return their bio and education/work history. The current implementation
-(V6) is a **genuine hybrid**:
+(V3) is a **Cypher-first hybrid**:
 
-- One Cypher call converts `$personId` to a graphid (`MATCH (p:Person {id: $personId}) RETURN id(p) LIMIT 1`).
-- A SQL `WITH RECURSIVE` BFS walks `KNOWS` 1–3 hops via the `KNOWS` edge table (directed `-[:KNOWS]->` per AGE-QUIRKS §11), recording `MIN(dist)` per reachable person.
-- A second Cypher call fetches all `firstName`-matching candidates (excluding `$personId`) with city, university, and company data via `OPTIONAL MATCH`.
-- The outer SQL `JOIN`s the BFS reach table to the candidates, applies the firstName filter, sorts by `(distance, lastName, friendId)`, and takes the top 20.
+- Three explicit Cypher arms (`hop1`, `hop2`, `hop3`) each walk exactly 1, 2, or 3 `KNOWS` hops and inline the `firstName` filter directly on the terminal node so AGE uses the GIN containment index (AGE-QUIRKS §8).
+- Each arm returns only the graphid of matching friends — bio properties are extracted in outer SQL by joining `Person` on the candidate graphid set (avoids agtype encode/decode of 10 fields inside Cypher).
+- The outer SQL `UNION ALL`s the three arms, deduplicates with `MIN(dist) GROUP BY person_gid`, joins in bio/city/study/work data, sorts by `(distance, lastName, friendId)`, and takes the top 20.
 
-The SQL BFS replaces the earlier three-separate-`cypher()` approach because
-3-hop variable-length Cypher paths trigger path-enumeration at scale
-(AGE-QUIRKS §4).
+`UNION ALL` + outer `MIN(dist)` dedup is used instead of exclusive arms because excluding lower-hop friends from higher-hop arms would require an anti-join per row; the sort-based dedup is cheaper (AGE-QUIRKS §4).
+`STUDY_AT`/`WORK_AT` aggregation uses the `University.city_id` and `Company.country_id` denorm columns to avoid one `IS_LOCATED_IN` hop per row.
 
 ### IC2 — friends' recent messages
 

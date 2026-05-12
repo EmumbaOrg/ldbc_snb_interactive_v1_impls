@@ -87,6 +87,12 @@ psql "$CONNECTION_STRING" \
     2>&1 | grep -v NOTICE || true
 
 # ---------------------------------------------------------------------------
+echo "=== Step 3b: Applying denormalised schema (columns + indexes + backfill) ==="
+psql "$CONNECTION_STRING" \
+    -f "${SCRIPT_DIR}/denormalize-schema.sql" \
+    2>&1 | grep -v NOTICE || true
+
+# ---------------------------------------------------------------------------
 echo "=== Step 4: VACUUM ANALYZE ==="
 bash "${SCRIPT_DIR}/vacuum-analyze.sh"
 
