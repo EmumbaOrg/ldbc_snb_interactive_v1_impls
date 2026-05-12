@@ -1,49 +1,53 @@
--- LdbcQuery1 — V2: SQL-first with early reachability ∩ firstName intersection.
--- Phase 1: one minimal Cypher call (personId → graphid seed).
--- Phase 2: SQL recursive BFS on KNOWS (unchanged from V1).
--- Phase 3 (NEW): one minimal Cypher call (firstName → graphids only, no OPTIONAL MATCH).
--- Phase 4 (NEW): SQL intersection of reachable ∩ firstName graphids.
--- Phase 5 (NEW): SQL GROUP BY for STUDY_AT / WORK_AT on the small candidate set only,
---   using University.city_id + Company.country_id denorm columns (no extra IS_LOCATED_IN hops).
--- Follows IC12 optimisation pattern: minimal Cypher + denorm SQL.
--- String params ($firstName) stay inside Cypher blocks where convertString binding is correct.
+-- LdbcQuery1 — V3: Cypher-first hybrid (three explicit hop arms + SQL aggregation).
+-- Pattern: AGENTS.md "Hybrid" tier + AGE-QUIRKS section 4 (canonical IC1 form).
+-- All KNOWS traversal directed (-[:KNOWS]->) per AGE-QUIRKS section 11; IU8 stores bidirectionally.
+-- firstName filter inlined as {firstName: $firstName} on the terminal node so AGE uses GIN
+--   (AGE-QUIRKS section 8: only inline node-pattern maps trigger GIN containment lookup).
+-- Each hop returns only id(f) (graphid) — bio properties are extracted in outer SQL by
+-- joining Person on the candidate graphid set (avoids agtype encode/decode of 10 fields
+-- inside the Cypher blocks; same pattern as IC9/IC2).
+-- Outer SQL: UNION ALL across the hop arms + MIN(dist) GROUP BY person_gid gives the
+-- shortest-distance semantics with natural dedup (matches IC9 V4 commentary in section 10).
+-- STUDY_AT/WORK_AT aggregation uses University.city_id and Company.country_id denorm columns
+-- (avoids one IS_LOCATED_IN hop per row; same idea as the IC12 optimization).
 
-WITH RECURSIVE
-  user_gid AS (
-    SELECT (g::text)::ag_catalog.graphid AS id
+WITH
+  hop1 AS (
+    SELECT (gid::text)::ag_catalog.graphid AS person_gid, 1 AS dist
     FROM cypher('$graphName', $$
-      MATCH (p:Person {id: $personId}) RETURN id(p) LIMIT 1
-    $$) AS x(g agtype)
-    LIMIT 1
-  ),
-  reach AS (
-    SELECT (SELECT id FROM user_gid) AS person_id, 0 AS dist
-    UNION
-    SELECT k.end_id, r.dist + 1
-    FROM reach r JOIN ldbc_snb."KNOWS" k ON k.start_id = r.person_id
-    WHERE r.dist < 3
-  ),
-  reachable AS MATERIALIZED (
-    SELECT person_id, MIN(dist) AS dist
-    FROM reach
-    WHERE dist > 0
-    GROUP BY person_id
-  ),
-  -- Minimal Cypher call: firstName → graphids only (no OPTIONAL MATCH, no city/edu/work hops).
-  -- GIN on Person.properties handles this. Seed excluded via reachable (dist > 0 above).
-  firstname_gids AS MATERIALIZED (
-    SELECT (f_gid::text)::ag_catalog.graphid AS person_gid
-    FROM cypher('$graphName', $$
-      MATCH (f:Person {firstName: $firstName})
+      MATCH (p:Person {id: $personId})-[:KNOWS]->(f:Person {firstName: $firstName})
+      WHERE f.id <> $personId
       RETURN id(f)
-    $$) AS x(f_gid agtype)
+    $$) AS x(gid agtype)
   ),
-  -- Intersection: reachable ∩ firstName_gids — SQL JOIN so STUDY_AT/WORK_AT only touch this small set.
+  hop2 AS (
+    SELECT (gid::text)::ag_catalog.graphid AS person_gid, 2 AS dist
+    FROM cypher('$graphName', $$
+      MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(f:Person {firstName: $firstName})
+      WHERE f.id <> $personId
+      RETURN DISTINCT id(f)
+    $$) AS x(gid agtype)
+  ),
+  hop3 AS (
+    SELECT (gid::text)::ag_catalog.graphid AS person_gid, 3 AS dist
+    FROM cypher('$graphName', $$
+      MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(:Person)-[:KNOWS]->(f:Person {firstName: $firstName})
+      WHERE f.id <> $personId
+      RETURN DISTINCT id(f)
+    $$) AS x(gid agtype)
+  ),
   candidates AS MATERIALIZED (
+    SELECT person_gid, MIN(dist) AS dist
+    FROM (
+      SELECT * FROM hop1
+      UNION ALL SELECT * FROM hop2
+      UNION ALL SELECT * FROM hop3
+    ) u
+    GROUP BY person_gid
+  ),
+  bio AS MATERIALIZED (
     SELECT
-      p.id                                                                                                  AS person_gid,
-      r.dist,
-      p.city_id,
+      c.person_gid, c.dist, p.city_id,
       ag_catalog.agtype_access_operator(VARIADIC ARRAY[p.properties, '"id"'::ag_catalog.agtype])           AS friend_id,
       ag_catalog.agtype_access_operator(VARIADIC ARRAY[p.properties, '"lastName"'::ag_catalog.agtype])     AS friend_lastname,
       ag_catalog.agtype_access_operator(VARIADIC ARRAY[p.properties, '"birthday"'::ag_catalog.agtype])     AS friend_birthday,
@@ -53,9 +57,8 @@ WITH RECURSIVE
       ag_catalog.agtype_access_operator(VARIADIC ARRAY[p.properties, '"locationIP"'::ag_catalog.agtype])   AS friend_locationip,
       ag_catalog.agtype_access_operator(VARIADIC ARRAY[p.properties, '"email"'::ag_catalog.agtype])        AS friend_emails,
       ag_catalog.agtype_access_operator(VARIADIC ARRAY[p.properties, '"speaks"'::ag_catalog.agtype])       AS friend_speaks
-    FROM ldbc_snb."Person" p
-    JOIN reachable       r  ON r.person_id   = p.id
-    JOIN firstname_gids  fg ON fg.person_gid = p.id
+    FROM candidates c
+    JOIN ldbc_snb."Person" p ON p.id = c.person_gid
   ),
   -- STUDY_AT aggregation: only for candidates (small set). Uses idx_studyat_start + University.city_id denorm.
   -- agtype_object_field_text strips agtype quotes; all fields stored as agtype strings so re-add "..." in array.
@@ -95,24 +98,24 @@ WITH RECURSIVE
     GROUP BY wa.start_id
   )
 SELECT
-  c.friend_id                                        AS friendId,
-  c.friend_lastname                                  AS friendLastName,
-  c.dist::ag_catalog.agtype                          AS distance,
-  c.friend_birthday                                  AS friendBirthday,
-  c.friend_creationdate                              AS friendCreationDate,
-  c.friend_gender                                    AS friendGender,
-  c.friend_browser                                   AS friendBrowserUsed,
-  c.friend_locationip                                AS friendLocationIp,
-  c.friend_emails                                    AS friendEmails,
-  c.friend_speaks                                    AS friendLanguages,
+  b.friend_id                                        AS friendId,
+  b.friend_lastname                                  AS friendLastName,
+  b.dist::ag_catalog.agtype                          AS distance,
+  b.friend_birthday                                  AS friendBirthday,
+  b.friend_creationdate                              AS friendCreationDate,
+  b.friend_gender                                    AS friendGender,
+  b.friend_browser                                   AS friendBrowserUsed,
+  b.friend_locationip                                AS friendLocationIp,
+  b.friend_emails                                    AS friendEmails,
+  b.friend_speaks                                    AS friendLanguages,
   ag_catalog.agtype_access_operator(VARIADIC ARRAY[ci.properties, '"name"'::ag_catalog.agtype]) AS friendCityName,
   COALESCE(sa.unis,      '[]'::ag_catalog.agtype)    AS friendUniversities,
   COALESCE(wa.companies, '[]'::ag_catalog.agtype)    AS friendCompanies
-FROM candidates c
-JOIN ldbc_snb."City" ci ON ci.id = c.city_id
-LEFT JOIN study_agg sa ON sa.person_gid = c.person_gid
-LEFT JOIN work_agg  wa ON wa.person_gid = c.person_gid
-ORDER BY c.dist ASC,
-         c.friend_lastname::text ASC,
-         (c.friend_id::text::bigint) ASC
+FROM bio b
+JOIN ldbc_snb."City" ci ON ci.id = b.city_id
+LEFT JOIN study_agg sa ON sa.person_gid = b.person_gid
+LEFT JOIN work_agg  wa ON wa.person_gid = b.person_gid
+ORDER BY b.dist ASC,
+         b.friend_lastname::text ASC,
+         (b.friend_id::text::bigint) ASC
 LIMIT 20;
