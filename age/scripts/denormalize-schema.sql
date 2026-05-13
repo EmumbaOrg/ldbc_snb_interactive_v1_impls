@@ -195,17 +195,16 @@ CREATE INDEX IF NOT EXISTS idx_university_city_id        ON "University" (city_i
 CREATE INDEX IF NOT EXISTS idx_company_country_id        ON "Company" (country_id);
 
 -- =========================================================================
--- 4. Composite (creator_id, creationDate DESC) for per-friend top-K message
--- queries (IC2, IC8). This is the index that unblocks "20 most recent
--- messages by friend" patterns at SF1000.
+-- 4. Per-friend top-K message composite indexes — DROPPED (IC2 rewrite 2026-05-13)
+-- These (creator_id, creationDate DESC) composites were IC2's only callers.
+-- IC2 is now a single Cypher call that filters creationDate inside Cypher,
+-- which uses the agtype functional indexes (idx_post_creationdate_agtype,
+-- idx_comment_creationdate_agtype) in create-indexes.sql instead.
+-- Dropping here so they are not created on fresh loads; the DROP below is
+-- idempotent for existing deployments.
 -- =========================================================================
--- creationDate is on the Comment/Post properties (agtype). Use the agtype
--- expression form to match how AGE compiles the WHERE comment.creationDate predicate.
-CREATE INDEX IF NOT EXISTS idx_post_creator_creationdate
-    ON "Post" (creator_id, ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"creationDate"'::ag_catalog.agtype]) DESC);
-
-CREATE INDEX IF NOT EXISTS idx_comment_creator_creationdate
-    ON "Comment" (creator_id, ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"creationDate"'::ag_catalog.agtype]) DESC);
+DROP INDEX IF EXISTS ldbc_snb.idx_post_creator_creationdate;
+DROP INDEX IF EXISTS ldbc_snb.idx_comment_creator_creationdate;
 
 -- =========================================================================
 -- 5. Iteration-2 aggregates (IC5 / IC10 SF1000 unblocks)
@@ -228,6 +227,64 @@ CREATE TABLE IF NOT EXISTS "ForumMemberPostCount" (
 );
 CREATE INDEX IF NOT EXISTS idx_fmpc_member ON "ForumMemberPostCount" (member_id);
 
+-- 3A: Composite mirror of FMPC PK for IC5's two-column probe. PK is
+-- (forum_id, member_id); IC5 drives from friend graphids and joins on both
+-- columns. Without this, planner builds a 7 MB hash on full FMPC (610k rows
+-- at SF10, ~6M at SF100) that spills to 16 batches. With it, NL-via-index
+-- returns at most 1 row per probe.
+CREATE INDEX IF NOT EXISTS idx_fmpc_member_forum
+    ON "ForumMemberPostCount" (member_id, forum_id);
+
+-- Drop the now-redundant single-column index; the composite covers all
+-- WHERE member_id = ? use cases as a leading prefix.
+DROP INDEX IF EXISTS idx_fmpc_member;
+
+-- 3B (revised 2026-05-13): client directive — never directly access AGE-managed
+-- tables in outer SQL. Replaces the prior HAS_MEMBER.join_date denorm column
+-- (which violated the directive) with two side tables that mirror the AGE
+-- state IC5 needs. IC5/IU5 read/write the side tables; AGE tables remain
+-- accessible only via cypher() calls.
+--
+-- HasMemberSide — mirror of HAS_MEMBER edges (forum_id, member_id, join_date).
+-- PK is (member_id, forum_id) because IC5 drives from the friend (member) side.
+-- Maintained by IU5 (INSERT per AddForumMembership). Initial backfill below.
+CREATE TABLE IF NOT EXISTS "HasMemberSide" (
+  forum_id   ag_catalog.graphid NOT NULL,
+  member_id  ag_catalog.graphid NOT NULL,
+  join_date  bigint             NOT NULL,
+  PRIMARY KEY (member_id, forum_id)
+);
+CREATE INDEX IF NOT EXISTS idx_hms_member_joindate
+    ON "HasMemberSide" (member_id, join_date);
+
+-- ForumSide — mirror of Forum vertex properties IC5 needs in its RETURN/ORDER BY.
+-- forum_id is the AGE graphid (used for joining); forum_business_id is the LDBC
+-- public id used as IC5's tie-breaker. Maintained by IU4 (INSERT per AddForum).
+CREATE TABLE IF NOT EXISTS "ForumSide" (
+  forum_id           ag_catalog.graphid PRIMARY KEY,
+  forum_business_id  bigint             NOT NULL,
+  title              text               NOT NULL
+);
+
+-- CommentRootPost — for each Comment, the LDBC business id (bigint) of the
+-- root Post reached by following REPLY_OF*. Used by IS6 to avoid Cypher
+-- variable-length REPLY_OF* traversal, which in AGE 1.6 expands intermediates
+-- through `_ag_label_vertex` and fails on label tables with denorm columns
+-- ("Invalid number of attributes for ldbc_snb.Person"). Storing the business
+-- id (not graphid) lets IS6 use `MATCH (root:Post {id: $rid})` directly.
+-- Maintained by IU7 on AddComment. Backfilled below.
+CREATE TABLE IF NOT EXISTS "CommentRootPost" (
+  comment_id            ag_catalog.graphid PRIMARY KEY,
+  root_post_business_id bigint             NOT NULL
+);
+
+-- Drop the prior Phase 3B denorm index on the AGE-managed HAS_MEMBER table.
+-- Note: the column itself (HAS_MEMBER.join_date) cannot be dropped — AGE 1.6
+-- blocks ALTER on its label tables ("table HAS_MEMBER is for label HAS_MEMBER").
+-- The column remains as dead storage but is no longer indexed or referenced.
+DROP INDEX IF EXISTS idx_hasmember_end_joindate;
+DROP INDEX IF EXISTS idx_hasmember_end_joindate_agtype;
+
 -- 5b. PersonPostCount: 1 row per Person, total post_count. Side table
 -- (NOT on the Person label) because AGE 1.6 cannot handle extra columns
 -- with NOT NULL DEFAULT on its label tables — Cypher CREATE segfaults.
@@ -248,6 +305,55 @@ CREATE INDEX IF NOT EXISTS idx_hasinterest_start_end
 -- =========================================================================
 -- 6. Iteration-2 backfills
 -- =========================================================================
+
+-- HasMemberSide: snapshot of HAS_MEMBER edges. The graph traversal goes
+-- through cypher() so we never read the AGE-managed HAS_MEMBER table
+-- directly, even at deploy time. Idempotent via ON CONFLICT.
+INSERT INTO "HasMemberSide" (forum_id, member_id, join_date)
+SELECT (forum_gid::text)::ag_catalog.graphid,
+       (member_gid::text)::ag_catalog.graphid,
+       (join_date_agt::text)::bigint
+FROM cypher('ldbc_snb', $$
+  MATCH (f:Forum)-[hm:HAS_MEMBER]->(p:Person)
+  RETURN id(f) AS forum_gid, id(p) AS member_gid, hm.joinDate AS jd
+$$) AS (forum_gid agtype, member_gid agtype, join_date_agt agtype)
+ON CONFLICT (member_id, forum_id) DO NOTHING;
+
+-- ForumSide: snapshot of Forum vertex properties used by IC5. Same cypher()
+-- pattern — no direct Forum table read. `agtype::text` on a scalar string
+-- returns the unquoted text directly (verified — AGE 1.6 strips the JSON
+-- quoting from string-typed agtype values).
+INSERT INTO "ForumSide" (forum_id, forum_business_id, title)
+SELECT (forum_gid::text)::ag_catalog.graphid,
+       (business_id::text)::bigint,
+       title_agt::text
+FROM cypher('ldbc_snb', $$
+  MATCH (f:Forum)
+  RETURN id(f) AS forum_gid, f.id AS bid, f.title AS title
+$$) AS (forum_gid agtype, business_id agtype, title_agt agtype)
+ON CONFLICT (forum_id) DO NOTHING;
+
+-- CommentRootPost: precomputed mapping Comment → root Post business id.
+-- IS6 needs this because AGE 1.6 cannot express the REPLY_OF* walk in Cypher
+-- (untyped intermediates break on Person's denorm columns). We walk the chain
+-- using Comment.reply_of_id (already maintained denorm) and capture each
+-- Comment's terminal Post's business id. Deploy-time backfill only; maintained
+-- per-Comment by IU7 thereafter.
+WITH RECURSIVE chain AS (
+  -- Base: every Comment whose direct parent is a Post.
+  SELECT c.id AS comment_id,
+         CAST(ag_catalog.agtype_object_field_text(p.properties, 'id') AS bigint) AS root_post_business_id
+  FROM "Comment" c
+  JOIN "Post" p ON p.id = c.reply_of_id
+  UNION ALL
+  -- Step: comments whose parent is another Comment we've already resolved.
+  SELECT c.id, chain.root_post_business_id
+  FROM "Comment" c
+  JOIN chain ON c.reply_of_id = chain.comment_id
+)
+INSERT INTO "CommentRootPost" (comment_id, root_post_business_id)
+SELECT comment_id, root_post_business_id FROM chain
+ON CONFLICT (comment_id) DO NOTHING;
 
 -- ForumMemberPostCount: aggregate from already-denormalised Post columns.
 -- ON CONFLICT DO NOTHING makes this idempotent (re-runs don't double-count).
