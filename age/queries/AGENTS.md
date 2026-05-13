@@ -18,16 +18,18 @@ You are a professional Database expert who has deep expertise in both relational
 - When evaluating query plans, the lowest SF that exposes real cost is typically SF10 or SF100. Run `EXPLAIN (ANALYZE, BUFFERS)` there, not at SF0.1 where every table fits in `shared_buffers`.
 
 
-## Implementation Style — Cypher-First, Hybrid Allowed, No Pure SQL
+## Implementation Style — Cypher-First, No Direct AGE Table Access, No Pure SQL
 
-All queries must go through the AGE/Cypher path. Two tiers are recognised, in priority order:
+All queries must go through the AGE/Cypher path via `cypher(...)` calls. Two patterns are recognised, in priority order:
 
-1. **Cypher-only** — a single `cypher(...)` call with no outer SQL logic beyond the mandatory wrapper. Default for simple lookups, updates, and queries the AGE planner handles well on its own.
-2. **Hybrid** — Cypher for graph traversal, outer SQL for aggregation, filtering on agtype-coerced columns, multi-result `UNION ALL`, or complex `ORDER BY` / `LIMIT`. Use when the traversal is the natural Cypher shape but the remainder is faster in SQL. Most IC queries fall here. However, never read the age tables directly from SQL. 
+1. **Cypher-only** — a single `cypher(...)` call with no outer SQL logic beyond the mandatory wrapper. Default for simple lookups, updates, and queries AGE handles well internally.
+2. **Hybrid (outer wrapper only)** — one or more `cypher(...)` calls where the outer SQL is strictly limited to combining or sorting Cypher output: `UNION ALL` of multiple `cypher()` calls (required for multi-label patterns — see AGE-QUIRKS §3), outer `ORDER BY`, `LIMIT`, and scalar arithmetic on Cypher output columns. All traversal, filtering, aggregation, and property access must still happen inside the Cypher block.
 
-**Pure SQL is forbidden.** The main query must always go through Cypher (either pure or as a hybrid). If a tactic seems to require eliminating the `cypher()` call entirely, treat that as a sign the approach is wrong — find an index, denorm column, side table, or query rewrite that lets Cypher do the traversal. Never read the age tables directly from SQL.
+**Forbidden: outer SQL that directly accesses AGE label tables.** Any `FROM`, `JOIN`, or `UPDATE` in outer SQL that references an AGE-managed PostgreSQL table directly — e.g., `ldbc_snb."Post"`, `ldbc_snb."Comment"`, `ldbc_snb."Person"`, `ldbc_snb."HAS_CREATOR"`, `ldbc_snb."HAS_MEMBER"`, or any other label or edge table — outside of a `cypher()` call is not allowed. Side tables (`ForumMemberPostCount`, `PersonPostCount`) are also off-limits. This pattern bypasses the graph query layer entirely.
 
-IS6 is the only current pure-SQL holdout and is tracked for migration back to Cypher. Do not cite it as precedent for new pure-SQL implementations.
+**Pure SQL is also forbidden.** If a tactic seems to require eliminating the `cypher()` call entirely, treat that as a sign the approach is wrong — find an index, rewrite the Cypher pattern, or restructure the query so all data retrieval goes through `cypher()`.
+
+IS6 is the only current pure-SQL holdout and is tracked for migration to Cypher. Do not cite it as precedent for new pure-SQL or direct-AGE-table-access implementations.
 
 
 ## Instructions
@@ -39,7 +41,7 @@ Consult these before generating or reviewing any query:
 | Document | Purpose |
 |---|---|
 | `README.md` | Strategy, history, and denormalization rationale — read first for context on why the implementation is structured the way it is |
-| `AGE-QUIRKS.md` | 12 catalogued AGE limitations: datetime handling, multi-label absence, variable-length predicate pushdown, KNOWS direction, and more |
+| `AGE-QUIRKS.md` | 13 catalogued AGE limitations: datetime handling, multi-label absence, variable-length predicate pushdown, KNOWS direction, multi-hop OPTIONAL MATCH backward hash join, and more |
 | `SCHEMA.md` | Node/edge labels, agtype storage layout, denorm columns added in iterations 1/2/3, and side tables |
 | `INDEXES.md` | GIN on agtype properties, B-tree on edge `start_id`/`end_id`, functional B-tree on extracted values, and composite indexes |
 
@@ -103,7 +105,16 @@ For each query, read both the YAML spec and the SQL file, then verify:
     - When unsure, run `EXPLAIN (ANALYZE, BUFFERS)` at the lowest SF that exposes real cost (typically SF10 or SF100).
     - If a proposed tactic only shows benefit at SF≤10, reject it and look for an approach that scales.
 
-13. **Never write `cypher(` literally in SQL comments for parameterized queries.** The JDBC handler binds one agtype JSON parameter per `cypher(` occurrence found in the SQL via naive `indexOf("cypher(")` — it does NOT strip comments. If a comment contains `cypher()` or `cypher(` literally, the handler will try to bind more parameters than there are `?` placeholders and the query crashes with `column index is out of range: N, number of columns: M`. Write "Cypher" (no parens) or "the Cypher call" in commentary instead. Applies to any query listed in `age_parameterized_queries` in `driver/*-local.properties` — currently IC4, IC6-IC8, IC10-IC12, IS1-IS5, IS7, IU2, IU3, IU5, IU8. Tracked durable fix: strip SQL comments in `countCypherCalls()` in `AgeUpdateOperationHandler` / `AgeSingletonOperationHandler` / `AgeListOperationHandler`.
+13. **Split multi-hop OPTIONAL MATCH chains involving edge→label→edge patterns.** A 2-hop OPTIONAL MATCH such as `OPTIONAL MATCH (f)-[wa:WORK_AT]->(co:Company)-[:IS_LOCATED_IN]->(cc:Country)` allows the AGE planner to invert the traversal — building a full hash of all Company × IS_LOCATED_IN × Country × WORK_AT rows and probing with the candidate set — rather than driving forward from `f` via `idx_workat_start`. At SF10 this builds a 143K-row hash that exceeds `work_mem` (8 batches, ~87 MB temp spill, +230 ms per hop arm). The fix is to split into two 1-hop OPTIONAL MATCHes with an intermediate `WITH` that binds each node separately:
+    ```cypher
+    OPTIONAL MATCH (f)-[wa:WORK_AT]->(co:Company)
+    WITH f, ..., wa, co
+    OPTIONAL MATCH (co)-[:IS_LOCATED_IN]->(cc:Country)
+    WITH f, ..., collect(...) AS companies
+    ```
+    Apply this pattern to any `(n)-[e:EDGE]->(x:Label)-[:IS_LOCATED_IN]->(:GeoNode)` OPTIONAL MATCH. See AGE-QUIRKS §12.
+
+14. **Never write `cypher(` literally in SQL comments for parameterized queries.** The JDBC handler binds one agtype JSON parameter per `cypher(` occurrence found in the SQL via naive `indexOf("cypher(")` — it does NOT strip comments. If a comment contains `cypher()` or `cypher(` literally, the handler will try to bind more parameters than there are `?` placeholders and the query crashes with `column index is out of range: N, number of columns: M`. Write "Cypher" (no parens) or "the Cypher call" in commentary instead. Applies to any query listed in `age_parameterized_queries` in `driver/*-local.properties` — currently IC4, IC6-IC8, IC10-IC12, IS1-IS5, IS7, IU2, IU3, IU5, IU8. Tracked durable fix: strip SQL comments in `countCypherCalls()` in `AgeUpdateOperationHandler` / `AgeSingletonOperationHandler` / `AgeListOperationHandler`.
 
 14. A query should never access the AGE tables directly from the outer SQL. Its strictly forbidden. 
 
