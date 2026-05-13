@@ -130,10 +130,10 @@ CREATE INDEX idx_post_date_id    ON ldbc_snb."Post"
 | Query | Primary indexes used |
 |---|---|
 | IC1 | `gin_person` (seed graphid + firstName candidate), `idx_knows_start` (BFS walk via KNOWS edge table directly) |
-| IC2 | `gin_person` (entry), `idx_knows_start/end`, `idx_hascreator_*`, `idx_comment_date_id` / `idx_post_date_id` |
+| IC2 | `gin_person` (entry), `idx_knows_start` (directed friend hop), `idx_hascreator_end` (reverse HAS_CREATOR), `idx_post_creationdate_agtype`, `idx_comment_creationdate_agtype` (date filter inside Cypher call) |
 | IC3 | `gin_person`, `idx_knows_*`, `idx_hascreator_*`, `idx_comment_date` / `idx_post_date`, `idx_country_name`, `gin_country` |
 | IC4 | `gin_person`, `idx_knows_*`, `idx_hascreator_*`, `idx_hastag_*`, `idx_post_date` |
-| IC5 | `gin_person` (entry), `idx_knows_start` (directed friend graphids via Cypher UNION), `idx_hasmember_end` (friend→forum), `idx_fmpc_member` (`ForumMemberPostCount` side-table lookup) |
+| IC5 | `gin_person` (entry), `idx_knows_start` (directed friend graphids via Cypher UNION), `idx_hms_member_joindate` (`HasMemberSide` friend→forum with native join_date filter), `idx_fmpc_member_forum` (`ForumMemberPostCount` two-column NL probe), `ForumSide` PK (forum title + business_id lookup) |
 | IC6 | `gin_person`, `idx_knows_*`, `idx_hascreator_*`, `idx_hastag_*`, `idx_tag_name` |
 | IC7 | `gin_person`, `idx_hascreator_*`, `idx_likes_*` |
 | IC8 | `gin_person` (entry), `idx_hascreator_*` (untyped intermediate; AGE plans as label UNION internally — bounded cost) |
@@ -144,7 +144,7 @@ CREATE INDEX idx_post_date_id    ON ldbc_snb."Post"
 | IS1, IS3 | `gin_person`, `idx_islocatedin_*` (IS1), `idx_knows_start` (IS3 — directed) |
 | IS2 | `gin_person`, `idx_hascreator_*`, `idx_replyof_start` (recursive CTE REPLY_OF walk), `idx_comment_date_id` / `idx_post_date_id` |
 | IS4, IS5 | `gin_comment` / `gin_post`, `idx_hascreator_*` (IS5) |
-| IS6 | `gin_post` / `gin_comment` (seed), `idx_replyof_start` (recursive CTE REPLY_OF walk), `idx_containerof_end`, `idx_hasmoderator_start` |
+| IS6 | `gin_comment` / `gin_post` (seed MATCH inside Cypher call), `idx_replyof_start` (variable-length walk `REPLY_OF*1..10`), `idx_containerof_end`, `idx_hasmoderator_start`, `idx_post_id`, `idx_comment_id` |
 | IS7 | `gin_comment` / `gin_post`, `idx_replyof_end`, `idx_hascreator_*`, `idx_knows_start` (directed, know-check) |
 | IU1–IU8 | `gin_*` for entry MATCHes; edge `idx_*_start/end` for existence checks; denorm-column indexes for UPDATE lookups |
 
@@ -184,27 +184,61 @@ CREATE INDEX idx_company_country_id        ON ldbc_snb."Company"  (country_id);
 ```sql
 -- IC5: forum_id = X AND creator_id = Y (Post LEFT JOIN in ForumMemberPostCount)
 CREATE INDEX idx_post_forum_creator ON ldbc_snb."Post" (forum_id, creator_id);
-
--- IC2/IC8: per-friend top-K messages (creator_id + creationDate DESC).
--- The creationDate expression uses the AGE agtype operator so the index
--- backs the same agtype DESC comparisons used in the SQL outer arms.
-CREATE INDEX idx_post_creator_creationdate
-    ON ldbc_snb."Post"
-    (creator_id, ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"creationDate"'::ag_catalog.agtype]) DESC);
-CREATE INDEX idx_comment_creator_creationdate
-    ON ldbc_snb."Comment"
-    (creator_id, ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"creationDate"'::ag_catalog.agtype]) DESC);
 ```
+
+#### Removed composites (IC2 rewrite 2026-05-13)
+
+`idx_post_creator_creationdate` and `idx_comment_creator_creationdate` have been
+dropped. They were IC2's only callers. IC2 is now a single Cypher call; the
+`creationDate <= $maxDate` filter runs inside Cypher and is backed by
+`idx_post_creationdate_agtype` / `idx_comment_creationdate_agtype` (defined in
+`create-indexes.sql`). The DROP is in `denormalize-schema.sql` section 4.
 
 ### Side-table indexes
 
 ```sql
--- ForumMemberPostCount: PK is (forum_id, member_id); secondary on member_id for IC5 probe
-CREATE INDEX idx_fmpc_member ON ldbc_snb."ForumMemberPostCount" (member_id);
+-- ForumMemberPostCount: PK is (forum_id, member_id).
+-- Phase 3A: composite (member_id, forum_id) replaces single-column idx_fmpc_member.
+-- IC5 drives from friend graphids and probes both columns; NL+index returns
+-- at most 1 row per probe, eliminating the 7 MB hash spill (16 batches at SF10).
+CREATE INDEX idx_fmpc_member_forum ON ldbc_snb."ForumMemberPostCount" (member_id, forum_id);
+-- REMOVED: idx_fmpc_member (single-column) — covered by idx_fmpc_member_forum prefix.
 
 -- HAS_INTEREST composite covering (IC10 per-post interest check)
 CREATE INDEX idx_hasinterest_start_end ON ldbc_snb."HAS_INTEREST" (start_id, end_id);
 ```
+
+### IC5 side-table indexes (replaces Phase 3B's HAS_MEMBER.join_date approach)
+
+Client directive 2026-05-13: outer SQL must not directly access AGE-managed
+tables. Phase 3B's `idx_hasmember_end_joindate` on the AGE `HAS_MEMBER` table
+was dropped; IC5's filter now reads `HasMemberSide` (a regular table) and
+`ForumSide` (Forum property mirror).
+
+```sql
+-- HasMemberSide: (member_id, forum_id) PK + (member_id, join_date) for IC5.
+CREATE TABLE "HasMemberSide" (
+  forum_id   ag_catalog.graphid NOT NULL,
+  member_id  ag_catalog.graphid NOT NULL,
+  join_date  bigint             NOT NULL,
+  PRIMARY KEY (member_id, forum_id)
+);
+CREATE INDEX idx_hms_member_joindate ON "HasMemberSide" (member_id, join_date);
+
+-- ForumSide: forum_id PK + native title/business_id columns.
+CREATE TABLE "ForumSide" (
+  forum_id           ag_catalog.graphid PRIMARY KEY,
+  forum_business_id  bigint             NOT NULL,
+  title              text               NOT NULL
+);
+```
+
+REMOVED in the same revision:
+- `idx_hasmember_end_joindate` (on the AGE HAS_MEMBER table — directive violation)
+- `idx_hasmember_end_joindate_agtype` (legacy functional agtype index — both pre-Phase-3 and Phase-3B forms are gone)
+
+The `HAS_MEMBER.join_date` BIGINT column remains on the AGE table because AGE 1.6
+blocks DROP COLUMN on its label tables, but it is unindexed and unreferenced.
 
 ---
 

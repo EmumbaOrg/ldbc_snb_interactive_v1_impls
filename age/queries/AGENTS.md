@@ -23,9 +23,9 @@ You are a professional Database expert who has deep expertise in both relational
 All queries must go through the AGE/Cypher path. Two tiers are recognised, in priority order:
 
 1. **Cypher-only** — a single `cypher(...)` call with no outer SQL logic beyond the mandatory wrapper. Default for simple lookups, updates, and queries the AGE planner handles well on its own.
-2. **Hybrid** — Cypher for graph traversal, outer SQL for aggregation, filtering on agtype-coerced columns, multi-result `UNION ALL`, or complex `ORDER BY` / `LIMIT`. Use when the traversal is the natural Cypher shape but the remainder is faster in SQL. Most IC queries fall here.
+2. **Hybrid** — Cypher for graph traversal, outer SQL for aggregation, filtering on agtype-coerced columns, multi-result `UNION ALL`, or complex `ORDER BY` / `LIMIT`. Use when the traversal is the natural Cypher shape but the remainder is faster in SQL. Most IC queries fall here. However, never read the age tables directly from SQL. 
 
-**Pure SQL is forbidden.** The main query must always go through Cypher (either pure or as a hybrid). If a tactic seems to require eliminating the `cypher()` call entirely, treat that as a sign the approach is wrong — find an index, denorm column, side table, or query rewrite that lets Cypher do the traversal.
+**Pure SQL is forbidden.** The main query must always go through Cypher (either pure or as a hybrid). If a tactic seems to require eliminating the `cypher()` call entirely, treat that as a sign the approach is wrong — find an index, denorm column, side table, or query rewrite that lets Cypher do the traversal. Never read the age tables directly from SQL.
 
 IS6 is the only current pure-SQL holdout and is tracked for migration back to Cypher. Do not cite it as precedent for new pure-SQL implementations.
 
@@ -104,6 +104,8 @@ For each query, read both the YAML spec and the SQL file, then verify:
     - If a proposed tactic only shows benefit at SF≤10, reject it and look for an approach that scales.
 
 13. **Never write `cypher(` literally in SQL comments for parameterized queries.** The JDBC handler binds one agtype JSON parameter per `cypher(` occurrence found in the SQL via naive `indexOf("cypher(")` — it does NOT strip comments. If a comment contains `cypher()` or `cypher(` literally, the handler will try to bind more parameters than there are `?` placeholders and the query crashes with `column index is out of range: N, number of columns: M`. Write "Cypher" (no parens) or "the Cypher call" in commentary instead. Applies to any query listed in `age_parameterized_queries` in `driver/*-local.properties` — currently IC4, IC6-IC8, IC10-IC12, IS1-IS5, IS7, IU2, IU3, IU5, IU8. Tracked durable fix: strip SQL comments in `countCypherCalls()` in `AgeUpdateOperationHandler` / `AgeSingletonOperationHandler` / `AgeListOperationHandler`.
+
+14. A query should never access the AGE tables directly from the outer SQL. Its strictly forbidden. 
 
 ## Known Intentional Deviations — Do NOT Flag as Bugs
 

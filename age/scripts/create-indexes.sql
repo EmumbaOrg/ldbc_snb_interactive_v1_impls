@@ -179,11 +179,10 @@ CREATE INDEX IF NOT EXISTS idx_university_graphid ON ldbc_snb."University" (id);
 -- range predicates. Worth trying on Comment.creationDate / Post.creationDate
 -- if those queries (IC2/IC9 etc.) ever flag at SF100+ in profiling.
 -- ---------------------------------------------------------------------------
-CREATE INDEX IF NOT EXISTS idx_hasmember_end_joindate_agtype
-  ON ldbc_snb."HAS_MEMBER" (
-    end_id,
-    (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"joinDate"'::ag_catalog.agtype]))
-  );
+-- Native (end_id, join_date) B-tree index moved to denormalize-schema.sql
+-- (after the join_date BIGINT ALTER+backfill). create-indexes.sql runs
+-- BEFORE denormalize-schema.sql in load-data.sh, so the column doesn't yet
+-- exist at this point.
 
 -- Date predicates on Comment / Post for IC2/IC4-style date-range filters in Cypher.
 -- Same agtype-expression-matching pattern as above. Existing idx_comment_date /

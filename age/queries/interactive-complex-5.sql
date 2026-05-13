@@ -1,15 +1,14 @@
 -- LdbcQuery5 — Recent forums (joined after minDate) that 1- or 2-hop friends joined, with post counts.
--- Hybrid: the Cypher call fetches 1+2-hop friend graphids via fixed-depth MATCH UNION (no variable-length
--- path per AGE-QUIRKS §4); SQL JOINs HAS_MEMBER + Forum + ForumMemberPostCount side table.
--- Directed `-[:KNOWS]->` per AGE-QUIRKS §11 — undirected forces a KNOWS seq scan; IU8 stores
--- both directions so directed traversal finds all friends via idx_knows_start.
--- Denorm used: ForumMemberPostCount(forum_id, member_id) (iter-2 aggregate side table).
--- Aggregation pre-groups by hm.start_id (graphid) in the agg CTE; Forum is joined after
--- aggregation so the GROUP BY hashes only on the graphid scalar, not the full properties JSON blob.
--- Phase 2 (Tactic B): replaced the OPTIONAL MATCH antijoin dedup with plain 1-hop UNION 2-hop.
--- UNION set semantics deduplicate naturally (same as postgres/duckdb/Neo4j reference impls).
--- Phase 2 (Tactic C): MATERIALIZED forces the planner to evaluate the friend set before joining
--- HAS_MEMBER, preventing the AGE 1.6 threshold-flip at SF100+ (sf3-final-report §5.1).
+-- Hybrid: Cypher fetches 1+2-hop friend graphids via fixed-depth MATCH UNION
+-- (no variable-length path per AGE-QUIRKS §4); outer SQL operates exclusively
+-- on side tables, never on AGE-managed tables (client directive 2026-05-13):
+--   HasMemberSide        — mirror of HAS_MEMBER (forum_id, member_id, join_date)
+--   ForumMemberPostCount — precomputed (forum_id, member_id) → post_count
+--   ForumSide            — mirror of Forum (forum_id, business_id, title)
+-- Directed `-[:KNOWS]->` per AGE-QUIRKS §11; IU8 stores both directions.
+-- Aggregation pre-groups by hms.forum_id (graphid scalar). MATERIALIZED forces
+-- the planner to evaluate the friend set before the HasMemberSide join,
+-- preventing the AGE 1.6 threshold-flip at SF100+ (sf3-final-report §5.1).
 
 WITH friends AS MATERIALIZED (
   SELECT (friend_gid::text)::ag_catalog.graphid AS friend_id
@@ -24,21 +23,20 @@ WITH friends AS MATERIALIZED (
   $$) AS x(friend_gid agtype)
 ),
 agg AS (
-  SELECT hm.start_id AS forum_id,
+  SELECT hms.forum_id,
          COALESCE(SUM(fmpc.post_count), 0)::int AS postCount
   FROM friends fr
-  JOIN ldbc_snb."HAS_MEMBER" hm
-    ON hm.end_id = fr.friend_id
-   AND ag_catalog.agtype_access_operator(VARIADIC ARRAY[hm.properties, '"joinDate"'::ag_catalog.agtype]) > $minDate::ag_catalog.agtype
+  JOIN ldbc_snb."HasMemberSide" hms
+    ON hms.member_id = fr.friend_id
+   AND hms.join_date > $minDate::bigint
   LEFT JOIN ldbc_snb."ForumMemberPostCount" fmpc
-    ON fmpc.forum_id = hm.start_id AND fmpc.member_id = fr.friend_id
-  GROUP BY hm.start_id
+    ON fmpc.forum_id = hms.forum_id AND fmpc.member_id = fr.friend_id
+  GROUP BY hms.forum_id
 )
-SELECT
-  ag_catalog.agtype_access_operator(VARIADIC ARRAY[f.properties, '"title"'::ag_catalog.agtype]) AS forumTitle,
-  a.postCount
+SELECT fs.title AS forumTitle,
+       a.postCount
 FROM agg a
-JOIN ldbc_snb."Forum" f ON f.id = a.forum_id
+JOIN ldbc_snb."ForumSide" fs ON fs.forum_id = a.forum_id
 ORDER BY a.postCount DESC,
-         (CAST(ag_catalog.agtype_object_field_text(f.properties, 'id') AS bigint)) ASC
+         fs.forum_business_id ASC
 LIMIT 20;

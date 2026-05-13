@@ -92,7 +92,7 @@ about direction. IU8 (add friendship) creates both rows in one transaction.
 | `HAS_CREATOR` | Comment\|Post → Person | — | Two source CSVs unified into one edge label |
 | `REPLY_OF` | Comment → Comment\|Post | — | Target can be either label; queries handle this with chained OPTIONAL MATCH |
 | `CONTAINER_OF` | Forum → Post | — | A Post belongs to exactly one Forum |
-| `HAS_MEMBER` | Forum → Person | `joinDate` (bigint) | |
+| `HAS_MEMBER` | Forum → Person | `joinDate` (bigint) | Mirrored into the `HasMemberSide` side table for IC5 (see "Side tables" below) — the AGE table itself is not read by outer SQL |
 | `HAS_MODERATOR` | Forum → Person | — | |
 | `LIKES` | Person → Comment\|Post | `creationDate` (bigint) | |
 | `HAS_INTEREST` | Person → Tag | — | |
@@ -158,6 +158,39 @@ on subsequent writes by the IU operations listed. All columns are of type
 | Column | Source edge | Maintained by |
 |---|---|---|
 | `city_id` | `IS_LOCATED_IN`.end_id | IU1 (SQL UPDATE) |
+
+### Side tables (mirrors — outer SQL never reads AGE tables)
+
+Per client directive 2026-05-13: outer SQL must not directly access AGE-managed
+tables. The denorm columns above on `Post`/`Comment`/`Forum`/`Person` are legacy
+and tracked for migration to side tables. Phase 3B's `HAS_MEMBER.join_date`
+column was replaced by the side-table pattern below.
+
+#### `ldbc_snb."HasMemberSide"`
+
+| Column | Source | Maintained by |
+|---|---|---|
+| `forum_id` | `HAS_MEMBER.start_id` | IU5 (INSERT from cypher() result) |
+| `member_id` | `HAS_MEMBER.end_id` | IU5 |
+| `join_date` | `HAS_MEMBER.properties->'joinDate'` (cast to bigint) | IU5 |
+
+PK `(member_id, forum_id)`; secondary index `(member_id, join_date)`. Backfilled
+from `HAS_MEMBER` at deploy time. Used by IC5 as the directive-compliant
+replacement for the prior `HAS_MEMBER.join_date` column. The HAS_MEMBER column
+of the same name still exists in the AGE table (AGE 1.6 blocks DROP COLUMN on
+label tables) but is unindexed and unreferenced.
+
+#### `ldbc_snb."ForumSide"`
+
+| Column | Source | Maintained by |
+|---|---|---|
+| `forum_id` | `Forum.id` (graphid) | IU4 (INSERT from cypher() result) |
+| `forum_business_id` | `Forum.properties->'id'` (LDBC public id, bigint) | IU4 |
+| `title` | `Forum.properties->'title'` (text) | IU4 |
+
+PK on `forum_id`. Used by IC5 to read forum titles and the IC5 ORDER BY
+tie-breaker (`forum_business_id`) without invoking `agtype_access_operator` on
+each top-20 row.
 
 ### Additional denorm columns (also in `denormalize-schema.sql`)
 

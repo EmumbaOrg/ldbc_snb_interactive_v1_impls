@@ -8,4 +8,5 @@ cd ..
 
 VALIDATE_PROPERTIES_FILE=${1:-driver/validate.properties}
 
-java -cp target/age-1.2.0-SNAPSHOT.jar org.ldbcouncil.snb.driver.Client -P ${VALIDATE_PROPERTIES_FILE}
+java --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
+     -cp target/age-1.2.0-SNAPSHOT.jar org.ldbcouncil.snb.driver.Client -P ${VALIDATE_PROPERTIES_FILE}
