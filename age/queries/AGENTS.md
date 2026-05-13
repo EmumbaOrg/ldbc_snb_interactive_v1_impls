@@ -18,17 +18,18 @@ You are a professional Database expert who has deep expertise in both relational
 - When evaluating query plans, the lowest SF that exposes real cost is typically SF10 or SF100. Run `EXPLAIN (ANALYZE, BUFFERS)` there, not at SF0.1 where every table fits in `shared_buffers`.
 
 
-## Implementation Style — Cypher-Only, No Hybrid, No Pure SQL
+## Implementation Style — Cypher-First, No Direct AGE Table Access, No Pure SQL
 
-All queries must go through the AGE/Cypher path via `cypher(...)` calls. Only one tier is recognised:
+All queries must go through the AGE/Cypher path via `cypher(...)` calls. Two patterns are recognised, in priority order:
 
-1. **Cypher-only** — one or more `cypher(...)` calls where all graph traversal, filtering, aggregation, and ordering logic lives inside the Cypher block. The only outer SQL permitted is the minimal wrapper (`SELECT … FROM cypher(…)`) and, where necessary, a `UNION ALL` combining the results of multiple `cypher()` calls (e.g., for multi-label patterns — see AGE-QUIRKS §3). Outer `ORDER BY` and `LIMIT` on the combined result set are also permitted.
+1. **Cypher-only** — a single `cypher(...)` call with no outer SQL logic beyond the mandatory wrapper. Default for simple lookups, updates, and queries AGE handles well internally.
+2. **Hybrid (outer wrapper only)** — one or more `cypher(...)` calls where the outer SQL is strictly limited to combining or sorting Cypher output: `UNION ALL` of multiple `cypher()` calls (required for multi-label patterns — see AGE-QUIRKS §3), outer `ORDER BY`, `LIMIT`, and scalar arithmetic on Cypher output columns. All traversal, filtering, aggregation, and property access must still happen inside the Cypher block.
 
-**Hybrid queries are forbidden.** A hybrid query is any pattern where outer SQL directly accesses AGE's underlying PostgreSQL label tables (e.g., `ldbc_snb."Post"`, `ldbc_snb."Comment"`, `ldbc_snb."Person"`, `ldbc_snb."KNOWS"`, or any other AGE-managed label table) outside of a `cypher()` call — for example, by joining a `cypher()` result set against `ldbc_snb."Post"` to retrieve properties, or by querying `ldbc_snb."HAS_MEMBER"` directly in outer SQL. Such access bypasses the graph query layer and is not allowed.
+**Forbidden: outer SQL that directly accesses AGE label tables.** Any `FROM`, `JOIN`, or `UPDATE` in outer SQL that references an AGE-managed PostgreSQL table directly — e.g., `ldbc_snb."Post"`, `ldbc_snb."Comment"`, `ldbc_snb."Person"`, `ldbc_snb."HAS_CREATOR"`, `ldbc_snb."HAS_MEMBER"`, or any other label or edge table — outside of a `cypher()` call is not allowed. Side tables (`ForumMemberPostCount`, `PersonPostCount`) are also off-limits. This pattern bypasses the graph query layer entirely.
 
 **Pure SQL is also forbidden.** If a tactic seems to require eliminating the `cypher()` call entirely, treat that as a sign the approach is wrong — find an index, rewrite the Cypher pattern, or restructure the query so all data retrieval goes through `cypher()`.
 
-IS6 is the only current pure-SQL holdout and is tracked for migration to Cypher. Do not cite it as precedent for new pure-SQL or hybrid implementations.
+IS6 is the only current pure-SQL holdout and is tracked for migration to Cypher. Do not cite it as precedent for new pure-SQL or direct-AGE-table-access implementations.
 
 
 ## Instructions
