@@ -18,18 +18,17 @@ You are a professional Database expert who has deep expertise in both relational
 - When evaluating query plans, the lowest SF that exposes real cost is typically SF10 or SF100. Run `EXPLAIN (ANALYZE, BUFFERS)` there, not at SF0.1 where every table fits in `shared_buffers`.
 
 
-## Implementation Style — Cypher-First, No Direct AGE Table Access, No Pure SQL
+## Implementation Style — Cypher-First, Hybrid Allowed, No Pure SQL
 
-All queries must go through the AGE/Cypher path via `cypher(...)` calls. Two patterns are recognised, in priority order:
+All queries must go through the AGE/Cypher path. Two tiers are recognised, in priority order:
 
-1. **Cypher-only** — a single `cypher(...)` call with no outer SQL logic beyond the mandatory wrapper. Default for simple lookups, updates, and queries AGE handles well internally.
-2. **Hybrid (outer wrapper only)** — one or more `cypher(...)` calls where the outer SQL is strictly limited to combining or sorting Cypher output: `UNION ALL` of multiple `cypher()` calls (required for multi-label patterns — see AGE-QUIRKS §3), outer `ORDER BY`, `LIMIT`, and scalar arithmetic on Cypher output columns. All traversal, filtering, aggregation, and property access must still happen inside the Cypher block.
+1. **Cypher-only** — a single `cypher(...)` call with no outer SQL logic beyond the mandatory wrapper. Default for simple lookups, updates, and queries the AGE planner handles well on its own.
 
-**Forbidden: outer SQL that directly accesses AGE label tables.** Any `FROM`, `JOIN`, or `UPDATE` in outer SQL that references an AGE-managed PostgreSQL table directly — e.g., `ldbc_snb."Post"`, `ldbc_snb."Comment"`, `ldbc_snb."Person"`, `ldbc_snb."HAS_CREATOR"`, `ldbc_snb."HAS_MEMBER"`, or any other label or edge table — outside of a `cypher()` call is not allowed. Side tables (`ForumMemberPostCount`, `PersonPostCount`) are also off-limits. This pattern bypasses the graph query layer entirely.
+2. **Hybrid** — Cypher for graph traversal, outer SQL for aggregation, filtering, multi-result `UNION ALL`, or complex `ORDER BY` / `LIMIT`. Use when the traversal is the natural Cypher shape but the remainder is faster in SQL. Never read the age graph tables directly from SQL. 
 
-**Pure SQL is also forbidden.** If a tactic seems to require eliminating the `cypher()` call entirely, treat that as a sign the approach is wrong — find an index, rewrite the Cypher pattern, or restructure the query so all data retrieval goes through `cypher()`.
+**Pure SQL is forbidden.** The main query must always go through Cypher (either pure or as a hybrid). If a tactic seems to require eliminating the `cypher()` call entirely, treat that as a sign the approach is wrong — find an index, denorm column, side table, or query rewrite that lets Cypher do the traversal. Never read the age tables directly from SQL.
 
-IS6 is the only current pure-SQL holdout and is tracked for migration to Cypher. Do not cite it as precedent for new pure-SQL or direct-AGE-table-access implementations.
+IS6 is the only current pure-SQL holdout and is tracked for migration back to Cypher. Do not cite it as precedent for new pure-SQL implementations.
 
 
 ## Instructions
@@ -41,7 +40,7 @@ Consult these before generating or reviewing any query:
 | Document | Purpose |
 |---|---|
 | `README.md` | Strategy, history, and denormalization rationale — read first for context on why the implementation is structured the way it is |
-| `AGE-QUIRKS.md` | 13 catalogued AGE limitations: datetime handling, multi-label absence, variable-length predicate pushdown, KNOWS direction, multi-hop OPTIONAL MATCH backward hash join, and more |
+| `AGE-QUIRKS.md` | 12 catalogued AGE limitations: datetime handling, multi-label absence, variable-length predicate pushdown, KNOWS direction, and more |
 | `SCHEMA.md` | Node/edge labels, agtype storage layout, denorm columns added in iterations 1/2/3, and side tables |
 | `INDEXES.md` | GIN on agtype properties, B-tree on edge `start_id`/`end_id`, functional B-tree on extracted values, and composite indexes |
 
@@ -105,16 +104,7 @@ For each query, read both the YAML spec and the SQL file, then verify:
     - When unsure, run `EXPLAIN (ANALYZE, BUFFERS)` at the lowest SF that exposes real cost (typically SF10 or SF100).
     - If a proposed tactic only shows benefit at SF≤10, reject it and look for an approach that scales.
 
-13. **Split multi-hop OPTIONAL MATCH chains involving edge→label→edge patterns.** A 2-hop OPTIONAL MATCH such as `OPTIONAL MATCH (f)-[wa:WORK_AT]->(co:Company)-[:IS_LOCATED_IN]->(cc:Country)` allows the AGE planner to invert the traversal — building a full hash of all Company × IS_LOCATED_IN × Country × WORK_AT rows and probing with the candidate set — rather than driving forward from `f` via `idx_workat_start`. At SF10 this builds a 143K-row hash that exceeds `work_mem` (8 batches, ~87 MB temp spill, +230 ms per hop arm). The fix is to split into two 1-hop OPTIONAL MATCHes with an intermediate `WITH` that binds each node separately:
-    ```cypher
-    OPTIONAL MATCH (f)-[wa:WORK_AT]->(co:Company)
-    WITH f, ..., wa, co
-    OPTIONAL MATCH (co)-[:IS_LOCATED_IN]->(cc:Country)
-    WITH f, ..., collect(...) AS companies
-    ```
-    Apply this pattern to any `(n)-[e:EDGE]->(x:Label)-[:IS_LOCATED_IN]->(:GeoNode)` OPTIONAL MATCH. See AGE-QUIRKS §12.
-
-14. **Never write `cypher(` literally in SQL comments for parameterized queries.** The JDBC handler binds one agtype JSON parameter per `cypher(` occurrence found in the SQL via naive `indexOf("cypher(")` — it does NOT strip comments. If a comment contains `cypher()` or `cypher(` literally, the handler will try to bind more parameters than there are `?` placeholders and the query crashes with `column index is out of range: N, number of columns: M`. Write "Cypher" (no parens) or "the Cypher call" in commentary instead. Applies to any query listed in `age_parameterized_queries` in `driver/*-local.properties` — currently IC4, IC6-IC8, IC10-IC12, IS1-IS5, IS7, IU2, IU3, IU5, IU8. Tracked durable fix: strip SQL comments in `countCypherCalls()` in `AgeUpdateOperationHandler` / `AgeSingletonOperationHandler` / `AgeListOperationHandler`.
+13. **Never write `cypher(` literally in SQL comments for parameterized queries.** The JDBC handler binds one agtype JSON parameter per `cypher(` occurrence found in the SQL via naive `indexOf("cypher(")` — it does NOT strip comments. If a comment contains `cypher()` or `cypher(` literally, the handler will try to bind more parameters than there are `?` placeholders and the query crashes with `column index is out of range: N, number of columns: M`. Write "Cypher" (no parens) or "the Cypher call" in commentary instead. Applies to any query listed in `age_parameterized_queries` in `driver/*-local.properties` — currently IC4, IC6-IC8, IC10-IC12, IS1-IS5, IS7, IU2, IU3, IU5, IU8. Tracked durable fix: strip SQL comments in `countCypherCalls()` in `AgeUpdateOperationHandler` / `AgeSingletonOperationHandler` / `AgeListOperationHandler`.
 
 14. A query should never access the AGE tables directly from the outer SQL. Its strictly forbidden. 
 
@@ -162,3 +152,40 @@ These implementations have no graph layer — what they offer is a SQL backbone 
 - GIN + functional-B-tree splits that `postgres/` and `duckdb/` do not have
 
 If a tactic from a relational implementation looks useful, propose adding the underlying denorm column or index in AGE's schema first, then write the hybrid query that uses it. Do not convert the AGE query to Pure SQL to mimic the relational shape.
+
+---
+
+## Validation against LDBC-official reference params
+
+LDBC distributes pre-computed validation parameters for SF0.1 through SF10, **generated by the Neo4j Cypher reference implementation**. These are the canonical ground-truth files for `mode=validate_database` and should be preferred over any locally-generated `validation_params.csv`.
+
+- **Download URL**: <https://datasets.ldbcouncil.org/interactive-v1/validation_params-interactive-v1.0.0-sf0.1-to-sf10.tar.zst> (~195 MB compressed, ~1.6 GB extracted).
+- **Source of truth**: project README §"Implementing the workload": *"We provide validation parameters for SF0.1 to SF10. These were produced using the Neo4j reference implementation."*
+
+### Contents (after extracting into `age/datasets/`)
+
+| File | Size | Use |
+|---|---|---|
+| `validation_params-sf0.1.csv` | 228 MB | Smoke tests, fast iteration |
+| `validation_params-sf0.3.csv` | 294 MB | |
+| `validation_params-sf1.csv` | 338 MB | |
+| `validation_params-sf3.csv` | 382 MB | Default local validation target (matches our SF3 dataset) |
+| `validation_params-sf10.csv` | 416 MB | Horizon DB validation target |
+
+### How to wire validation to these files
+
+```properties
+# age/driver/validate-local.properties
+validate_database=/Users/waleed/repositories/ldbc_snb_interactive_v1_impls/age/datasets/validation_params-sf3.csv
+ldbc.snb.interactive.scale_factor=3
+ldbc.snb.interactive.parameters_dir=/Users/waleed/repositories/ldbc_snb_interactive_v1_impls/age/datasets/substitution_parameters-sf3/
+ldbc.snb.interactive.updates_dir=/Users/waleed/repositories/ldbc_snb_interactive_v1_impls/age/datasets/social_network-sf3-CsvComposite-LongDateFormatter/
+```
+
+Then `bash age/driver/validate.sh age/driver/validate-local.properties` runs the validator. A passing run on the SF3 file means our AGE implementation produces byte-identical results to Neo4j-Cypher for every interactive operation in the validation sequence.
+
+### Important caveats
+
+1. **Do NOT regenerate `validation_params-sf<N>.csv` locally against AGE** (via `create-validation-parameters` mode) and overwrite the downloaded file. The LDBC-distributed file is the ground truth; a fresh AGE-generated file would only validate AGE against AGE's prior output (drift-prone) and would hide genuine regressions.
+2. **The validation framework treats every output mismatch as a failure**, including LDBC-Cypher-specific quirks (e.g. duplicate emissions from `-[:KNOWS]-` undirected over bidirectional storage, `REPLY_OF*0..` path enumeration). If your implementation is semantically correct per the LDBC spec but produces unique-rather-than-duplicate output, those rows still register as "incorrect". Treat them as known divergences; document each one against the relevant query rather than contorting the implementation to reproduce the duplicates.
+3. **IC13 and IC14 are intentionally disabled** in the LDBC v1 spec (AGE has no `shortestPath` / `allShortestPaths`); their absence from the failure list is expected.
