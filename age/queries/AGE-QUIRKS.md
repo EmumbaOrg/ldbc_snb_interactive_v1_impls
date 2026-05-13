@@ -173,7 +173,60 @@ separately.
   that traverse KNOWS: IC1, IC2, IC3, IC5, IC6, IC9, IC10, IC11, IS3, IS7, and any new
   query involving friends or FOF. See AGENTS.md rule 4 for the review checklist entry.
 
-## 12. `cypher()` is plan-cached only when parameterised
+## 12. Multi-hop OPTIONAL MATCH chains trigger backward hash join on edge tables
+
+When a Cypher OPTIONAL MATCH spans two or more hops — e.g.
+`OPTIONAL MATCH (f)-[wa:WORK_AT]->(co:Company)-[:IS_LOCATED_IN]->(cc:Country)` — the AGE 1.6
+planner may invert the traversal direction and build a **full hash table over the destination
+table** (Company × IS_LOCATED_IN × Country × WORK_AT_end), then probe it with the candidate
+set, rather than driving forward from the bound `f` nodes using `idx_workat_start`.
+
+**What the bad plan looks like (from SF10 EXPLAIN ANALYZE):**
+```
+Hash Left Join
+  Hash Cond: age_id(f) = wa.start_id
+  ->  [candidate set: ~61–1344 rows]
+  ->  Hash  (rows=143553, Batches=8, Memory=44MB, temp written=10974 pages)
+        ->  Seq Scan on "Company" (1575 rows)
+              -> Index Scan idx_islocatedin_start (per company)
+              -> Memoize idx_country_graphid
+        ->  Index Scan idx_workat_end (91 rows per company)
+```
+The 143,553-row hash (all WORK_AT relationships × company × country) does not fit in
+`work_mem` (8 batches, ~87 MB temp spill), adding **~230 ms per hop arm** at SF10.
+
+By contrast, STUDY_AT in the same query correctly uses forward traversal:
+```
+Nested Loop Left Join (loops = number_of_candidates)
+  -> Index Scan idx_studyat_start (1 loop per candidate)
+```
+
+**Root cause:** The planner overestimates the candidate set size (estimates 900, actual 61 for
+a common firstName). At 900 estimated candidates, the pre-built Company hash looks cheaper than
+900 individual `idx_workat_start` lookups. Actual 61 candidates means forward traversal would
+be ~7× cheaper.
+
+**Workaround — split into two 1-hop OPTIONAL MATCHes with an intermediate WITH:**
+```cypher
+-- Instead of:
+OPTIONAL MATCH (f)-[wa:WORK_AT]->(co:Company)-[:IS_LOCATED_IN]->(cc:Country)
+WITH f, ..., collect(...) AS companies
+
+-- Write:
+OPTIONAL MATCH (f)-[wa:WORK_AT]->(co:Company)
+WITH f, ..., wa, co
+OPTIONAL MATCH (co)-[:IS_LOCATED_IN]->(cc:Country)
+WITH f, ..., collect(...) AS companies
+```
+The intermediate `WITH` binds `(f)` before the first OPTIONAL MATCH and `(co)` before the
+second, removing IS_LOCATED_IN × Country from the hash build. The hash either vanishes
+entirely (planner switches to `idx_workat_start` nested loop) or shrinks to WORK_AT × Company
+only (~30K rows, fits in memory, no temp spill). Measured improvement: **~344 ms at SF10**
+(1016 ms → 672 ms) with the WORK_AT split applied to all three IC1 hop arms.
+
+**Affected queries:** IC1 (all 3 hop arms). Any query using a 2-hop `(n)-[e:EDGE]->(x:Label)-[:IS_LOCATED_IN]->(:Country)` OPTIONAL MATCH pattern in Cypher may trigger the same pathology.
+
+## 13. `cypher()` is plan-cached only when parameterised
 
 If we inline parameter values into the Cypher source as text (e.g.
 `MATCH (p:Person {id: 933})`), every call is a fresh parse + plan.
@@ -207,4 +260,5 @@ shape — a 30–60% improvement on hot queries.
 | 9 | Var-length paths slow | IS2, IS6 (SQL recursive CTE on REPLY_OF); IC12 (SQL recursive CTE on TagClass.subclass_of_id denorm) |
 | 10 | `NOT (p)-[:TYPE]-(n)` negation rejected by parser | IC9 V4 (uses UNION dedup instead) |
 | 11 | Undirected traversal disables seed-node index | IC1, IC2, IC3, IC5, IC6, IC9, IC10, IC11, IS3, IS7 (all fixed: use directed `->`, IU8 guarantees symmetry) |
-| 12 | Plan caching needs params | every query (parameterised path) |
+| 12 | Multi-hop OPTIONAL MATCH triggers backward hash join + disk spill | IC1 (WORK_AT 2-hop pattern; fixed by splitting into two 1-hop steps with intermediate WITH) |
+| 13 | Plan caching needs params | every query (parameterised path) |
