@@ -1,5 +1,5 @@
 -- LdbcQuery1 — V4b: All graph access through Cypher; outer SQL only deduplicates and sorts.
--- Pattern: AGENTS.md "Hybrid" tier — Cypher handles all traversal and property access;
+-- Pattern: AGENTS.md "Hybrid (outer wrapper only)" tier — Cypher handles all traversal and property access;
 --   outer SQL performs UNION ALL + DISTINCT ON (min-distance dedup) + ORDER BY + LIMIT.
 -- No AGE graph table accessed directly in outer SQL.
 -- All KNOWS traversal directed (-[:KNOWS]->) per AGE-QUIRKS section 11; IU8 stores bidirectionally.
