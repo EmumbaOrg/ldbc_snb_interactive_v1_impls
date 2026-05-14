@@ -30,6 +30,7 @@ All queries must go through the AGE/Cypher path. Two tiers are recognised, in pr
 
 IS6 is the only current pure-SQL holdout and is tracked for migration back to Cypher. Do not cite it as precedent for new pure-SQL implementations.
 
+Always cleanup dead or unused columns or tables created by us for optimization when you pivot to a different strategy. 
 
 ## Instructions
 

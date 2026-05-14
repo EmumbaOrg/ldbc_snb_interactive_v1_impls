@@ -28,12 +28,25 @@ Run was stopped early. The 14% failure rate held flat from op ~3,500 through op 
 
 Derived by attributing each Incorrect-counter increment to the query that just completed (the previous "Currently processing" entry in the stream log). 999 of the 2,207 increments were cleanly attributable; the remainder fall through edge cases in stream parsing but the rank ordering and rough magnitudes are stable.
 
+> ⚠️ **2026-05-13 follow-up**: the recipe used here pairs each Incorrect-counter
+> increment with the *prior* `Currently processing` entry in the log stream.
+> Inspection of `DbValidator.validate` bytecode shows the validator prints
+> "Currently processing X" *after* X has finished — i.e. each line's
+> `Currently processing` is the op that **just completed**, and the increment
+> shown on that line is whatever Incorrect counter was at that moment. The
+> recipe therefore attributes each failure **one op too early** in the stream.
+> In an interleaved op stream this scrambles the per-query histogram.
+> Corrected recipe + caveat documented at the bottom of this file. The
+> IC5 row below has been fully audited via focused re-validation and
+> confirmed to have **zero** real failures — its 85 entry here is an
+> attribution artifact, not a real bug.
+
 | Query | Failures | Type | Category |
 |---|---:|---|---|
-| LdbcQuery7 | 135 | complex | Investigation needed |
-| LdbcQuery12 | 132 | complex | Investigation needed |
-| LdbcQuery4 | 105 | complex | Investigation needed |
-| **LdbcQuery5** | **85** | complex | ⚠️ Phase 3 rewrite — semantic drift vs Neo4j reference; diagnose |
+| LdbcQuery7 | 135 | complex | Investigation needed (may include attribution noise) |
+| LdbcQuery12 | 132 | complex | Investigation needed (may include attribution noise) |
+| LdbcQuery4 | 105 | complex | Investigation needed (may include attribution noise) |
+| ~~LdbcQuery5~~ | ~~85~~ → **0** | complex | ✅ **Re-validated 2026-05-13** — 0 real failures across all 6,818 IC5 ops + 8,087 IUs on a focused fresh-snapshot run. The 85 was attribution-recipe misalignment. |
 | LdbcQuery11 | 74 | complex | Likely property-extraction / ordering |
 | LdbcQuery1 | 73 | complex | Likely property-extraction / ordering |
 | LdbcQuery3 | 71 | complex | Likely property-extraction / ordering |
@@ -56,7 +69,7 @@ Subtotals:
 
 1. **The picture from the LDBC-official reference is much richer than the AGE-self-generated baseline** (46 → 2,207 failures over 10× the op count). The official file caught regressions invisible to AGE-vs-AGE comparison.
 2. **Top offenders are IC7, IC12, IC4** — none of which we've rewritten. They jump to the top of the priority list.
-3. **IC5 has 85 failures despite the Phase 3 + side-table rewrite**, contradicting the local-validation-passed claim. Possible drivers: side-table backfill state, agtype vs text content handling differences, or specific tie-breakers we missed.
+3. ~~**IC5 has 85 failures despite the Phase 3 + side-table rewrite**, contradicting the local-validation-passed claim.~~ **Retracted 2026-05-13**: a focused IC5+IU re-validation run (all 6,818 IC5 ops + 8,087 IUs against a fresh snapshot, `age/datasets/validation_params-sf3-iu+ic5.csv`, properties at `age/driver/validate-local-ic5only.properties`) produced **zero** incorrect results. The 85 figure was an artifact of the off-by-one attribution recipe (see top of "Per-query failure histogram" section). The Phase 3 + side-table rewrite is correct.
 4. **IS3 / IS7 / IC8** failures match the Neo4j-Cypher reference-quirk pattern (duplicate emission from undirected KNOWS or `*0..` REPLY_OF over bidirectional storage). Per AGENTS.md "Validation against LDBC-official reference params" caveat #2, these can't be reproduced without semantic regression and should be documented as known divergences.
 5. **IC13/IC14 are correctly handled** — their failures are intentional and pre-disclosed.
 
@@ -66,11 +79,11 @@ Original priority (driven by old AGE-self-generated 46-failure baseline) put IC2
 
 | Priority | Query | Failures | Effort estimate | Notes |
 |---|---|---:|---|---|
-| 1 | **IC7** | 135 | Medium | Highest count; not yet investigated |
+| 1 | **IC7** | 135 | Medium | Highest count; not yet investigated (attribution-noise caveat applies) |
 | 2 | **IC12** | 132 | High | Recursive TagClass walk + multiple denorm-column joins (current shape violates directive) |
 | 3 | **IC4** | 105 | Low-Medium | Already in parameterized list; diagnose specific shape |
-| 4 | **IC5** | 85 | Investigation-first | Phase 3 said complete — diagnose drift |
-| 5 | IC11 / IC1 / IC3 | 70-75 each | Mixed | Likely property-extraction / content-trim issues like IC2 had |
+| ~~4~~ | ~~IC5~~ | ~~85~~ → 0 | — | ✅ Re-validated 2026-05-13: zero failures; no work needed. |
+| 5 | IC11 / IC1 / IC3 | 70-75 each | Mixed | Likely property-extraction / content-trim issues like IC2 had — but check attribution first; some of this may shift after Step 1 re-runs |
 | 6 | IC6 | 51 | Medium | Untouched in this session |
 | 7 (parked) | IC9 | 21 | Plan ready in `~/.claude/plans/ic9-rewrite-parked.md` | Lower priority than initially estimated |
 | 8 | IC10 | 7 | Low | One off-by-one we already investigated; rest likely similar |
@@ -93,18 +106,80 @@ PGPASSWORD=postgres psql -h localhost -p 5432 -U postgres -d postgres -f scripts
 
 The validator runs the entire 145k-op validation_params-sf3.csv (the `operation_count` cap in the properties file does **not** apply in `validate_database` mode). Plan for ~18 hr full run on local hardware; stop earlier when the failure-rate signal stabilizes.
 
-Per-query failure attribution recipe:
+Per-query failure attribution recipe (CORRECTED 2026-05-13 — the previous
+version was off by one; see top of "Per-query failure histogram"):
+
 ```bash
-tr '\r' '\n' < <validator-log> | grep -oE "Incorrect [0-9]+ -- Currently processing [A-Za-z0-9]+" > /tmp/ic_seq.txt
-# attribute each Incorrect-counter increment to the previous "Currently processing" entry
-# (the query that just completed) — gives a per-query failure histogram.
+tr '\r' '\n' < <validator-log> \
+  | grep -oE "Incorrect [0-9]+ -- Currently processing [A-Za-z0-9]+" \
+  | awk '
+      { match($0, /Incorrect ([0-9]+) -- Currently processing ([A-Za-z0-9]+)/, a);
+        cur = a[1]; q = a[2];
+        if (NR > 1 && cur > prev) print q;
+        prev = cur
+      }
+    ' | sort | uniq -c | sort -rn
+```
+
+The validator prints `Currently processing X` **after** X has just finished
+(verified against `DbValidator.validate` bytecode in
+`age-1.2.0-SNAPSHOT.jar`), so when the Incorrect counter is higher on a
+given line than on the previous line, the failing op is the one named on
+**that** line — not the previous line's. The corrected `awk` above
+implements this.
+
+Focused single-query re-validation (template — used for the IC5 retraction
+above):
+
+```bash
+# 1. Build a focused CSV that keeps only the target reads + ALL IUs in CSV order.
+python3 - <<'PY'
+import json
+IU_KEYS = {  # set of frozensets identifying IUs by their param-key shape
+  frozenset({'forumId','joinDate','personId'}),                              # IU5
+  frozenset({'commentId','creationDate','personId'}),                        # IU3
+  frozenset({'creationDate','personId','postId'}),                           # IU2
+  frozenset({'authorPersonId','browserUsed','commentId','content','countryId',
+             'creationDate','length','locationIp','replyToCommentId',
+             'replyToPostId','tagIds'}),                                     # IU7
+  frozenset({'authorPersonId','browserUsed','content','countryId','creationDate',
+             'forumId','imageFile','language','length','locationIp','postId',
+             'tagIds'}),                                                     # IU6
+  frozenset({'creationDate','person1Id','person2Id'}),                       # IU8
+  frozenset({'creationDate','forumId','forumTitle','moderatorPersonId','tagIds'}),  # IU4
+  frozenset({'birthday','browserUsed','cityId','creationDate','emails','gender',
+             'languages','locationIp','personFirstName','personId',
+             'personLastName','studyAt','tagIds','workAt'}),                 # IU1
+}
+TARGET_KEY = frozenset({'limit','minDate','personIdQ5'})  # IC5 — change per target
+keep = IU_KEYS | {TARGET_KEY}
+with open('age/datasets/validation_params-sf3.csv') as fi, \
+     open('age/datasets/validation_params-sf3-iu+target.csv','w') as fo:
+  for line in fi:
+    p = json.loads(line.split('|',1)[0])
+    if frozenset(p.keys()) in keep: fo.write(line)
+PY
+
+# 2. Restore snapshot to a clean fresh-load state.
+CONNECTION_STRING="postgresql://postgres:postgres@localhost:5432/postgres" \
+  bash age/scripts/restore-database.sh
+PGPASSWORD=postgres psql -h localhost -p 5432 -U postgres -d postgres \
+  -f age/scripts/denormalize-schema.sql
+
+# 3. Run validator with all reads disabled except the target query.
+#    See age/driver/validate-local-ic5only.properties for the working example.
+bash age/driver/validate.sh age/driver/validate-local-<query>only.properties
+
+# 4. Output JSONs (empty arrays if PASS) at:
+#    age/datasets/validation_params-sf3-iu+target-failed-actual.json
+#    age/datasets/validation_params-sf3-iu+target-failed-expected.json
 ```
 
 ## Open follow-ups
 
-1. **Categorize each failing query by failure type**: real bug vs reference-quirk-duplicate vs ordering tie-breaker. Use the failed-actual/failed-expected JSON files (written on validator completion only — would need a full run to materialize).
-2. **IC5 diagnosis**: a single representative IC5 op's expected vs actual diff would reveal whether the issue is side-table content, ordering, or property serialization.
-3. **Bulk IC1 / IC3 / IC11 diagnosis**: likely all share the same property-extraction-vs-agtype-trim class of issue that bit IC2. A single fix pattern might close many at once.
+1. **Categorize each failing query by failure type**: real bug vs reference-quirk-duplicate vs ordering tie-breaker. Use the failed-actual/failed-expected JSON files (written on validator completion only — would need a full run to materialize). **OR** apply the focused-CSV template above per query, which finishes in ~1–2 hr and writes JSONs for that single query — much faster than an 18-hr full run.
+2. ~~**IC5 diagnosis**~~ — done; zero real failures (2026-05-13).
+3. **Bulk IC1 / IC3 / IC11 diagnosis**: same focused-CSV approach. Likely most of their attributed counts will also shrink — re-validate before doing any rewrites driven by the histogram. The IC5 result shows the histogram's larger entries can be entirely attribution artifact.
 4. **Investigate the unattributed ~1,210 failures**: the per-line attribution misses some increments; the failed-actual JSON would give exact per-op detail.
 5. **Run validation against `validation_params-sf0.1.csv`** (228 MB, fewer ops) for fast iteration during diagnosis. Full SF0.1 run should complete in 1-2 hrs.
 
