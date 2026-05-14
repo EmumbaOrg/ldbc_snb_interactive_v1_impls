@@ -57,12 +57,27 @@ on the edge table's `start_id` (forward traversal) or `end_id` (reverse).
 ```sql
 CREATE INDEX idx_knows_start        ON ldbc_snb."KNOWS"          (start_id);
 CREATE INDEX idx_knows_end          ON ldbc_snb."KNOWS"          (end_id);
--- ... same shape for HAS_CREATOR, REPLY_OF, HAS_TAG, LIKES, CONTAINER_OF,
+-- ... same shape for REPLY_OF, HAS_TAG, LIKES, CONTAINER_OF,
 --     HAS_MEMBER, IS_LOCATED_IN, HAS_INTEREST, WORK_AT, STUDY_AT, HAS_TYPE,
 --     IS_SUBCLASS_OF, HAS_MODERATOR, IS_PART_OF
 ```
 
-15 edge labels × 2 indexes = 30 edge B-trees.
+15 edge labels × 2 indexes = 30 edge B-trees (minus one replaced below).
+
+**`HAS_CREATOR` covering index (OPT-3):** The plain `idx_hascreator_end (end_id)` forces a
+heap fetch per row to retrieve `start_id`. The covering variant eliminates those heap reads:
+
+```sql
+-- Supersedes idx_hascreator_end — drop the plain index after this is built.
+CREATE INDEX idx_hascreator_end_incl
+  ON ldbc_snb."HAS_CREATOR" (end_id) INCLUDE (start_id);
+```
+
+This converts the `Bitmap Heap Scan on "HAS_CREATOR"` to an Index Only Scan in any query
+that traverses `(person)<-[:HAS_CREATOR]-(msg)` and needs the message graphid (IC2, IC3,
+IC4, IC6, IC7, IC8, IC9, IC10, IC11, IS4, IS5, IS6, IS7). The `start_id` B-tree
+`idx_hascreator_start (start_id)` is unchanged — used by IC10 V7 Cypher 2
+`(post)-[:HAS_CREATOR]->(creator)`.
 
 ### 3. Functional B-trees on extracted values
 
@@ -153,7 +168,7 @@ CREATE UNIQUE INDEX idx_msgbycreator_creator_date_msg
 | IC7 | `gin_person`, `idx_hascreator_*`, `idx_likes_*` |
 | IC8 | `gin_person` (entry), `idx_hascreator_*` (untyped intermediate; AGE plans as label UNION internally — bounded cost) |
 | IC9 | `gin_person` (entry), `idx_knows_start` (directed 1+2-hop friend ids via Cypher UNION), `idx_msgbycreator_creator_date_msg` (per-friend date-DESC walk with LATERAL LIMIT 20 — composite `(creator_business_id, creation_date DESC, message_business_id)`), `PersonSide_pkey` (friend name projection) |
-| IC10 | `gin_person` (entry), `idx_knows_start` (directed 2-hop FoF), `idx_islocatedin_*` (city), `idx_post_creator_id` (denorm: per-FoF post scan), `idx_hastag_*`, `idx_hasinterest_start_end` (composite), `PersonPostCount` PK (total post count) |
+| IC10 | `gin_person` (entry, Cypher 1), `idx_knows_start` (directed 2-hop FoF, Cypher 1), `idx_islocatedin_start` (city, Cypher 1); `idx_hasinterest_start` (p→tags, Cypher 2), `idx_hastag_end` (tag←posts reverse, Cypher 2), `idx_hascreator_start` (post→creator, Cypher 2), `PersonPostCount` PK (total post count) |
 | IC11 | `gin_person`, `idx_knows_*`, `idx_workat_*`, `idx_islocatedin_*`, `idx_country_name` |
 | IC12 | `gin_person` (friends via directed KNOWS), `gin_tagclass` (root TagClass seed), `idx_knows_start` (friend hop), `idx_hascreator_end` (reverse HAS_CREATOR), `idx_replyof_start` (REPLY_OF to Post), `idx_hastag_*` (post tags); traverses graph entirely via Cypher — `idx_comment_creator_id` and `idx_comment_reply_of_id` retired 2026-05-14 |
 | IS1, IS3 | `gin_person`, `idx_islocatedin_*` (IS1), `idx_knows_start` (IS3 — directed) |
