@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Load preprocessed LDBC CSVs into Apache AGE using PostgreSQL COPY.
+Load preprocessed LDBC files into Apache AGE using PostgreSQL COPY.
 
 Replaces `agefreighter --source-type csv` for the production pipeline.
 
@@ -9,8 +9,16 @@ ROOT CAUSE OF THE AGEFREIGHTER PROBLEM:
   properties as agtype strings — {"id": "933", "creationDate": "1266161530447"}.
   AGE queries use integer literals: MATCH (p:Person {id: 933}) compiles to
   properties @> '{"id": 933}'::agtype.  String "933" != integer 933 in agtype,
-  so every MATCH returns 0 rows.  This script stores numeric columns as agtype
-  integers so lookups work correctly.
+  so every MATCH returns 0 rows.
+
+INPUT FORMAT (produced by preprocess_ldbc.py):
+  Vertex line:  <orig_id>|"<agtype_properties_csv_escaped>"
+  Edge line:    <start_orig>|<end_orig>|<start_label>|<end_label>|"<agtype_properties_csv_escaped>"
+
+  The agtype properties are pre-built by preprocess (numeric type discrimination,
+  array passthrough, string escaping, Person.birthMonth/birthDay derivation,
+  NULL-field omission). This loader does pure text split + COPY; no Python
+  per-row JSON construction. At SF10 that saved ~15-25 min of GIL-bound CPU.
 
 Usage:
     python3 scripts/load-production-data.py \\
@@ -20,7 +28,6 @@ Usage:
 """
 
 import argparse
-import csv
 import io
 import json
 import os
@@ -33,28 +40,6 @@ GRAPH = "ldbc_snb"
 COPY_BATCH = 50_000          # rows per COPY flush (keeps memory bounded)
 ENTRY_ID_BITS = 48            # graphid = (ag_label.id << 48) | entry_sequence
 
-# Properties that MUST be stored as agtype integers (not strings).
-#
-# AGE's cross-type Cypher comparisons sort by *type* before value:
-# `agtype_string < agtype_int` always returns true regardless of numeric value.
-# So a property compared with raw `<` / `>` against a Long param must be int.
-#
-# Minimal set — only the props that LDBC interactive queries compare without
-# a `toInteger()` / `::bigint` wrapper:
-#   - id          : MATCH (n {id: 933})            (every query)
-#   - creationDate: WHERE c.creationDate < $maxDate (IC2/3/4/9), arithmetic in IC7
-#   - joinDate    : WHERE m.joinDate > $minDate     (IC5)
-#
-# Other numeric-looking props (birthday, length, classYear, workFrom) are kept
-# as strings: the queries that touch them either cast explicitly
-# (IC11: `toInteger(work.workFrom)`) or never compare them directly.
-# birthMonth and birthDay are derived from birthday at load time (see Person hook
-# in load_vertex_csv) and stored as integers for IC10's parameterized Cypher filter.
-NUMERIC_PROPS = frozenset({
-    "id", "creationDate", "joinDate",
-    "birthMonth", "birthDay",
-})
-
 VERTEX_LABELS = [
     "Person", "Comment", "Post", "Forum", "Tag", "TagClass",
     "City", "Country", "Continent", "Company", "University",
@@ -65,9 +50,6 @@ EDGE_LABELS = [
     "HAS_MODERATOR", "LIKES", "HAS_INTEREST", "STUDY_AT", "WORK_AT",
     "IS_LOCATED_IN", "IS_PART_OF", "HAS_TYPE", "IS_SUBCLASS_OF", "HAS_TAG",
 ]
-
-# Columns in edge CSVs that are routing metadata, not graph properties.
-EDGE_SYSTEM_COLS = frozenset({"id", "start_id", "end_id", "start_vertex_type", "end_vertex_type"})
 
 
 # ---------------------------------------------------------------------------
@@ -82,68 +64,6 @@ def connect(cs):
     cur.execute("SET search_path = ag_catalog, '$user', public")
     conn.commit()
     return conn, cur
-
-
-# ---------------------------------------------------------------------------
-# agtype helpers
-# ---------------------------------------------------------------------------
-
-def agtype_value(key, val):
-    """
-    Format a string value from CSV as the correct agtype literal.
-
-    - Numeric columns (id, creationDate, …): bare integer, e.g. 933
-    - JSON arrays (speaks, email): pass through as agtype array literal
-    - Everything else: double-quoted string with escaping
-    """
-    if val is None or val == "":
-        return "null"
-    if key in NUMERIC_PROPS:
-        try:
-            # epoch-ms values fit in int; use float() first to handle scientific notation
-            return str(int(float(val)))
-        except (ValueError, TypeError):
-            pass  # fall through to string
-    stripped = val.strip()
-    if stripped.startswith("["):
-        # JSON arrays (speaks, email) — pass through as agtype array literal.
-        # We only allow arrays, never objects starting with '{', because free-text
-        # fields (e.g. Comment.content) can contain valid JSON objects that AGE's
-        # COPY format rejects as nested property values.
-        try:
-            json.loads(stripped)
-            return stripped
-        except (json.JSONDecodeError, ValueError):
-            pass  # fall through to quoted string
-    escaped = val.replace("\\", "\\\\").replace('"', '\\"')
-    # Escape control characters that agtype requires to be escaped
-    escaped = (
-        escaped
-        .replace("\t", "\\t")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\x08", "\\b")
-        .replace("\x0c", "\\f")
-    )
-    return f'"{escaped}"'
-
-
-def build_agtype_props(pairs, exclude=None):
-    """Build an agtype properties object string from (key, value) pairs."""
-    parts = []
-    for k, v in pairs:
-        if exclude and k in exclude:
-            continue
-        av = agtype_value(k, v)
-        if av == "null":
-            continue
-        parts.append(f'"{k}": {av}')
-    return "{" + ", ".join(parts) + "}"
-
-
-def escape_for_csv(s):
-    """Escape an agtype string for enclosure in CSV double-quotes."""
-    return s.replace('"', '""')
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +125,15 @@ def copy_flush(cur, conn, sql, lines):
 
 def load_vertex_csv(conn, cur, graph_name, label, csv_path):
     """
-    Stream-load a vertex CSV via COPY.
-    Returns {original_id_str: graphid} mapping for edge resolution.
+    Stream-load a preprocessed vertex file via COPY.
+
+    Input file format (no header), one row per line:
+        <orig_id>|"<agtype_properties_csv_escaped>"
+
+    The properties field is already CSV-quoted by preprocess (internal `"`
+    doubled). We just prepend the graphid and stream straight to COPY.
+
+    Returns {original_id_str: graphid} for downstream edge resolution.
     """
     label_id = get_label_id(cur, graph_name, label)
     copy_sql = f'COPY {graph_name}."{label}" FROM STDIN (FORMAT CSV)'
@@ -215,28 +142,16 @@ def load_vertex_csv(conn, cur, graph_name, label, csv_path):
     lines = []
     entry_id = 1
 
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+    with open(csv_path, encoding="utf-8") as f:
+        for line in f:
+            pipe = line.find("|")
+            if pipe < 0:
+                continue
+            orig_id = line[:pipe]
+            props_csv = line[pipe + 1:]  # already includes the trailing \n
             graphid = make_graphid(label_id, entry_id)
-            orig_id = row.get("id", str(entry_id))
             id_map[orig_id] = graphid
-
-            if label == "Person":
-                bday_str = row.get("birthday", "")
-                if bday_str:
-                    try:
-                        from datetime import datetime, timezone
-                        ts = int(bday_str)
-                        # UTC matches LDBC reference: datetime({epochMillis: birthday}).month
-                        dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
-                        row["birthMonth"] = str(dt.month)
-                        row["birthDay"] = str(dt.day)
-                    except (ValueError, OverflowError):
-                        pass
-
-            props_str = build_agtype_props(row.items())
-            lines.append(f'{graphid},"{escape_for_csv(props_str)}"\n')
+            lines.append(f"{graphid},{props_csv}")
             entry_id += 1
 
             if len(lines) >= COPY_BATCH:
@@ -246,7 +161,7 @@ def load_vertex_csv(conn, cur, graph_name, label, csv_path):
     if lines:
         copy_flush(cur, conn, copy_sql, lines)
 
-    # Update the sequence so AGE assigns IDs correctly for future inserts (IU ops)
+    # Advance the sequence so AGE assigns the next graphid correctly for IU ops.
     if entry_id > 1:
         cur.execute(
             f"SELECT setval('\"{graph_name}\".\"{label}_id_seq\"', {entry_id - 1}, true)"
@@ -263,7 +178,14 @@ def load_vertex_csv(conn, cur, graph_name, label, csv_path):
 
 def load_edge_csv(conn, cur, graph_name, label, csv_path, id_maps):
     """
-    Stream-load an edge CSV via COPY.
+    Stream-load a preprocessed edge file via COPY.
+
+    Input file format (no header), one row per line:
+        <start_orig>|<end_orig>|<start_label>|<end_label>|"<agtype_properties_csv_escaped>"
+
+    Properties are already CSV-quoted by preprocess. We resolve start/end
+    orig_ids to graphids via id_maps and emit a four-column COPY line.
+
     id_maps: {label_name: {original_id_str: graphid}}
     """
     label_id = get_label_id(cur, graph_name, label)
@@ -276,27 +198,21 @@ def load_edge_csv(conn, cur, graph_name, label, csv_path, id_maps):
     entry_id = 1
     skipped = 0
 
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            start_label = row.get("start_vertex_type", "")
-            end_label = row.get("end_vertex_type", "")
-            orig_start = row.get("start_id", "")
-            orig_end = row.get("end_id", "")
+    with open(csv_path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split("|", 4)
+            if len(parts) < 5:
+                continue
+            orig_start, orig_end, start_label, end_label, props_csv = parts
 
             start_gid = id_maps.get(start_label, {}).get(orig_start)
             end_gid = id_maps.get(end_label, {}).get(orig_end)
-
             if start_gid is None or end_gid is None:
                 skipped += 1
                 continue
 
             edge_gid = make_graphid(label_id, entry_id)
-            prop_pairs = [(k, v) for k, v in row.items() if k not in EDGE_SYSTEM_COLS]
-            props_str = build_agtype_props(prop_pairs)
-            lines.append(
-                f'{edge_gid},{start_gid},{end_gid},"{escape_for_csv(props_str)}"\n'
-            )
+            lines.append(f"{edge_gid},{start_gid},{end_gid},{props_csv}")
             entry_id += 1
 
             if len(lines) >= COPY_BATCH:

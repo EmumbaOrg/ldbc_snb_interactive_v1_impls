@@ -26,10 +26,13 @@ SELECT * FROM cypher('$graphName', $$
     CREATE (post)-[:HAS_TAG]->(t)
   RETURN count(post)
 $$) AS (result agtype);
+-- Post.country_id retired 2026-05-14: no read consumers (see SCHEMA.md).
+-- Post.creator_id is still live (IC10 reads it; the ForumMemberPostCount
+-- aggregate below also reads it). Post.forum_id is internal to this IU only
+-- but the FMPC INSERT requires it.
 UPDATE ldbc_snb."Post" p
    SET creator_id = (SELECT end_id FROM ldbc_snb."HAS_CREATOR" WHERE start_id = p.id LIMIT 1),
-       forum_id   = (SELECT start_id FROM ldbc_snb."CONTAINER_OF" WHERE end_id = p.id LIMIT 1),
-       country_id = (SELECT end_id FROM ldbc_snb."IS_LOCATED_IN" WHERE start_id = p.id LIMIT 1)
+       forum_id   = (SELECT start_id FROM ldbc_snb."CONTAINER_OF" WHERE end_id = p.id LIMIT 1)
  WHERE CAST(ag_catalog.agtype_object_field_text(p.properties, 'id') AS bigint) = $postId
 ;
 -- Aggregate INSERTs: SELECT DISTINCT ... LIMIT 1 guards against pre-existing
@@ -59,4 +62,22 @@ SELECT creator_id, 1 FROM (
 ) ins
 ON CONFLICT (person_id) DO UPDATE
    SET post_count = ldbc_snb."PersonPostCount".post_count + 1
+;
+-- MessageByCreator: append the new Post for IC9's per-creator date-DESC walk.
+-- Read content/imageFile from the just-inserted Post vertex (not via $content
+-- substitution) because the driver's convertString() emits Cypher-style
+-- backslash escaping that breaks SQL string literals.
+INSERT INTO ldbc_snb."MessageByCreator" (creator_business_id, message_business_id, creation_date, content, is_post)
+SELECT
+  $authorPersonId,
+  $postId,
+  $creationDate,
+  COALESCE(
+    ag_catalog.agtype_object_field_text(p.properties, 'content'),
+    ag_catalog.agtype_object_field_text(p.properties, 'imageFile')
+  ),
+  true
+FROM ldbc_snb."Post" p
+WHERE CAST(ag_catalog.agtype_object_field_text(p.properties, 'id') AS bigint) = $postId
+ON CONFLICT DO NOTHING
 ;

@@ -1,67 +1,52 @@
--- LdbcQuery9 — Top-20 recent messages (before maxDate) by friends and FoF.
--- Hybrid: one Cypher call builds the 1+2-hop friend graphid set via fixed-depth MATCH UNION
--- (no variable-length path per AGE-QUIRKS §4); SQL walks idx_comment_date_id / idx_post_date_id
--- backwards and stops via Nested Loop Semi Join once 20 friend-authored rows accumulate.
--- Directed `-[:KNOWS]->` per AGE-QUIRKS §11 — undirected forces a KNOWS seq scan at scale.
--- Typed-relationship pattern negation `NOT (p)-[:KNOWS]-(f)` is rejected by the AGE parser
--- (AGE-QUIRKS §10); UNION deduplication is semantically equivalent and used here.
--- Excluded from age_parameterized_queries: the Cypher block uses $personId while outer SQL
--- uses $maxDate — they cannot share a single agtype JSON bind.
--- TODO: if at SF1000+ the date-DESC walk runs long before hitting 20 friend rows, push
---       creationDate onto HAS_CREATOR edge and add composite idx_hascreator_end_creationdate.
-
-WITH all_friends AS (
-  SELECT (g::text)::ag_catalog.graphid AS friend_id
-  FROM cypher('$graphName', $$
-    MATCH (p:Person {id: $personId})-[:KNOWS]->(f1:Person)
-    WHERE f1.id <> $personId
-    RETURN id(f1) AS friend_gid
-    UNION
-    MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(f2:Person)
-    WHERE f2.id <> $personId
-    RETURN id(f2) AS friend_gid
-  $$) AS x(g agtype)
-),
-top_comments AS (
-  -- Walk idx_comment_date_id from `< $maxDate` backwards; planner stops
-  -- the index walk as soon as the Nested Loop Semi Join accumulates 20 rows
-  -- whose creator is in all_friends.
-  SELECT msg.id        AS msg_gid,
-         msg.properties AS msg_props,
-         hc.end_id     AS author_gid,
-         CAST(ag_catalog.agtype_object_field_text(msg.properties, 'creationDate') AS bigint) AS cdate,
-         CAST(ag_catalog.agtype_object_field_text(msg.properties, 'id') AS bigint)           AS msg_id_biz
-  FROM ldbc_snb."Comment" msg
-  JOIN ldbc_snb."HAS_CREATOR" hc ON hc.start_id = msg.id
-  WHERE CAST(ag_catalog.agtype_object_field_text(msg.properties, 'creationDate') AS bigint) < $maxDate
-    AND hc.end_id IN (SELECT friend_id FROM all_friends)
-  ORDER BY 4 DESC, 5 ASC
-  LIMIT 20
-),
-top_posts AS (
-  SELECT msg.id        AS msg_gid,
-         msg.properties AS msg_props,
-         hc.end_id     AS author_gid,
-         CAST(ag_catalog.agtype_object_field_text(msg.properties, 'creationDate') AS bigint) AS cdate,
-         CAST(ag_catalog.agtype_object_field_text(msg.properties, 'id') AS bigint)           AS msg_id_biz
-  FROM ldbc_snb."Post" msg
-  JOIN ldbc_snb."HAS_CREATOR" hc ON hc.start_id = msg.id
-  WHERE CAST(ag_catalog.agtype_object_field_text(msg.properties, 'creationDate') AS bigint) < $maxDate
-    AND hc.end_id IN (SELECT friend_id FROM all_friends)
-  ORDER BY 4 DESC, 5 ASC
-  LIMIT 20
-)
+-- LdbcQuery9 — Top-20 recent messages (before maxDate) by friends + FoF.
+-- Hybrid: Cypher block enumerates 1+2-hop friend ids (LDBC business bigints);
+-- outer SQL walks ldbc_snb."MessageByCreator" per-friend in date-DESC order
+-- with LATERAL LIMIT 20, then takes global top-20 and joins PersonSide for
+-- names. AGENTS.md §14 compliant — outer SQL never touches AGE label tables
+-- (Comment/Post/Person/HAS_CREATOR/KNOWS); MessageByCreator and PersonSide
+-- are non-AGE side tables maintained by the load step + IU1/IU6/IU7.
+--
+-- Why side table rather than Cypher: tested 2026-05-14 against local SF3,
+-- the Cypher-only 4-arm UNION (HAS_CREATOR.creationDate edge property +
+-- composite functional index) ran 135x-388x slower than the prior hybrid.
+-- AGE 1.6 cannot push LIMIT past Cypher UNION and cannot bind Cypher
+-- edge-property predicates to functional indexes as Index Cond — the date
+-- predicate always lands as a post-scan Filter. The side-table shape lets
+-- PostgreSQL's planner bind the predicate to the composite index directly
+-- and use LATERAL LIMIT 20 for per-friend early termination.
+--
+-- Index used: idx_msgbycreator_creator_date_msg(creator_business_id, creation_date DESC, message_business_id)
+-- — per-friend ordered range scan with both columns as Index Cond.
+--
+-- Excluded from age_parameterized_queries: $maxDate lives in outer SQL,
+-- only Cypher-internal params can be bound through the agtype blob.
 SELECT
-  ag_catalog.agtype_access_operator(VARIADIC ARRAY[per.properties, '"id"'::ag_catalog.agtype])         AS personId,
-  ag_catalog.agtype_access_operator(VARIADIC ARRAY[per.properties, '"firstName"'::ag_catalog.agtype])  AS personFirstName,
-  ag_catalog.agtype_access_operator(VARIADIC ARRAY[per.properties, '"lastName"'::ag_catalog.agtype])   AS personLastName,
-  t.msg_id_biz::ag_catalog.agtype                                                                      AS messageId,
-  COALESCE(
-    ag_catalog.agtype_access_operator(VARIADIC ARRAY[t.msg_props, '"content"'::ag_catalog.agtype]),
-    ag_catalog.agtype_access_operator(VARIADIC ARRAY[t.msg_props, '"imageFile"'::ag_catalog.agtype])
-  )                                                                                                    AS messageContent,
-  t.cdate::ag_catalog.agtype                                                                           AS messageCreationDate
-FROM (SELECT * FROM top_comments UNION ALL SELECT * FROM top_posts) t
-JOIN ldbc_snb."Person" per ON per.id = t.author_gid
-ORDER BY t.cdate DESC, t.msg_id_biz ASC
+  m.creator_business_id::ag_catalog.agtype   AS personId,
+  ag_catalog.text_to_agtype(ps.first_name)   AS personFirstName,
+  ag_catalog.text_to_agtype(ps.last_name)    AS personLastName,
+  m.message_business_id::ag_catalog.agtype   AS messageId,
+  ag_catalog.text_to_agtype(m.content)       AS messageContent,
+  m.creation_date::ag_catalog.agtype         AS messageCreationDate
+FROM (
+  SELECT (fid::text)::bigint AS person_id
+  FROM ag_catalog.cypher('$graphName', $$
+    MATCH (p:Person {id: $personId})-[:KNOWS]->(f:Person)
+    WHERE f.id <> $personId
+    RETURN f.id AS fid
+    UNION
+    MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(f:Person)
+    WHERE f.id <> $personId
+    RETURN f.id AS fid
+  $$) AS x(fid ag_catalog.agtype)
+) friends
+CROSS JOIN LATERAL (
+  SELECT mm.creator_business_id, mm.message_business_id, mm.creation_date, mm.content
+  FROM ldbc_snb."MessageByCreator" mm
+  WHERE mm.creator_business_id = friends.person_id
+    AND mm.creation_date < $maxDate
+  ORDER BY mm.creation_date DESC, mm.message_business_id ASC
+  LIMIT 20
+) m
+JOIN ldbc_snb."PersonSide" ps ON ps.person_business_id = m.creator_business_id
+ORDER BY m.creation_date DESC, m.message_business_id ASC
 LIMIT 20;

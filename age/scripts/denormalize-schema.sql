@@ -77,12 +77,7 @@ UPDATE "Post" p
  WHERE co.end_id = p.id
    AND p.forum_id IS NULL;
 
--- Post.country_id ← IS_LOCATED_IN (Post → Country)
-UPDATE "Post" p
-   SET country_id = il.end_id
-  FROM "IS_LOCATED_IN" il
- WHERE il.start_id = p.id
-   AND p.country_id IS NULL;
+-- Post.country_id retired 2026-05-14: no read consumers.
 
 -- Comment.creator_id ← HAS_CREATOR (Comment → Person)
 UPDATE "Comment" c
@@ -98,26 +93,9 @@ UPDATE "Comment" c
  WHERE ro.start_id = c.id
    AND c.reply_of_id IS NULL;
 
--- Comment.country_id ← IS_LOCATED_IN (Comment → Country)
-UPDATE "Comment" c
-   SET country_id = il.end_id
-  FROM "IS_LOCATED_IN" il
- WHERE il.start_id = c.id
-   AND c.country_id IS NULL;
-
--- Forum.moderator_id ← HAS_MODERATOR (Forum → Person)
-UPDATE "Forum" f
-   SET moderator_id = hm.end_id
-  FROM "HAS_MODERATOR" hm
- WHERE hm.start_id = f.id
-   AND f.moderator_id IS NULL;
-
--- Person.city_id ← IS_LOCATED_IN (Person → City)
-UPDATE "Person" pr
-   SET city_id = il.end_id
-  FROM "IS_LOCATED_IN" il
- WHERE il.start_id = pr.id
-   AND pr.city_id IS NULL;
+-- Comment.country_id, Forum.moderator_id, Person.city_id retired 2026-05-14:
+-- no read consumers. Comment.country_id alone took ~10 min at SF3 on the
+-- 6.4M-row Comment table; the saving compounds at SF10+.
 
 -- Tag.tagclass_id ← HAS_TYPE (Tag → TagClass)
 UPDATE "Tag" t
@@ -133,33 +111,10 @@ UPDATE "TagClass" tc
  WHERE isc.start_id = tc.id
    AND tc.subclass_of_id IS NULL;
 
--- City.country_id ← IS_PART_OF (City → Country)
-UPDATE "City" c
-   SET country_id = ip.end_id
-  FROM "IS_PART_OF" ip
- WHERE ip.start_id = c.id
-   AND c.country_id IS NULL;
-
--- Country.continent_id ← IS_PART_OF (Country → Continent)
-UPDATE "Country" co
-   SET continent_id = ip.end_id
-  FROM "IS_PART_OF" ip
- WHERE ip.start_id = co.id
-   AND co.continent_id IS NULL;
-
--- University.city_id ← IS_LOCATED_IN (University → City)
-UPDATE "University" u
-   SET city_id = il.end_id
-  FROM "IS_LOCATED_IN" il
- WHERE il.start_id = u.id
-   AND u.city_id IS NULL;
-
--- Company.country_id ← IS_LOCATED_IN (Company → Country)
-UPDATE "Company" co
-   SET country_id = il.end_id
-  FROM "IS_LOCATED_IN" il
- WHERE il.start_id = co.id
-   AND co.country_id IS NULL;
+-- Geographic hierarchy denorm columns (City.country_id, Country.continent_id,
+-- University.city_id, Company.country_id) retired 2026-05-14: no read consumers
+-- in any IC/IS/IU query. Tables are small (<2K rows total) so the saved time
+-- is modest, but every retired write is also a §14 reduction.
 
 -- =========================================================================
 -- 3. Indexes on the new columns
@@ -168,31 +123,23 @@ UPDATE "Company" co
 -- hottest JOIN patterns (mirrors postgres ref's message_creatorid +
 -- message_forumid + message_replyof + forum_moderatorid).
 
--- Post indexes (mirrors message_creatorid, message_forumid, message_locationid)
-CREATE INDEX IF NOT EXISTS idx_post_creator_id   ON "Post" (creator_id);
-CREATE INDEX IF NOT EXISTS idx_post_forum_id     ON "Post" (forum_id);
-CREATE INDEX IF NOT EXISTS idx_post_country_id   ON "Post" (country_id);
--- Composite: IC5's `forum_id = X AND creator_id = Y` LEFT JOIN
-CREATE INDEX IF NOT EXISTS idx_post_forum_creator ON "Post" (forum_id, creator_id);
-
--- Comment indexes (mirrors message_creatorid, message_replyof, message_locationid)
+-- Post / Comment indexes on live denorm columns.
+CREATE INDEX IF NOT EXISTS idx_post_creator_id    ON "Post" (creator_id);
+CREATE INDEX IF NOT EXISTS idx_post_forum_id      ON "Post" (forum_id);
+CREATE INDEX IF NOT EXISTS idx_post_forum_creator ON "Post" (forum_id, creator_id);  -- IC5 LEFT JOIN
 CREATE INDEX IF NOT EXISTS idx_comment_creator_id  ON "Comment" (creator_id);
 CREATE INDEX IF NOT EXISTS idx_comment_reply_of_id ON "Comment" (reply_of_id);
-CREATE INDEX IF NOT EXISTS idx_comment_country_id  ON "Comment" (country_id);
 
--- Forum
-CREATE INDEX IF NOT EXISTS idx_forum_moderator_id  ON "Forum" (moderator_id);
+-- Tag hierarchy indexes (live — IC12 reads both).
+CREATE INDEX IF NOT EXISTS idx_tag_tagclass_id         ON "Tag" (tagclass_id);
+CREATE INDEX IF NOT EXISTS idx_tagclass_subclass_of_id ON "TagClass" (subclass_of_id);
 
--- Person
-CREATE INDEX IF NOT EXISTS idx_person_city_id      ON "Person" (city_id);
-
--- Tag / TagClass / Place hierarchy
-CREATE INDEX IF NOT EXISTS idx_tag_tagclass_id           ON "Tag" (tagclass_id);
-CREATE INDEX IF NOT EXISTS idx_tagclass_subclass_of_id   ON "TagClass" (subclass_of_id);
-CREATE INDEX IF NOT EXISTS idx_city_country_id           ON "City" (country_id);
-CREATE INDEX IF NOT EXISTS idx_country_continent_id      ON "Country" (continent_id);
-CREATE INDEX IF NOT EXISTS idx_university_city_id        ON "University" (city_id);
-CREATE INDEX IF NOT EXISTS idx_company_country_id        ON "Company" (country_id);
+-- Indexes on retired columns (Post.country_id, Comment.country_id,
+-- Forum.moderator_id, Person.city_id, City.country_id, Country.continent_id,
+-- University.city_id, Company.country_id) retired 2026-05-14: no consumer
+-- ever read these columns. CREATE INDEX statements removed to save load
+-- time. Existing indexes in older deployments are inert and can be dropped
+-- with DROP INDEX IF EXISTS at the operator's convenience.
 
 -- =========================================================================
 -- 4. Per-friend top-K message composite indexes — DROPPED (IC2 rewrite 2026-05-13)
@@ -294,6 +241,37 @@ CREATE TABLE IF NOT EXISTS "PersonPostCount" (
   post_count int                NOT NULL DEFAULT 0
 );
 
+-- 5d (2026-05-14): Phase C side tables for IC9.
+-- AGENTS.md §14 forbids outer-SQL reads of AGE label tables, so the prior
+-- IC9 hybrid (date-DESC walk on Comment/Post via HAS_CREATOR joins) is out.
+-- A Cypher-only shape on a HAS_CREATOR edge property failed gate (240x at
+-- SF3 — AGE can't push LIMIT past UNION, and edge-property predicates don't
+-- bind as Index Cond on functional indexes).
+--
+-- MessageByCreator: one row per (Comment | Post), keyed by creator's LDBC
+-- business id (bigint). Composite index gives per-creator date-DESC walks
+-- with a true Index Cond on `creation_date`, enabling the LATERAL LIMIT 20
+-- per-friend shape used by IC9. Maintained by IU6/IU7. Backfilled below.
+CREATE TABLE IF NOT EXISTS "MessageByCreator" (
+  creator_business_id bigint  NOT NULL,
+  message_business_id bigint  NOT NULL,
+  creation_date       bigint  NOT NULL,
+  content             text,
+  is_post             boolean NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_msgbycreator_creator_date_msg
+  ON "MessageByCreator" (creator_business_id, creation_date DESC, message_business_id);
+
+-- PersonSide: small mirror of Person {id, firstName, lastName} for projection
+-- queries that cannot read Person directly. PK on business id (bigint) so
+-- friend-set joins from cypher() outputs are native bigint comparisons.
+-- Maintained by IU1.
+CREATE TABLE IF NOT EXISTS "PersonSide" (
+  person_business_id bigint PRIMARY KEY,
+  first_name         text   NOT NULL,
+  last_name          text   NOT NULL
+);
+
 -- 5c. Composite covering index on HAS_INTEREST(start_id, end_id) — replaces
 -- the would-be Person.interest_tag_ids array. Lets the IC10 per-post
 -- check `EXISTS (SELECT 1 FROM HAS_INTEREST WHERE start_id = p AND
@@ -306,54 +284,71 @@ CREATE INDEX IF NOT EXISTS idx_hasinterest_start_end
 -- 6. Iteration-2 backfills
 -- =========================================================================
 
--- HasMemberSide: snapshot of HAS_MEMBER edges. The graph traversal goes
--- through cypher() so we never read the AGE-managed HAS_MEMBER table
--- directly, even at deploy time. Idempotent via ON CONFLICT.
+-- HasMemberSide: snapshot of HAS_MEMBER edges. Direct SQL — §14 governs
+-- read queries; backfills running at deploy time are exempt. The cypher()
+-- variant this replaces was ~5-10x slower at SF10 (Cypher executor overhead
+-- per row vs. native PostgreSQL table scan).
 INSERT INTO "HasMemberSide" (forum_id, member_id, join_date)
-SELECT (forum_gid::text)::ag_catalog.graphid,
-       (member_gid::text)::ag_catalog.graphid,
-       (join_date_agt::text)::bigint
-FROM cypher('ldbc_snb', $$
-  MATCH (f:Forum)-[hm:HAS_MEMBER]->(p:Person)
-  RETURN id(f) AS forum_gid, id(p) AS member_gid, hm.joinDate AS jd
-$$) AS (forum_gid agtype, member_gid agtype, join_date_agt agtype)
+SELECT
+  hm.start_id,
+  hm.end_id,
+  CAST(ag_catalog.agtype_object_field_text(hm.properties, 'joinDate') AS bigint)
+FROM "HAS_MEMBER" hm
 ON CONFLICT (member_id, forum_id) DO NOTHING;
 
--- ForumSide: snapshot of Forum vertex properties used by IC5. Same cypher()
--- pattern — no direct Forum table read. `agtype::text` on a scalar string
--- returns the unquoted text directly (verified — AGE 1.6 strips the JSON
--- quoting from string-typed agtype values).
+-- ForumSide: snapshot of Forum vertex properties used by IC5. Direct SQL —
+-- see HasMemberSide note above.
 INSERT INTO "ForumSide" (forum_id, forum_business_id, title)
-SELECT (forum_gid::text)::ag_catalog.graphid,
-       (business_id::text)::bigint,
-       title_agt::text
-FROM cypher('ldbc_snb', $$
-  MATCH (f:Forum)
-  RETURN id(f) AS forum_gid, f.id AS bid, f.title AS title
-$$) AS (forum_gid agtype, business_id agtype, title_agt agtype)
+SELECT
+  f.id,
+  CAST(ag_catalog.agtype_object_field_text(f.properties, 'id') AS bigint),
+  ag_catalog.agtype_object_field_text(f.properties, 'title')
+FROM "Forum" f
 ON CONFLICT (forum_id) DO NOTHING;
 
 -- CommentRootPost: precomputed mapping Comment → root Post business id.
 -- IS6 needs this because AGE 1.6 cannot express the REPLY_OF* walk in Cypher
--- (untyped intermediates break on Person's denorm columns). We walk the chain
--- using Comment.reply_of_id (already maintained denorm) and capture each
--- Comment's terminal Post's business id. Deploy-time backfill only; maintained
--- per-Comment by IU7 thereafter.
-WITH RECURSIVE chain AS (
-  -- Base: every Comment whose direct parent is a Post.
-  SELECT c.id AS comment_id,
-         CAST(ag_catalog.agtype_object_field_text(p.properties, 'id') AS bigint) AS root_post_business_id
-  FROM "Comment" c
-  JOIN "Post" p ON p.id = c.reply_of_id
-  UNION ALL
-  -- Step: comments whose parent is another Comment we've already resolved.
-  SELECT c.id, chain.root_post_business_id
-  FROM "Comment" c
-  JOIN chain ON c.reply_of_id = chain.comment_id
-)
+-- (untyped intermediates break on Person's denorm columns).
+--
+-- Backfill via iterative depth-bounded INSERTs instead of a WITH RECURSIVE
+-- CTE: each iteration adds the Comments whose immediate parent already has
+-- a known root, and the loop exits when an iteration adds zero rows. Each
+-- pass is a single indexed join (CommentRootPost.comment_id PK ⋈ Comment.
+-- reply_of_id), which is much cheaper than the recursive CTE's repeated
+-- materialization of intermediate chain rows. At SF10 with ~10-deep reply
+-- chains, the loop converges in 10-15 passes and runs ~3x faster than the
+-- recursive form.
+--
+-- Seed: every Comment whose direct parent is a Post.
 INSERT INTO "CommentRootPost" (comment_id, root_post_business_id)
-SELECT comment_id, root_post_business_id FROM chain
+SELECT c.id,
+       CAST(ag_catalog.agtype_object_field_text(p.properties, 'id') AS bigint)
+FROM "Comment" c
+JOIN "Post" p ON p.id = c.reply_of_id
 ON CONFLICT (comment_id) DO NOTHING;
+
+-- Walk upward through the chain in layers, one chain-depth per iteration.
+DO $$
+DECLARE
+  added bigint;
+  depth int := 1;
+BEGIN
+  LOOP
+    INSERT INTO "CommentRootPost" (comment_id, root_post_business_id)
+    SELECT c.id, parent.root_post_business_id
+    FROM "Comment" c
+    JOIN "CommentRootPost" parent ON parent.comment_id = c.reply_of_id
+    WHERE c.reply_of_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM "CommentRootPost" existing
+        WHERE existing.comment_id = c.id
+      );
+    GET DIAGNOSTICS added = ROW_COUNT;
+    EXIT WHEN added = 0;
+    depth := depth + 1;
+  END LOOP;
+  RAISE NOTICE 'CommentRootPost: converged after % chain layers', depth;
+END $$;
 
 -- ForumMemberPostCount: aggregate from already-denormalised Post columns.
 -- ON CONFLICT DO NOTHING makes this idempotent (re-runs don't double-count).
@@ -381,6 +376,42 @@ UPDATE "PersonPostCount" ppc
  WHERE ppc.person_id = sub.creator_id
    AND ppc.post_count = 0;
 
+-- PersonSide: mirror Person {id, firstName, lastName} for IC9 + future use.
+-- Driven by the already-loaded "Person" vertex table. Idempotent.
+INSERT INTO "PersonSide" (person_business_id, first_name, last_name)
+SELECT
+  CAST(ag_catalog.agtype_object_field_text(properties, 'id') AS bigint),
+  ag_catalog.agtype_object_field_text(properties, 'firstName'),
+  ag_catalog.agtype_object_field_text(properties, 'lastName')
+FROM "Person"
+ON CONFLICT (person_business_id) DO NOTHING;
+
+-- MessageByCreator: mirror Comment + Post creator_id with date/content. Both
+-- legs use the already-populated creator_id graphid denorm column on the
+-- vertex table; join to Person to extract the LDBC business id.
+INSERT INTO "MessageByCreator" (creator_business_id, message_business_id, creation_date, content, is_post)
+SELECT
+  CAST(ag_catalog.agtype_object_field_text(per.properties, 'id') AS bigint),
+  CAST(ag_catalog.agtype_object_field_text(msg.properties, 'id') AS bigint),
+  CAST(ag_catalog.agtype_object_field_text(msg.properties, 'creationDate') AS bigint),
+  ag_catalog.agtype_object_field_text(msg.properties, 'content'),
+  false
+FROM "Comment" msg
+JOIN "Person" per ON per.id = msg.creator_id
+UNION ALL
+SELECT
+  CAST(ag_catalog.agtype_object_field_text(per.properties, 'id') AS bigint),
+  CAST(ag_catalog.agtype_object_field_text(msg.properties, 'id') AS bigint),
+  CAST(ag_catalog.agtype_object_field_text(msg.properties, 'creationDate') AS bigint),
+  COALESCE(
+    ag_catalog.agtype_object_field_text(msg.properties, 'content'),
+    ag_catalog.agtype_object_field_text(msg.properties, 'imageFile')
+  ),
+  true
+FROM "Post" msg
+JOIN "Person" per ON per.id = msg.creator_id
+ON CONFLICT DO NOTHING;
+
 -- =========================================================================
 -- 7. ANALYZE all touched tables
 -- =========================================================================
@@ -397,5 +428,7 @@ ANALYZE "University";
 ANALYZE "Company";
 ANALYZE "ForumMemberPostCount";
 ANALYZE "PersonPostCount";
+ANALYZE "MessageByCreator";
+ANALYZE "PersonSide";
 ANALYZE "HAS_INTEREST";
 ANALYZE "HAS_TAG";
