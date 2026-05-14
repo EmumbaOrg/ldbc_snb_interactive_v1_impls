@@ -39,3 +39,17 @@ UPDATE ldbc_snb."Comment" c
        country_id  = (SELECT end_id FROM ldbc_snb."IS_LOCATED_IN" WHERE start_id = c.id LIMIT 1)
  WHERE CAST(ag_catalog.agtype_object_field_text(c.properties, 'id') AS bigint) = $commentId
 ;
+-- MessageByCreator: append the new Comment for IC9's per-creator date-DESC walk.
+-- Source content from the just-inserted Comment vertex (not via $content
+-- substitution) to avoid the convertString() Cypher-vs-SQL escaping mismatch.
+INSERT INTO ldbc_snb."MessageByCreator" (creator_business_id, message_business_id, creation_date, content, is_post)
+SELECT
+  $authorPersonId,
+  $commentId,
+  $creationDate,
+  ag_catalog.agtype_object_field_text(c.properties, 'content'),
+  false
+FROM ldbc_snb."Comment" c
+WHERE CAST(ag_catalog.agtype_object_field_text(c.properties, 'id') AS bigint) = $commentId
+ON CONFLICT DO NOTHING
+;

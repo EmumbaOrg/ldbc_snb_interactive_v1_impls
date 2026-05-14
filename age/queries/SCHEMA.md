@@ -243,3 +243,41 @@ section 5 for the DDL.
 - Maintained by IU6 (AddPost): `UPDATE … SET post_count = post_count + 1`.
 - Populated at load time from `Post.creator_id`; every Person has a row
   (even those with 0 posts) so IU6 can always use `UPDATE` (no INSERT race).
+
+### `ldbc_snb."MessageByCreator"` (2026-05-14, IC9 Phase C)
+
+```sql
+(creator_business_id bigint, message_business_id bigint, creation_date bigint,
+ content text, is_post boolean)
+UNIQUE INDEX (creator_business_id, creation_date DESC, message_business_id)
+```
+
+- Mirrors `Comment` + `Post` keyed by the **creator's LDBC business id** (bigint).
+  `content` stores `Comment.content` or `Post.content`/`Post.imageFile` (whichever
+  is non-null, mirroring IC9's projection). `is_post` distinguishes the source.
+- Used by IC9 to walk per-friend date-DESC with `LATERAL LIMIT 20`. The composite
+  index binds both `creator_business_id` and `creation_date < $maxDate` as
+  `Index Cond:`, so each per-friend scan early-terminates at 20 rows.
+- Maintained by IU6 (AddPost) and IU7 (AddComment): one `INSERT … ON CONFLICT
+  DO NOTHING` per new message. No update path — messages are immutable.
+- Populated at load time by `denormalize-schema.sql` section 6 (`UNION ALL` over
+  `Comment ⨝ Person` and `Post ⨝ Person`).
+- Replaces the prior `Comment` + `Post` + `HAS_CREATOR` outer-SQL joins that
+  violated AGENTS.md §14. The Cypher-only alternative (`HAS_CREATOR.creationDate`
+  edge property + functional index) was tested 2026-05-14 and ran 135x–388x
+  slower at SF3 — AGE 1.6 can't push LIMIT past Cypher UNION and edge-property
+  predicates don't bind as `Index Cond:` on functional indexes.
+
+### `ldbc_snb."PersonSide"` (2026-05-14, IC9 Phase C)
+
+```sql
+(person_business_id bigint PRIMARY KEY, first_name text, last_name text)
+```
+
+- Mirrors `Person.{id, firstName, lastName}` for projection queries that cannot
+  read `Person` directly under AGENTS.md §14.
+- Used by IC9 for the friend-name projection (`personFirstName`, `personLastName`).
+  Could be reused by other queries that need only `id/firstName/lastName`.
+- Maintained by IU1 (AddPerson): one `INSERT … ON CONFLICT DO NOTHING`.
+- Populated at load time by `denormalize-schema.sql` section 6 from `Person`
+  properties. ~10k rows at SF3, scales linearly with Person count.

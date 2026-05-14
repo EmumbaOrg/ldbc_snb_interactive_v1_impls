@@ -109,10 +109,12 @@ CREATE INDEX idx_city_id     ON ldbc_snb."City"     (CAST(agtype_object_field_te
 CREATE INDEX idx_country_id  ON ldbc_snb."Country"  (CAST(agtype_object_field_text(properties, 'id') AS bigint));
 ```
 
-**(d) Composite covering for IC2 / IC9.**  
-IC2 and IC9 retrieve the most-recent N messages by `creationDate DESC`
-and tie-break on `id`. A composite `(creationDate DESC, id)` lets the
-planner index-scan in date-desc order without a sort node.
+**(d) Composite covering for IC2.**  
+IC2 retrieves the most-recent N messages by `creationDate DESC` and
+tie-breaks on `id`. A composite `(creationDate DESC, id)` lets the
+planner index-scan in date-desc order without a sort node. IC9 used to
+share this index pre-2026-05-14; the strict §14 reading moved IC9 to a
+side-table walk (see `MessageByCreator` below).
 
 ```sql
 CREATE INDEX idx_comment_date_id ON ldbc_snb."Comment"
@@ -121,6 +123,19 @@ CREATE INDEX idx_comment_date_id ON ldbc_snb."Comment"
 CREATE INDEX idx_post_date_id    ON ldbc_snb."Post"
   (CAST(agtype_object_field_text(properties, 'creationDate') AS bigint) DESC,
    CAST(agtype_object_field_text(properties, 'id') AS bigint));
+```
+
+**(e) IC9 side-table composite — per-friend date-DESC + tie-break.**  
+`MessageByCreator` mirrors Comment + Post {creator, creationDate, content}
+into a plain (non-AGE) table. The composite index keys per-friend ordered
+walks, which IC9 drives via `LATERAL LIMIT 20`. Both columns of the
+predicate are bound as `Index Cond:`, so each per-friend scan early-
+terminates at 20 rows. See `interactive-complex-9.sql` for the query
+shape and `SCHEMA.md` for table provenance and maintenance.
+
+```sql
+CREATE UNIQUE INDEX idx_msgbycreator_creator_date_msg
+  ON ldbc_snb."MessageByCreator" (creator_business_id, creation_date DESC, message_business_id);
 ```
 
 ---
@@ -137,7 +152,7 @@ CREATE INDEX idx_post_date_id    ON ldbc_snb."Post"
 | IC6 | `gin_person`, `idx_knows_*`, `idx_hascreator_*`, `idx_hastag_*`, `idx_tag_name` |
 | IC7 | `gin_person`, `idx_hascreator_*`, `idx_likes_*` |
 | IC8 | `gin_person` (entry), `idx_hascreator_*` (untyped intermediate; AGE plans as label UNION internally — bounded cost) |
-| IC9 | `gin_person` (entry), `idx_knows_start` (directed friend graphids), `idx_comment_date_id` / `idx_post_date_id` (date-DESC walk + semi-join on `hc.end_id`), `idx_hascreator_start` (semi-join probe) |
+| IC9 | `gin_person` (entry), `idx_knows_start` (directed 1+2-hop friend ids via Cypher UNION), `idx_msgbycreator_creator_date_msg` (per-friend date-DESC walk with LATERAL LIMIT 20 — composite `(creator_business_id, creation_date DESC, message_business_id)`), `PersonSide_pkey` (friend name projection) |
 | IC10 | `gin_person` (entry), `idx_knows_start` (directed 2-hop FoF), `idx_islocatedin_*` (city), `idx_post_creator_id` (denorm: per-FoF post scan), `idx_hastag_*`, `idx_hasinterest_start_end` (composite), `PersonPostCount` PK (total post count) |
 | IC11 | `gin_person`, `idx_knows_*`, `idx_workat_*`, `idx_islocatedin_*`, `idx_country_name` |
 | IC12 | `gin_person` (friends), `gin_tagclass` (root TagClass seed), `idx_tagclass_subclass_of_id` (recursive subclass walk), `idx_tag_tagclass_id` (valid tags), `idx_comment_creator_id` (denorm), `idx_comment_reply_of_id` (denorm), `idx_hastag_*` |

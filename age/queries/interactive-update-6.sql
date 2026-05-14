@@ -60,3 +60,21 @@ SELECT creator_id, 1 FROM (
 ON CONFLICT (person_id) DO UPDATE
    SET post_count = ldbc_snb."PersonPostCount".post_count + 1
 ;
+-- MessageByCreator: append the new Post for IC9's per-creator date-DESC walk.
+-- Read content/imageFile from the just-inserted Post vertex (not via $content
+-- substitution) because the driver's convertString() emits Cypher-style
+-- backslash escaping that breaks SQL string literals.
+INSERT INTO ldbc_snb."MessageByCreator" (creator_business_id, message_business_id, creation_date, content, is_post)
+SELECT
+  $authorPersonId,
+  $postId,
+  $creationDate,
+  COALESCE(
+    ag_catalog.agtype_object_field_text(p.properties, 'content'),
+    ag_catalog.agtype_object_field_text(p.properties, 'imageFile')
+  ),
+  true
+FROM ldbc_snb."Post" p
+WHERE CAST(ag_catalog.agtype_object_field_text(p.properties, 'id') AS bigint) = $postId
+ON CONFLICT DO NOTHING
+;

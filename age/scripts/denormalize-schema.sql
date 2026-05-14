@@ -294,6 +294,37 @@ CREATE TABLE IF NOT EXISTS "PersonPostCount" (
   post_count int                NOT NULL DEFAULT 0
 );
 
+-- 5d (2026-05-14): Phase C side tables for IC9.
+-- AGENTS.md §14 forbids outer-SQL reads of AGE label tables, so the prior
+-- IC9 hybrid (date-DESC walk on Comment/Post via HAS_CREATOR joins) is out.
+-- A Cypher-only shape on a HAS_CREATOR edge property failed gate (240x at
+-- SF3 — AGE can't push LIMIT past UNION, and edge-property predicates don't
+-- bind as Index Cond on functional indexes).
+--
+-- MessageByCreator: one row per (Comment | Post), keyed by creator's LDBC
+-- business id (bigint). Composite index gives per-creator date-DESC walks
+-- with a true Index Cond on `creation_date`, enabling the LATERAL LIMIT 20
+-- per-friend shape used by IC9. Maintained by IU6/IU7. Backfilled below.
+CREATE TABLE IF NOT EXISTS "MessageByCreator" (
+  creator_business_id bigint  NOT NULL,
+  message_business_id bigint  NOT NULL,
+  creation_date       bigint  NOT NULL,
+  content             text,
+  is_post             boolean NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_msgbycreator_creator_date_msg
+  ON "MessageByCreator" (creator_business_id, creation_date DESC, message_business_id);
+
+-- PersonSide: small mirror of Person {id, firstName, lastName} for projection
+-- queries that cannot read Person directly. PK on business id (bigint) so
+-- friend-set joins from cypher() outputs are native bigint comparisons.
+-- Maintained by IU1.
+CREATE TABLE IF NOT EXISTS "PersonSide" (
+  person_business_id bigint PRIMARY KEY,
+  first_name         text   NOT NULL,
+  last_name          text   NOT NULL
+);
+
 -- 5c. Composite covering index on HAS_INTEREST(start_id, end_id) — replaces
 -- the would-be Person.interest_tag_ids array. Lets the IC10 per-post
 -- check `EXISTS (SELECT 1 FROM HAS_INTEREST WHERE start_id = p AND
@@ -381,6 +412,42 @@ UPDATE "PersonPostCount" ppc
  WHERE ppc.person_id = sub.creator_id
    AND ppc.post_count = 0;
 
+-- PersonSide: mirror Person {id, firstName, lastName} for IC9 + future use.
+-- Driven by the already-loaded "Person" vertex table. Idempotent.
+INSERT INTO "PersonSide" (person_business_id, first_name, last_name)
+SELECT
+  CAST(ag_catalog.agtype_object_field_text(properties, 'id') AS bigint),
+  ag_catalog.agtype_object_field_text(properties, 'firstName'),
+  ag_catalog.agtype_object_field_text(properties, 'lastName')
+FROM "Person"
+ON CONFLICT (person_business_id) DO NOTHING;
+
+-- MessageByCreator: mirror Comment + Post creator_id with date/content. Both
+-- legs use the already-populated creator_id graphid denorm column on the
+-- vertex table; join to Person to extract the LDBC business id.
+INSERT INTO "MessageByCreator" (creator_business_id, message_business_id, creation_date, content, is_post)
+SELECT
+  CAST(ag_catalog.agtype_object_field_text(per.properties, 'id') AS bigint),
+  CAST(ag_catalog.agtype_object_field_text(msg.properties, 'id') AS bigint),
+  CAST(ag_catalog.agtype_object_field_text(msg.properties, 'creationDate') AS bigint),
+  ag_catalog.agtype_object_field_text(msg.properties, 'content'),
+  false
+FROM "Comment" msg
+JOIN "Person" per ON per.id = msg.creator_id
+UNION ALL
+SELECT
+  CAST(ag_catalog.agtype_object_field_text(per.properties, 'id') AS bigint),
+  CAST(ag_catalog.agtype_object_field_text(msg.properties, 'id') AS bigint),
+  CAST(ag_catalog.agtype_object_field_text(msg.properties, 'creationDate') AS bigint),
+  COALESCE(
+    ag_catalog.agtype_object_field_text(msg.properties, 'content'),
+    ag_catalog.agtype_object_field_text(msg.properties, 'imageFile')
+  ),
+  true
+FROM "Post" msg
+JOIN "Person" per ON per.id = msg.creator_id
+ON CONFLICT DO NOTHING;
+
 -- =========================================================================
 -- 7. ANALYZE all touched tables
 -- =========================================================================
@@ -397,5 +464,7 @@ ANALYZE "University";
 ANALYZE "Company";
 ANALYZE "ForumMemberPostCount";
 ANALYZE "PersonPostCount";
+ANALYZE "MessageByCreator";
+ANALYZE "PersonSide";
 ANALYZE "HAS_INTEREST";
 ANALYZE "HAS_TAG";
