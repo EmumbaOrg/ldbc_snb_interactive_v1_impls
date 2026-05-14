@@ -214,16 +214,24 @@ CREATE TABLE IF NOT EXISTS "ForumSide" (
 );
 
 -- CommentRootPost — for each Comment, the LDBC business id (bigint) of the
--- root Post reached by following REPLY_OF*. Used by IS6 to avoid Cypher
--- variable-length REPLY_OF* traversal, which in AGE 1.6 expands intermediates
--- through `_ag_label_vertex` and fails on label tables with denorm columns
--- ("Invalid number of attributes for ldbc_snb.Person"). Storing the business
--- id (not graphid) lets IS6 use `MATCH (root:Post {id: $rid})` directly.
+-- root Post reached by following REPLY_OF*. Used by IS6 (currently falls back
+-- to its own SQL walk; pending future refactor) and IS2 (consumes the
+-- comment_business_id lookup). Storing the business id (not graphid) lets
+-- queries use `MATCH (root:Post {id: $rid})` directly inside Cypher when needed.
 -- Maintained by IU7 on AddComment. Backfilled below.
+--
+-- 2026-05-14: added comment_business_id column with a unique index, so IS2
+-- can look up a Comment's root post by its LDBC bigint id without joining
+-- the AGE Comment label table. The original comment_id (graphid) PK remains
+-- so the iterative backfill loop can keep using graphid-keyed joins against
+-- Comment.reply_of_id during deploy.
 CREATE TABLE IF NOT EXISTS "CommentRootPost" (
   comment_id            ag_catalog.graphid PRIMARY KEY,
+  comment_business_id   bigint             NOT NULL,
   root_post_business_id bigint             NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_commentrootpost_business_id
+    ON "CommentRootPost" (comment_business_id);
 
 -- Drop the prior Phase 3B denorm index on the AGE-managed HAS_MEMBER table.
 -- Note: the column itself (HAS_MEMBER.join_date) cannot be dropped — AGE 1.6
@@ -261,6 +269,10 @@ CREATE TABLE IF NOT EXISTS "MessageByCreator" (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_msgbycreator_creator_date_msg
   ON "MessageByCreator" (creator_business_id, creation_date DESC, message_business_id);
+-- Secondary unique index by message_business_id alone — IS2 looks up a
+-- specific root post by its business id without scanning per-creator.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_msgbycreator_message
+  ON "MessageByCreator" (message_business_id);
 
 -- PersonSide: small mirror of Person {id, firstName, lastName} for projection
 -- queries that cannot read Person directly. PK on business id (bigint) so
@@ -320,8 +332,9 @@ ON CONFLICT (forum_id) DO NOTHING;
 -- recursive form.
 --
 -- Seed: every Comment whose direct parent is a Post.
-INSERT INTO "CommentRootPost" (comment_id, root_post_business_id)
+INSERT INTO "CommentRootPost" (comment_id, comment_business_id, root_post_business_id)
 SELECT c.id,
+       CAST(ag_catalog.agtype_object_field_text(c.properties, 'id') AS bigint),
        CAST(ag_catalog.agtype_object_field_text(p.properties, 'id') AS bigint)
 FROM "Comment" c
 JOIN "Post" p ON p.id = c.reply_of_id
@@ -334,8 +347,10 @@ DECLARE
   depth int := 1;
 BEGIN
   LOOP
-    INSERT INTO "CommentRootPost" (comment_id, root_post_business_id)
-    SELECT c.id, parent.root_post_business_id
+    INSERT INTO "CommentRootPost" (comment_id, comment_business_id, root_post_business_id)
+    SELECT c.id,
+           CAST(ag_catalog.agtype_object_field_text(c.properties, 'id') AS bigint),
+           parent.root_post_business_id
     FROM "Comment" c
     JOIN "CommentRootPost" parent ON parent.comment_id = c.reply_of_id
     WHERE c.reply_of_id IS NOT NULL

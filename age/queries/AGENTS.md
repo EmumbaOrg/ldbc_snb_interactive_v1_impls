@@ -109,6 +109,80 @@ For each query, read both the YAML spec and the SQL file, then verify:
 
 14. A query should never access the AGE tables directly from the outer SQL. Its strictly forbidden. 
 
+## AGE 1.6 Cypher Constructs — Reference for Query Design
+
+This section is the AI agent's lookup for what Cypher constructs AGE 1.6 actually supports, what it doesn't, and which patterns to reach for when the obvious shape doesn't perform. Every claim here is checked against the AGE 1.6 release tags (`PG14/15/16/17 v1.6.0-rc0`) and that version's regression tests (`regress/expected/*.out`) — not master. Re-verify against the actual version if AGE is upgraded.
+
+### Supported constructs you can rely on
+
+| Construct | Example | Test reference |
+|---|---|---|
+| `CALL fn(args) YIELD col` | `CALL sqrt(64) YIELD sqrt` | `cypher_call.out:62` |
+| `CALL` after `MATCH`/`WITH`, chained with `RETURN` | `MATCH (a) CALL sqrt(64) YIELD sqrt RETURN a, sqrt` | `cypher_call.out:135` |
+| PG function returning scalar `agtype`, called as an expression | `WHERE e.year < public.get_event_year(e.name)` | [`sql_in_cypher.html`](https://age.apache.org/age-manual/master/advanced/sql_in_cypher.html); `cypher_call.out:42` |
+| Schema-qualified function call | `public.fn(...)` (in CALL or expression) | `cypher_call.out:72` |
+| `UNWIND list_expr AS x` | `UNWIND [1,2,3] AS i` / `UNWIND row.col AS i` | `cypher_unwind.out:55,68` |
+| `range(start, end[, step])` | `RETURN range(0, 10)` and `range(1, 30, 2)` | `expr.out:7818+`, `list_comprehension.out:46` |
+| List comprehensions | `[x IN list WHERE pred \| expr]` | `list_comprehension.out:46–94` |
+| List slicing | `list[..5]`, `list[1..3]` | `list_comprehension.out` |
+| Map projection | `n {.firstName, .lastName, age: 30}` | `map_projection.out:96–103` |
+| `EXISTS { pattern }` and `EXISTS { MATCH … WHERE … RETURN … }` (incl. nested, `UNION` inside) | `WHERE EXISTS {(a)-[]->(:pet)}` | `cypher_subquery.out:36+` |
+| `COUNT { pattern }` | `WITH COUNT {(a)-[]-()} AS c` | `cypher_subquery.out` |
+| Variable-length paths with *inline-map equality* on edges | `MATCH (u:a)-[:e* {name:"main edge"}]-(v:b)` | `cypher_vle.out:233` |
+| Aggregates | `count, collect, min, max, sum, avg, stDev, stDevP, percentileCont, percentileDisc, agtype_larger, agtype_smaller` | `agtype.c` symbol list |
+| List/element accessors | `head`, `last`, `tail`, `size`, `reverse`, `range`, `nodes`, `relationships`, `keys`, `properties`, `labels`, `label`, `type`, `id`, `start_id`, `end_id`, `startnode`, `endnode`, `length` | `agtype.c` symbol list |
+| String functions | `substring, replace, split, toLower, toUpper, ltrim, rtrim, trim, left, right, reverse` | `agtype.c` symbol list |
+| Math functions | `abs, ceil, floor, round, sign, sqrt, exp, log, sin/cos/tan/asin/acos/atan, degrees, radians, pi, e, rand` | `agtype.c` symbol list |
+| Type conversions | `toInteger`, `toFloat`, `toBoolean`, `toString` (each with `…List` variants) | `agtype.c` symbol list |
+
+### Known NOT supported in AGE 1.6 — do not propose these
+
+| Construct | Verified absent |
+|---|---|
+| `reduce(acc = init, x IN list \| expr)` accumulator | Not in `PG_FUNCTION_INFO_V1` symbol list; zero regression tests |
+| `collect(x ORDER BY y DESC)` aggregate-input ordering | No regression test; aggregate has no order-input variant |
+| Per-arm `ORDER BY … LIMIT` inside `UNION` | Empirical: Horizon SF10 test 2026-05-14 raised `could not find rte for cd` |
+| Comparison operators inside inline edge property map (`-[:R {cd < $X}]-`) | Equality-only; comparators must move to post-MATCH `WHERE` (no early rejection during walk) |
+| `CALL { subquery }` block form | Grammar reserves `{ }` blocks for `EXISTS {}` / `COUNT {}` only |
+| `SET RETURNING` functions in Cypher expressions | Per `sql_in_cypher.html`: *"Void and Scalar-Value functions only. Set returning functions are not currently supported."* |
+| `EXPLAIN` / `PROFILE` as Cypher statements | Use PG `EXPLAIN (ANALYZE) SELECT * FROM cypher(...)` instead |
+| `USING INDEX` / `USING JOIN ON` hints | Not exposed |
+| `USING PERIODIC COMMIT` | Not in grammar |
+| `apoc.*` or any top-K / heap / priority-queue builtin | None |
+| `shortestPath()`, `allShortestPaths()` | IC13/IC14 return constants (see deviations table below) |
+
+### Structural performance limits to design around
+
+These are the rules every plan should account for *before* committing to a shape:
+
+1. **No LIMIT pushdown.** `MATCH … RETURN … ORDER BY x DESC LIMIT N` materializes the full row set before the sort. Per-creator scans that yield thousands of rows for top-10 will scan all of them. There is no Cypher rewrite that fixes this in 1.6.
+2. **Functional B-tree indexes on extracted property values do NOT bind from Cypher** (AGE issue [#1000](https://github.com/apache/age/issues/1000)). AGE wraps the vertex in `_agtype_build_vertex(...)` before the property accessor, so the indexed expression never matches. Only `gin_<label>` containment lookups via `properties @> '{"id": X}'::agtype` bind reliably.
+3. **GIN property containment only binds for *literal or parameter* values in the inline `{prop: X}` form.** Runtime expressions from `UNWIND`, `WITH`, or function output do not bind — they fall to seq scans. Verified empirically: `UNWIND list AS r MATCH (n:Post {id: r.id})` was 5.7s for 10 lookups at SF3. Workaround: do the per-row lookup inside a PG function, or pass the value as a Cypher parameter via `cypher('…', $$ … $$, {id: …}::agtype)`.
+4. **Edge-property comparators in MATCH do not bind to composite functional indexes either** (same root cause as #2). The IC9 Phase A experiment (HAS_CREATOR.creationDate composite functional index) confirmed this — the predicate landed as `Filter:`, not `Index Cond:`. Don't propose "add edge property + functional index" as a perf fix.
+5. **Cypher call has fixed ~10–30 ms overhead per `cypher(…)` invocation.** Splitting work across multiple `cypher()` calls in one SQL file costs at the IU/IS scale. IU7's two-call split is the established example.
+
+### Recommended hybrid patterns (Cypher + UDF)
+
+When the obvious Cypher shape hits limits #1–#4, reach for these in order:
+
+**Pattern A — Seed-MATCH + UDF body (AGE-docs-sanctioned).** When everything after the seed is bounded indexed scans against side tables that you don't want to express in Cypher (because of limits #1–#4), put it in a `STABLE` PL/pgSQL function returning a single `agtype` list and call it from Cypher:
+
+```cypher
+MATCH (p:Person {id: $personId})       -- only place GIN binds for runtime $param
+UNWIND public.my_function(p.id) AS r   -- list-returning agtype, UNWIND fans it out
+RETURN r.field1, r.field2, …
+```
+
+The UDF body does the SQL work against side tables. Construct the agtype list via `jsonb_agg(jsonb_build_object(…))::text::ag_catalog.agtype` — the AGE `agtype_build_list(VARIADIC array_agg(…))` form has a known memory bug ("pfree called with invalid pointer"). Verified: 28 ms total at SF3 for a top-10-per-person lookup that this pattern solves and pure Cypher cannot (would otherwise materialize all messages per person, 200 ms+ at SF3 and seconds at SF1000).
+
+**Pattern B — `UNWIND range(0, N-1) AS i` driving `CALL public.fn(seed, i) YIELD …`.** Available and confirmed working, but tends to be *slower* than Pattern A because of `N×` PG-function call overhead plus `N×` index walks instead of `1×`. Reserve for cases where each row needs different per-row Cypher work after the function call — and even then, runtime values from `YIELD` won't bind to GIN, so the Cypher work has to stay within the function's output structure.
+
+**Pattern C — Multiple Cypher calls in sequence.** Already in use (IU7's create-then-tag-then-content shape; IS2's old Comment+Post branches). Costs the per-call overhead but is the only way to work around per-call MVCC and label-disjoint patterns.
+
+### What to do when no pattern is fast enough
+
+If a query genuinely cannot be expressed in compliant Cypher at acceptable performance (true top-N at scale on a per-entity dimension where side tables have a composite index that Cypher can't use), it joins the pure-SQL holdout list with IS6. Treat that as an exception requiring explicit sanction, not a default — and document the structural reason in the query's header comment so future readers see why Cypher wasn't chosen.
+
 ## Known Intentional Deviations — Do NOT Flag as Bugs
 
 | Query | Deviation | Reason |

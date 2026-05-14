@@ -247,7 +247,8 @@ section 5 for the DDL.
 ```sql
 (creator_business_id bigint, message_business_id bigint, creation_date bigint,
  content text, is_post boolean)
-UNIQUE INDEX (creator_business_id, creation_date DESC, message_business_id)
+UNIQUE INDEX (creator_business_id, creation_date DESC, message_business_id)  -- IC9 per-creator walk
+UNIQUE INDEX (message_business_id)  -- IS2 lookup by message id, added 2026-05-14
 ```
 
 - Mirrors `Comment` + `Post` keyed by the **creator's LDBC business id** (bigint).
@@ -256,6 +257,9 @@ UNIQUE INDEX (creator_business_id, creation_date DESC, message_business_id)
 - Used by IC9 to walk per-friend date-DESC with `LATERAL LIMIT 20`. The composite
   index binds both `creator_business_id` and `creation_date < $maxDate` as
   `Index Cond:`, so each per-friend scan early-terminates at 20 rows.
+- Used by IS2 to look up the root post's creator after `CommentRootPost`
+  resolves `comment_business_id → root_post_business_id`. The secondary
+  unique index on `message_business_id` makes this a single PK probe.
 - Maintained by IU6 (AddPost) and IU7 (AddComment): one `INSERT … ON CONFLICT
   DO NOTHING` per new message. No update path — messages are immutable.
 - Populated at load time by `denormalize-schema.sql` section 6 (`UNION ALL` over
@@ -265,6 +269,29 @@ UNIQUE INDEX (creator_business_id, creation_date DESC, message_business_id)
   edge property + functional index) was tested 2026-05-14 and ran 135x–388x
   slower at SF3 — AGE 1.6 can't push LIMIT past Cypher UNION and edge-property
   predicates don't bind as `Index Cond:` on functional indexes.
+
+### `ldbc_snb."CommentRootPost"` (extended 2026-05-14 for IS2)
+
+```sql
+(comment_id ag_catalog.graphid PRIMARY KEY,
+ comment_business_id bigint NOT NULL,
+ root_post_business_id bigint NOT NULL)
+UNIQUE INDEX (comment_business_id)  -- added 2026-05-14 for IS2 lookup-by-bizid
+```
+
+- For each Comment, stores the LDBC business id of the root Post reachable
+  by walking `REPLY_OF*`. The `comment_id` (graphid) PK lets the iterative
+  deploy-time backfill loop join against `Comment.reply_of_id` (graphid).
+- Used by IS2 to skip the recursive REPLY_OF walk: a single lookup on
+  `comment_business_id` yields the root post id without touching any AGE
+  label table. (IS6 was the original target but currently falls back to
+  its own SQL walk pending a separate refactor.)
+- Maintained by IU7 (AddComment): when the new comment replies to a Post,
+  root = `$replyToId`; when it replies to another Comment, root inherits
+  the parent comment's `root_post_business_id` via a CommentRootPost lookup.
+- Populated at load time by `denormalize-schema.sql` section 6: seed every
+  Comment whose direct parent is a Post, then walk upward iteratively
+  (replaces the prior recursive CTE — see commit `82865047`).
 
 ### `ldbc_snb."PersonSide"` (2026-05-14, IC9 Phase C)
 
