@@ -159,6 +159,24 @@ CREATE INDEX IF NOT EXISTS idx_company_graphid    ON ldbc_snb."Company"    (id);
 CREATE INDEX IF NOT EXISTS idx_university_graphid ON ldbc_snb."University" (id);
 
 -- ---------------------------------------------------------------------------
+-- OPT-3 — Covering index on HAS_CREATOR (end_id) INCLUDE (start_id)
+--
+-- The plain idx_hascreator_end (end_id) index forces a heap fetch per row
+-- to retrieve start_id (the message graphid). Adding start_id as an INCLUDE
+-- column converts the Bitmap Heap Scan to an Index Only Scan on HAS_CREATOR,
+-- eliminating ~150 K heap block reads per IC10 query at SF10 (8.6% of V6
+-- total buffers). Also benefits IC2, IC3, IC4, IC6, IC7, IC8, IC9, IC11,
+-- IS4, IS5, IS6, IS7 — any query that traverses (creator)<-[:HAS_CREATOR]-
+-- and needs the message graphid after finding the creator's end_id.
+--
+-- This index supersedes idx_hascreator_end. On existing databases, drop the
+-- plain index after this one is built:
+--   DROP INDEX IF EXISTS ldbc_snb.idx_hascreator_end;
+-- ---------------------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_hascreator_end_incl
+  ON ldbc_snb."HAS_CREATOR" (end_id) INCLUDE (start_id);
+
+-- ---------------------------------------------------------------------------
 -- Edge-property indexes that match AGE's compiled Cypher predicate shape
 --
 -- AGE 1.6 compiles `member.joinDate > $minDate` to:
