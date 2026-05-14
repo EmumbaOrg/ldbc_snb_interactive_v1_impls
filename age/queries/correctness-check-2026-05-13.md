@@ -67,7 +67,7 @@ Original priority (driven by old AGE-self-generated 46-failure baseline) put IC2
 | Priority | Query | Failures | Effort estimate | Notes |
 |---|---|---:|---|---|
 | 1 | **IC7** | 135 | Medium | Highest count; not yet investigated |
-| 2 | **IC12** | 132 | High | Recursive TagClass walk + multiple denorm-column joins (current shape violates directive) |
+| 2 | **IC12** | 132 | ✅ Root cause fixed (2026-05-14) | `WHERE id(tag) IN validTagIds` compared AGE graphids vs LDBC business IDs — always failed, returning empty results. Fixed to `tag.id IN validTagIds`. Expect ~0 failures on re-validation. |
 | 3 | **IC4** | 105 | Low-Medium | Already in parameterized list; diagnose specific shape |
 | 4 | **IC5** | 85 | Investigation-first | Phase 3 said complete — diagnose drift |
 | 5 | IC11 / IC1 / IC3 | 70-75 each | Mixed | Likely property-extraction / content-trim issues like IC2 had |
