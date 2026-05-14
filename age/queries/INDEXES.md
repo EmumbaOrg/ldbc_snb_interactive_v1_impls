@@ -174,25 +174,21 @@ on the entity tables without going through the AGE edge tables.
 ### Single-column denorm indexes
 
 ```sql
--- Post
-CREATE INDEX idx_post_creator_id    ON ldbc_snb."Post"    (creator_id);
-CREATE INDEX idx_post_forum_id      ON ldbc_snb."Post"    (forum_id);
-CREATE INDEX idx_post_country_id    ON ldbc_snb."Post"    (country_id);
--- Comment
-CREATE INDEX idx_comment_creator_id  ON ldbc_snb."Comment" (creator_id);
-CREATE INDEX idx_comment_reply_of_id ON ldbc_snb."Comment" (reply_of_id);
-CREATE INDEX idx_comment_country_id  ON ldbc_snb."Comment" (country_id);
--- Forum / Person
-CREATE INDEX idx_forum_moderator_id  ON ldbc_snb."Forum"   (moderator_id);
-CREATE INDEX idx_person_city_id      ON ldbc_snb."Person"  (city_id);
--- Tag / TagClass / Place hierarchy
-CREATE INDEX idx_tag_tagclass_id           ON ldbc_snb."Tag"      (tagclass_id);
-CREATE INDEX idx_tagclass_subclass_of_id   ON ldbc_snb."TagClass" (subclass_of_id);
-CREATE INDEX idx_city_country_id           ON ldbc_snb."City"     (country_id);
-CREATE INDEX idx_country_continent_id      ON ldbc_snb."Country"  (continent_id);
-CREATE INDEX idx_university_city_id        ON ldbc_snb."University" (city_id);
-CREATE INDEX idx_company_country_id        ON ldbc_snb."Company"  (country_id);
+-- Post / Comment denorm columns with live read consumers
+CREATE INDEX idx_post_creator_id     ON ldbc_snb."Post"     (creator_id);   -- IC10
+CREATE INDEX idx_post_forum_id       ON ldbc_snb."Post"     (forum_id);     -- IU6 internal (FMPC)
+CREATE INDEX idx_comment_creator_id  ON ldbc_snb."Comment"  (creator_id);   -- IC12
+CREATE INDEX idx_comment_reply_of_id ON ldbc_snb."Comment"  (reply_of_id);  -- IC12 + IS2
+CREATE INDEX idx_tag_tagclass_id         ON ldbc_snb."Tag"      (tagclass_id);       -- IC12
+CREATE INDEX idx_tagclass_subclass_of_id ON ldbc_snb."TagClass" (subclass_of_id);    -- IC12
 ```
+
+**Retired 2026-05-14** (no read consumers, removed from `denormalize-schema.sql`):
+`idx_post_country_id`, `idx_comment_country_id`, `idx_forum_moderator_id`,
+`idx_person_city_id`, `idx_city_country_id`, `idx_country_continent_id`,
+`idx_university_city_id`, `idx_company_country_id`. Existing indexes in
+older deployments are empty and can be dropped with `DROP INDEX IF EXISTS`
+at the operator's convenience.
 
 ### Composite covering indexes (hot JOIN patterns)
 

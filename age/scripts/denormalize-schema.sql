@@ -77,12 +77,7 @@ UPDATE "Post" p
  WHERE co.end_id = p.id
    AND p.forum_id IS NULL;
 
--- Post.country_id ← IS_LOCATED_IN (Post → Country)
-UPDATE "Post" p
-   SET country_id = il.end_id
-  FROM "IS_LOCATED_IN" il
- WHERE il.start_id = p.id
-   AND p.country_id IS NULL;
+-- Post.country_id retired 2026-05-14: no read consumers.
 
 -- Comment.creator_id ← HAS_CREATOR (Comment → Person)
 UPDATE "Comment" c
@@ -98,26 +93,9 @@ UPDATE "Comment" c
  WHERE ro.start_id = c.id
    AND c.reply_of_id IS NULL;
 
--- Comment.country_id ← IS_LOCATED_IN (Comment → Country)
-UPDATE "Comment" c
-   SET country_id = il.end_id
-  FROM "IS_LOCATED_IN" il
- WHERE il.start_id = c.id
-   AND c.country_id IS NULL;
-
--- Forum.moderator_id ← HAS_MODERATOR (Forum → Person)
-UPDATE "Forum" f
-   SET moderator_id = hm.end_id
-  FROM "HAS_MODERATOR" hm
- WHERE hm.start_id = f.id
-   AND f.moderator_id IS NULL;
-
--- Person.city_id ← IS_LOCATED_IN (Person → City)
-UPDATE "Person" pr
-   SET city_id = il.end_id
-  FROM "IS_LOCATED_IN" il
- WHERE il.start_id = pr.id
-   AND pr.city_id IS NULL;
+-- Comment.country_id, Forum.moderator_id, Person.city_id retired 2026-05-14:
+-- no read consumers. Comment.country_id alone took ~10 min at SF3 on the
+-- 6.4M-row Comment table; the saving compounds at SF10+.
 
 -- Tag.tagclass_id ← HAS_TYPE (Tag → TagClass)
 UPDATE "Tag" t
@@ -133,33 +111,10 @@ UPDATE "TagClass" tc
  WHERE isc.start_id = tc.id
    AND tc.subclass_of_id IS NULL;
 
--- City.country_id ← IS_PART_OF (City → Country)
-UPDATE "City" c
-   SET country_id = ip.end_id
-  FROM "IS_PART_OF" ip
- WHERE ip.start_id = c.id
-   AND c.country_id IS NULL;
-
--- Country.continent_id ← IS_PART_OF (Country → Continent)
-UPDATE "Country" co
-   SET continent_id = ip.end_id
-  FROM "IS_PART_OF" ip
- WHERE ip.start_id = co.id
-   AND co.continent_id IS NULL;
-
--- University.city_id ← IS_LOCATED_IN (University → City)
-UPDATE "University" u
-   SET city_id = il.end_id
-  FROM "IS_LOCATED_IN" il
- WHERE il.start_id = u.id
-   AND u.city_id IS NULL;
-
--- Company.country_id ← IS_LOCATED_IN (Company → Country)
-UPDATE "Company" co
-   SET country_id = il.end_id
-  FROM "IS_LOCATED_IN" il
- WHERE il.start_id = co.id
-   AND co.country_id IS NULL;
+-- Geographic hierarchy denorm columns (City.country_id, Country.continent_id,
+-- University.city_id, Company.country_id) retired 2026-05-14: no read consumers
+-- in any IC/IS/IU query. Tables are small (<2K rows total) so the saved time
+-- is modest, but every retired write is also a §14 reduction.
 
 -- =========================================================================
 -- 3. Indexes on the new columns
@@ -168,31 +123,23 @@ UPDATE "Company" co
 -- hottest JOIN patterns (mirrors postgres ref's message_creatorid +
 -- message_forumid + message_replyof + forum_moderatorid).
 
--- Post indexes (mirrors message_creatorid, message_forumid, message_locationid)
-CREATE INDEX IF NOT EXISTS idx_post_creator_id   ON "Post" (creator_id);
-CREATE INDEX IF NOT EXISTS idx_post_forum_id     ON "Post" (forum_id);
-CREATE INDEX IF NOT EXISTS idx_post_country_id   ON "Post" (country_id);
--- Composite: IC5's `forum_id = X AND creator_id = Y` LEFT JOIN
-CREATE INDEX IF NOT EXISTS idx_post_forum_creator ON "Post" (forum_id, creator_id);
-
--- Comment indexes (mirrors message_creatorid, message_replyof, message_locationid)
+-- Post / Comment indexes on live denorm columns.
+CREATE INDEX IF NOT EXISTS idx_post_creator_id    ON "Post" (creator_id);
+CREATE INDEX IF NOT EXISTS idx_post_forum_id      ON "Post" (forum_id);
+CREATE INDEX IF NOT EXISTS idx_post_forum_creator ON "Post" (forum_id, creator_id);  -- IC5 LEFT JOIN
 CREATE INDEX IF NOT EXISTS idx_comment_creator_id  ON "Comment" (creator_id);
 CREATE INDEX IF NOT EXISTS idx_comment_reply_of_id ON "Comment" (reply_of_id);
-CREATE INDEX IF NOT EXISTS idx_comment_country_id  ON "Comment" (country_id);
 
--- Forum
-CREATE INDEX IF NOT EXISTS idx_forum_moderator_id  ON "Forum" (moderator_id);
+-- Tag hierarchy indexes (live — IC12 reads both).
+CREATE INDEX IF NOT EXISTS idx_tag_tagclass_id         ON "Tag" (tagclass_id);
+CREATE INDEX IF NOT EXISTS idx_tagclass_subclass_of_id ON "TagClass" (subclass_of_id);
 
--- Person
-CREATE INDEX IF NOT EXISTS idx_person_city_id      ON "Person" (city_id);
-
--- Tag / TagClass / Place hierarchy
-CREATE INDEX IF NOT EXISTS idx_tag_tagclass_id           ON "Tag" (tagclass_id);
-CREATE INDEX IF NOT EXISTS idx_tagclass_subclass_of_id   ON "TagClass" (subclass_of_id);
-CREATE INDEX IF NOT EXISTS idx_city_country_id           ON "City" (country_id);
-CREATE INDEX IF NOT EXISTS idx_country_continent_id      ON "Country" (continent_id);
-CREATE INDEX IF NOT EXISTS idx_university_city_id        ON "University" (city_id);
-CREATE INDEX IF NOT EXISTS idx_company_country_id        ON "Company" (country_id);
+-- Indexes on retired columns (Post.country_id, Comment.country_id,
+-- Forum.moderator_id, Person.city_id, City.country_id, Country.continent_id,
+-- University.city_id, Company.country_id) retired 2026-05-14: no consumer
+-- ever read these columns. CREATE INDEX statements removed to save load
+-- time. Existing indexes in older deployments are inert and can be dropped
+-- with DROP INDEX IF EXISTS at the operator's convenience.
 
 -- =========================================================================
 -- 4. Per-friend top-K message composite indexes — DROPPED (IC2 rewrite 2026-05-13)

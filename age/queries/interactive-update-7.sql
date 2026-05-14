@@ -33,10 +33,12 @@ SELECT * FROM cypher('$graphName', $$
   RETURN count(comment)
 $$) AS (result agtype);
 
+-- Comment.country_id retired 2026-05-14: no read consumers (see SCHEMA.md).
+-- creator_id and reply_of_id are still live (IC12 + downstream CommentRootPost
+-- maintenance).
 UPDATE ldbc_snb."Comment" c
    SET creator_id  = (SELECT end_id FROM ldbc_snb."HAS_CREATOR" WHERE start_id = c.id LIMIT 1),
-       reply_of_id = (SELECT end_id FROM ldbc_snb."REPLY_OF"    WHERE start_id = c.id LIMIT 1),
-       country_id  = (SELECT end_id FROM ldbc_snb."IS_LOCATED_IN" WHERE start_id = c.id LIMIT 1)
+       reply_of_id = (SELECT end_id FROM ldbc_snb."REPLY_OF"    WHERE start_id = c.id LIMIT 1)
  WHERE CAST(ag_catalog.agtype_object_field_text(c.properties, 'id') AS bigint) = $commentId
 ;
 -- MessageByCreator: append the new Comment for IC9's per-creator date-DESC walk.

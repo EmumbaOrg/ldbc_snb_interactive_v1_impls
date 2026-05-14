@@ -1,8 +1,11 @@
--- LdbcUpdate1AddPerson — create a Person vertex with all edges and maintain denorm state.
+-- LdbcUpdate1AddPerson — create a Person vertex with all edges and maintain side-table state.
 -- Hybrid: Cypher block creates Person + IS_LOCATED_IN + HAS_INTEREST + STUDY_AT + WORK_AT in
--- one chained WITH/UNWIND block. SQL UPDATE/INSERT maintains:
---   Person.city_id              (iter-1 column denorm)
+-- one chained WITH/UNWIND block. SQL INSERT maintains:
 --   PersonPostCount(person_id)  (iter-2 side table — initialised to 0)
+--   PersonSide(person_business_id, first_name, last_name)  (Phase C mirror)
+--
+-- Person.city_id (iter-1 denorm) was previously written here but had no read
+-- consumers — retired 2026-05-14 alongside Forum.moderator_id (see SCHEMA.md).
 SELECT * FROM cypher('$graphName', $$
   MATCH (city:City {id: $cityId})
   CREATE (p:Person {
@@ -33,10 +36,6 @@ SELECT * FROM cypher('$graphName', $$
     CREATE (p)-[:WORK_AT {workFrom: w.year}]->(comp)
   RETURN count(*)
 $$) AS (result agtype);
-UPDATE ldbc_snb."Person" pr
-   SET city_id = (SELECT end_id FROM ldbc_snb."IS_LOCATED_IN" WHERE start_id = pr.id LIMIT 1)
- WHERE CAST(ag_catalog.agtype_object_field_text(pr.properties, 'id') AS bigint) = $personId
-;
 INSERT INTO ldbc_snb."PersonPostCount" (person_id, post_count)
 SELECT id, 0 FROM ldbc_snb."Person"
  WHERE CAST(ag_catalog.agtype_object_field_text(properties, 'id') AS bigint) = $personId

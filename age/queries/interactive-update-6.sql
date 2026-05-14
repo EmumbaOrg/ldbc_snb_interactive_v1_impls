@@ -26,10 +26,13 @@ SELECT * FROM cypher('$graphName', $$
     CREATE (post)-[:HAS_TAG]->(t)
   RETURN count(post)
 $$) AS (result agtype);
+-- Post.country_id retired 2026-05-14: no read consumers (see SCHEMA.md).
+-- Post.creator_id is still live (IC10 reads it; the ForumMemberPostCount
+-- aggregate below also reads it). Post.forum_id is internal to this IU only
+-- but the FMPC INSERT requires it.
 UPDATE ldbc_snb."Post" p
    SET creator_id = (SELECT end_id FROM ldbc_snb."HAS_CREATOR" WHERE start_id = p.id LIMIT 1),
-       forum_id   = (SELECT start_id FROM ldbc_snb."CONTAINER_OF" WHERE end_id = p.id LIMIT 1),
-       country_id = (SELECT end_id FROM ldbc_snb."IS_LOCATED_IN" WHERE start_id = p.id LIMIT 1)
+       forum_id   = (SELECT start_id FROM ldbc_snb."CONTAINER_OF" WHERE end_id = p.id LIMIT 1)
  WHERE CAST(ag_catalog.agtype_object_field_text(p.properties, 'id') AS bigint) = $postId
 ;
 -- Aggregate INSERTs: SELECT DISTINCT ... LIMIT 1 guards against pre-existing

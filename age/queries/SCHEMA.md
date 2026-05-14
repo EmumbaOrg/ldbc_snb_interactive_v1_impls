@@ -135,29 +135,29 @@ on subsequent writes by the IU operations listed. All columns are of type
 
 | Column | Source edge | Maintained by |
 |---|---|---|
-| `creator_id` | `HAS_CREATOR`.end_id | IU6 (SQL UPDATE) |
-| `forum_id` | `CONTAINER_OF`.start_id (inverse) | IU6 (SQL UPDATE) |
-| `country_id` | `IS_LOCATED_IN`.end_id | IU6 (SQL UPDATE) |
+| `creator_id` | `HAS_CREATOR`.end_id | IU6 (SQL UPDATE) — read by IC10 + IU6's own FMPC aggregate |
+| `forum_id` | `CONTAINER_OF`.start_id (inverse) | IU6 (SQL UPDATE) — internal to IU6's FMPC aggregate |
+| ~~`country_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no read consumer. UPDATE removed from IU6 and `denormalize-schema.sql`; column + index remain (AGE 1.6 ALTER limit). |
 
 ### `ldbc_snb."Comment"`
 
 | Column | Source edge | Maintained by |
 |---|---|---|
-| `creator_id` | `HAS_CREATOR`.end_id | IU7 (SQL UPDATE) |
-| `reply_of_id` | `REPLY_OF`.end_id | IU7 (SQL UPDATE) |
-| `country_id` | `IS_LOCATED_IN`.end_id | IU7 (SQL UPDATE) |
+| `creator_id` | `HAS_CREATOR`.end_id | IU7 (SQL UPDATE) — read by IC12 |
+| `reply_of_id` | `REPLY_OF`.end_id | IU7 (SQL UPDATE) — read by IC12 + IS2 + CommentRootPost upkeep |
+| ~~`country_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no read consumer. UPDATE removed from IU7 and `denormalize-schema.sql` (was the slowest deploy-time UPDATE at SF3 → ~10 min saved at SF10+). |
 
 ### `ldbc_snb."Forum"`
 
 | Column | Source edge | Maintained by |
 |---|---|---|
-| `moderator_id` | `HAS_MODERATOR`.end_id | **retired 2026-05-14** — no read query referenced it; IU4 no longer writes it. Existing column + index remain (AGE 1.6 blocks `ALTER TABLE` on label tables) but values for new Forums are NULL. Reintroduce as a `ForumSide.moderator_id` column if a read query ever needs it. |
+| ~~`moderator_id`~~ | ~~`HAS_MODERATOR`.end_id~~ | **retired 2026-05-14** — no read query referenced it; IU4 no longer writes it. Existing column + index remain (AGE 1.6 blocks `ALTER TABLE` on label tables) but values for new Forums are NULL. Reintroduce as `ForumSide.moderator_id` if a read query ever needs it. |
 
 ### `ldbc_snb."Person"`
 
 | Column | Source edge | Maintained by |
 |---|---|---|
-| `city_id` | `IS_LOCATED_IN`.end_id | IU1 (SQL UPDATE) |
+| ~~`city_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no read query referenced it; IU1 no longer writes it. Existing column + index remain (AGE 1.6 ALTER limit). |
 
 ### Side tables (mirrors — outer SQL never reads AGE tables)
 
@@ -194,20 +194,18 @@ each top-20 row.
 
 ### Additional denorm columns (also in `denormalize-schema.sql`)
 
-The following columns are also added by the schema script but are not yet
-used by the current IC/IS/IU queries. They are present for potential future
-query optimizations:
+| Table | Column | Source | Status |
+|---|---|---|---|
+| `Tag` | `tagclass_id` | `HAS_TYPE`.end_id | active — read by IC12 |
+| `TagClass` | `subclass_of_id` | `IS_SUBCLASS_OF`.end_id | active — read by IC12 |
+| ~~`City`~~ | ~~`country_id`~~ | ~~`IS_PART_OF`.end_id~~ | **retired 2026-05-14** — no consumer |
+| ~~`Country`~~ | ~~`continent_id`~~ | ~~`IS_PART_OF`.end_id~~ | **retired 2026-05-14** — no consumer |
+| ~~`University`~~ | ~~`city_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no consumer |
+| ~~`Company`~~ | ~~`country_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no consumer |
 
-| Table | Column | Source |
-|---|---|---|
-| `Tag` | `tagclass_id` | `HAS_TYPE`.end_id |
-| `TagClass` | `subclass_of_id` | `IS_SUBCLASS_OF`.end_id — used by IC12 |
-| `City` | `country_id` | `IS_PART_OF`.end_id |
-| `Country` | `continent_id` | `IS_PART_OF`.end_id |
-| `University` | `city_id` | `IS_LOCATED_IN`.end_id |
-| `Company` | `country_id` | `IS_LOCATED_IN`.end_id |
-
-Note: `Tag.tagclass_id` and `TagClass.subclass_of_id` are actively used by IC12.
+Retired columns are no longer backfilled by `denormalize-schema.sql`. The
+columns and any indexes on them remain in the AGE schema (AGE 1.6 blocks
+`ALTER TABLE DROP COLUMN` on label tables) but values are NULL.
 
 ---
 
