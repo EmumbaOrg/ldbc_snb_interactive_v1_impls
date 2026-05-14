@@ -233,7 +233,17 @@ scripts/converted/sf<N>/
 
 ## 7. Configure benchmark.properties
 
-Edit `driver/benchmark.properties` for your environment:
+Three profiles are checked in under `driver/`:
+
+| Profile | Target | When to use |
+|---|---|---|
+| `benchmark.properties` | HorizonDB / production | Full Horizon runs on Azure |
+| `benchmark-local.properties` | Local PostgreSQL, **SF3**, 5K ops | Default local SF3 perf run |
+| `benchmark-local-10k.properties` | Local PostgreSQL, **SF3**, 10K ops + 1K warmup | Quick local smoke / iteration |
+
+Pick the one matching your target and edit the host-specific fields below.
+
+### Production / HorizonDB — `driver/benchmark.properties`
 
 ```properties
 # Connection — must match your HorizonDB / PostgreSQL instance
@@ -242,9 +252,9 @@ age_user=<user>
 age_password=<password>
 
 # Paths — must match where your LDBC data is stored
-ldbc.snb.interactive.parameters_dir=/path/to/substitution_parameters-sf0.1/substitution_parameters-sf0.1/
-ldbc.snb.interactive.updates_dir=/path/to/social_network-sf0.1-CsvComposite-LongDateFormatter/
-ldbc.snb.interactive.scale_factor=0.1
+ldbc.snb.interactive.parameters_dir=/path/to/substitution_parameters-sf<N>/
+ldbc.snb.interactive.updates_dir=/path/to/social_network-sf<N>-CsvComposite-LongDateFormatter/
+ldbc.snb.interactive.scale_factor=<N>
 
 # Benchmark size
 operation_count=1000000
@@ -252,33 +262,62 @@ warmup=10000
 thread_count=8
 ```
 
-Key notes:
-- `parameters_dir` must point to the **inner** directory that directly contains
-  `interactive_1_param.txt`, `interactive_2_param.txt`, etc.  
-  If your archive unpacks as `substitution_parameters-sf0.1/substitution_parameters-sf0.1/`,
-  point to the inner one.
+### Local SF3 — `driver/benchmark-local.properties` (already wired up)
+
+Pre-configured for `localhost:5432/postgres` and the SF3 paths under
+`age/datasets/`. Defaults: `thread_count=4`, `operation_count=5000`,
+`warmup=1000`. Only override the endpoint/user/password if your local
+PostgreSQL isn't on the default port/credentials.
+
+For a quick smoke run, use `benchmark-local-10k.properties` instead
+(`operation_count=10000`, same threads).
+
+### Key notes (all profiles)
+
+- `parameters_dir` must point to the directory that **directly contains**
+  `interactive_1_param.txt`, `interactive_2_param.txt`, etc. Some archives
+  unpack with a double-nested `substitution_parameters-sf<N>/substitution_parameters-sf<N>/`
+  layout — point at the inner one in that case.
 - `operation_count` is the number of operations **after** warmup.
 - `thread_count` is sized to the **benchmark host's vCPU count**, not the DB host's.
-  Default 8 matches a Standard_D8ds_v4 (8 vCPU / 32 GB) driver VM. The Hikari JDBC
-  pool (`age_connection_pool_size`) must mirror this value — each driver thread
-  gets its own dedicated connection. For a 16-vCPU driver bump both to 16; for
-  a 4-vCPU driver drop both to 4.
-- The DB host's parallelism (`max_parallel_workers=24`) is recruited *per query*
-  by each driver thread, so DB cores aren't a constraint on driver thread count
-  unless you push driver threads above the DB's parallel-worker pool.
+  The Hikari JDBC pool (`age_connection_pool_size`) must mirror this value —
+  each driver thread gets its own dedicated connection. Production default 8
+  matches a Standard_D8ds_v4 driver VM; the local profiles use 4 for a laptop.
+- The DB host's parallelism (`max_parallel_workers=24` on HorizonDB) is
+  recruited *per query* by each driver thread, so DB cores aren't a constraint
+  on driver thread count unless you push driver threads above the DB's
+  parallel-worker pool.
 
 ---
 
 ## 8. Run the benchmark
 
 Always restore the snapshot before running so the graph is in a clean state
-(not mutated by prior IU operations):
+(not mutated by prior IU operations).
+
+### Option A — wrapper script (recommended for local SF3)
+
+`driver/benchmark.sh` `cd`s into `age/` and invokes the driver. The properties
+path is **relative to `age/`**; pass `driver/<file>` not `age/driver/<file>`.
 
 ```bash
 # Step 1 — restore clean snapshot
 bash scripts/restore-database.sh
 
-# Step 2 — run benchmark
+# Step 2 — run benchmark against SF3 (5K ops, full local)
+bash driver/benchmark.sh driver/benchmark-local.properties \
+  2>&1 | tee results/bench-sf3-$(date +%Y%m%d-%H%M%S).log
+
+# …or the 10K-op smoke variant
+bash driver/benchmark.sh driver/benchmark-local-10k.properties \
+  2>&1 | tee results/bench-sf3-10k-$(date +%Y%m%d-%H%M%S).log
+```
+
+### Option B — raw java invocation (production / HorizonDB)
+
+```bash
+bash scripts/restore-database.sh
+
 java --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
   -Xmx8g \
   -cp target/age-1.2.0-SNAPSHOT.jar \
@@ -343,19 +382,73 @@ EOF
 
 ## 11. Validation (correctness check)
 
-Validation confirms that query results match the expected LDBC reference output.
-It requires a `validation_params-sf<N>.csv` reference file.
+Validation confirms that AGE's query output matches the LDBC reference output
+byte-for-byte. The canonical ground truth is the **LDBC-distributed**
+`validation_params-sf<N>.csv`, which was generated by the Neo4j Cypher
+reference implementation and is the authoritative oracle.
+
+> **Do NOT regenerate `validation_params-sf<N>.csv` locally against AGE.**
+> A fresh AGE-generated file only validates AGE against AGE's prior output —
+> drift-prone, and hides genuine regressions. See `queries/AGENTS.md`
+> §"Validation against LDBC-official reference params" for the full rule.
+
+### 11.1 One-time: download the official validation params
+
+Distributed as a single tarball covering SF0.1 → SF10 (~195 MB compressed,
+~1.6 GB extracted):
 
 ```bash
-# Edit driver/validate.properties with correct connection and paths, then:
-bash scripts/run-local-validation.sh
+cd age/datasets
+
+curl -L -O https://datasets.ldbcouncil.org/interactive-v1/validation_params-interactive-v1.0.0-sf0.1-to-sf10.tar.zst
+tar --use-compress-program=unzstd -xf validation_params-interactive-v1.0.0-sf0.1-to-sf10.tar.zst
 ```
 
-`run-local-validation.sh` generates a fresh `validation_params.csv` from the
-current implementation, restores the snapshot, then runs the validator.
+After extraction `age/datasets/` contains `validation_params-sf0.1.csv` through
+`validation_params-sf10.csv`. `driver/validate-local.properties` is already
+wired to `validation_params-sf3.csv`.
 
-Expected outcome for the current implementation: only IC13 and IC14 report
-failures (both are intentionally disabled). All other queries should pass.
+### 11.2 Run full validation against LDBC SF3
+
+```bash
+# Step 1 — restore clean snapshot (validator expects pre-IU state)
+bash scripts/restore-database.sh
+
+# Step 2 — run validator against the LDBC-distributed SF3 oracle
+bash driver/validate.sh driver/validate-local.properties \
+  2>&1 | tee results/validate-sf3-$(date +%Y%m%d-%H%M%S).log
+```
+
+`driver/validate-local.properties` is pinned to:
+- `validate_database=…/age/datasets/validation_params-sf3.csv`
+- `parameters_dir=…/age/datasets/substitution_parameters-sf3/`
+- `updates_dir=…/age/datasets/social_network-sf3-CsvComposite-LongDateFormatter/`
+- All IC, IS, and IU operations enabled (IU writes are part of the validation sequence).
+
+### 11.3 Expected outcome
+
+- **IC13 and IC14** — always report failures. Intentional: AGE has no
+  `shortestPath()` / `allShortestPaths()` support; the SQL stubs return `-1`
+  and an empty list respectively. Not a regression.
+- **All other queries** — 0 failures expected on a clean snapshot.
+- Any other non-zero failure count is a genuine regression and must be
+  investigated. Per `queries/AGENTS.md` §"Important caveats", do NOT contort
+  the implementation to reproduce LDBC-Cypher quirks (e.g. duplicate emissions
+  from undirected `-[:KNOWS]-`); document the divergence against the relevant
+  query instead.
+
+### 11.4 Other scale factors
+
+Switch profiles by changing `validate_database`, `parameters_dir`,
+`updates_dir`, and `scale_factor` to the matching SF (the dataset for that SF
+must be loaded into AGE first per §6). The same `validate.sh` invocation
+applies.
+
+### 11.5 Production / HorizonDB
+
+`driver/validate.properties` is the equivalent profile pointed at HorizonDB.
+Same procedure: restore the snapshot on the target DB, then
+`bash driver/validate.sh driver/validate.properties`.
 
 ---
 
@@ -364,12 +457,18 @@ failures (both are intentionally disabled). All other queries should pass.
 | Task | Command |
 |---|---|
 | Build JAR | `mvn -q clean package -DskipTests` |
-| Load data (first time) | `bash scripts/load-data.sh --sf 0.1` |
-| Restore before benchmark | `bash scripts/restore-database.sh` |
-| Run benchmark | `java --add-opens java.base/sun.nio.ch=ALL-UNNAMED -Xmx8g -cp target/age-1.2.0-SNAPSHOT.jar org.ldbcouncil.snb.driver.Client -P driver/benchmark.properties` |
-| Run validation | `bash scripts/run-local-validation.sh` |
+| Load data (first time) | `bash scripts/load-data.sh --sf 3` |
+| Restore snapshot | `bash scripts/restore-database.sh` |
+| Run benchmark — local SF3 | `bash driver/benchmark.sh driver/benchmark-local.properties` |
+| Run benchmark — local SF3 (10K smoke) | `bash driver/benchmark.sh driver/benchmark-local-10k.properties` |
+| Run benchmark — HorizonDB | `bash driver/benchmark.sh driver/benchmark.properties` |
+| Run validation — local SF3 (LDBC oracle) | `bash driver/validate.sh driver/validate-local.properties` |
+| Run validation — HorizonDB | `bash driver/validate.sh driver/validate.properties` |
 | Apply PostgreSQL tuning | See §4 above / `scripts/postgres-tuning.md` |
 | Take a manual snapshot | `bash scripts/snapshot-database.sh` |
+
+Wrapper scripts (`benchmark.sh`, `validate.sh`) `cd` into `age/`, so pass the
+properties path as `driver/<file>`, **not** `age/driver/<file>`.
 
 ### Environment variables cheat-sheet
 
