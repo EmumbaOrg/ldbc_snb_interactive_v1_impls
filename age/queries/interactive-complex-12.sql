@@ -1,59 +1,96 @@
--- LdbcQuery12 — Friends who replied to posts tagged under a TagClass subtree, with tag names.
--- Hybrid: two Cypher calls (TagClass root graphid, direct friend graphids); SQL walks
--- TagClass.subclass_of_id denorm recursively, filters valid Tags via tagclass_id denorm,
--- then JOINs Comment.{creator_id, reply_of_id} denorm + HAS_TAG for matched comments.
--- valid_tags AS MATERIALIZED prevents planner from inlining into HAS_TAG at scale.
--- Denorm used: Comment.creator_id, Comment.reply_of_id, Tag.tagclass_id,
---              TagClass.subclass_of_id (all iter-3).
+-- LdbcQuery12 — Expert search: friends' replies to posts tagged under a TagClass subtree.
+-- Hybrid H1: two Cypher calls connected via PostgreSQL CTEs. The graph traversal stays in
+-- Cypher; the tag-ID filter, aggregation, and sort are handled by outer SQL as a Hash Semi
+-- Join on plain bigint columns. This eliminates the agtype_in_operator linear scan bottleneck
+-- (5,085 × 743K = 3.78B comparisons at SF3 for broad tag classes) and moves the GROUP BY
+-- off AGE-reconstructed vertex blobs onto plain bigint/text columns.
+--
+-- First Cypher call — TagClass hierarchy + valid tag IDs (SF-invariant):
+--   d1-d6 OPTIONAL MATCH ladder (variable-length [:IS_SUBCLASS_OF*] crashes AGE 1.6 — §9).
+--   Returns one row per valid tag.id (LDBC business ID bigint). MATERIALIZED forces a single
+--   evaluation; without it PG≥12 may inline and re-execute per outer row.
+--   Uses tag.id (LDBC business ID), NOT id(tag) (AGE internal graphid) — different namespaces.
+--
+-- Second Cypher call — main traversal (scales with SF):
+--   friends (idx_knows_start) → comments (idx_hascreator_end) →
+--   post-replies (idx_replyof_start, :Post label filters Comment-to-Comment out) →
+--   post tags (idx_hastag_start). Each hop in its own WITH (consecutive-reverse-arrow bug).
+--   KNOWS directed (-[:KNOWS]->) per AGE-QUIRKS §11. No HAS_TYPE hop here — adding it would
+--   flip HAS_TAG from Nested Loop + Index Scan to Hash Join (7.8s regression, Phase 7).
+--   personId/replyCount bound in WITH before RETURN per AGE-QUIRKS §5.
+--
+-- Two Cypher call occurrences → JDBC handler writes two ? placeholders and binds the same
+-- agtype JSON to both. Each Cypher block references only its own $paramName.
+--
+-- AGENTS.md §14 compliance: outer SQL touches only the two CTE result sets; no direct reads
+-- of AGE-managed tables (ldbc_snb."Person", ldbc_snb."HAS_TAG", etc.).
 
-WITH RECURSIVE
-valid_classes(class_id) AS (
-    -- Base: resolve root TagClass by name via Cypher
-    SELECT (tc_id::text)::ag_catalog.graphid AS class_id
+WITH valid_tag_ids AS MATERIALIZED (
+    SELECT (tid::text::bigint) AS tag_biz_id
     FROM cypher('$graphName', $$
-        MATCH (tc:TagClass {name: $tagClassName})
-        RETURN id(tc)
-    $$) AS x(tc_id agtype)
-    UNION ALL
-    -- Recursive: walk subclasses via denormalized subclass_of_id
-    SELECT tc.id
-    FROM ldbc_snb."TagClass" tc
-    JOIN valid_classes vc ON tc.subclass_of_id = vc.class_id
+        MATCH (base:TagClass {name: $tagClassName})
+        OPTIONAL MATCH (d1:TagClass)-[:IS_SUBCLASS_OF]->(base)
+        OPTIONAL MATCH (d2:TagClass)-[:IS_SUBCLASS_OF]->(d1)
+        OPTIONAL MATCH (d3:TagClass)-[:IS_SUBCLASS_OF]->(d2)
+        OPTIONAL MATCH (d4:TagClass)-[:IS_SUBCLASS_OF]->(d3)
+        OPTIONAL MATCH (d5:TagClass)-[:IS_SUBCLASS_OF]->(d4)
+        OPTIONAL MATCH (d6:TagClass)-[:IS_SUBCLASS_OF]->(d5)
+        UNWIND [base.id, d1.id, d2.id, d3.id, d4.id, d5.id, d6.id] AS classId
+        WITH classId WHERE classId IS NOT NULL
+        WITH collect(DISTINCT classId) AS validClassIds
+        MATCH (tc:TagClass)
+        WHERE tc.id IN validClassIds
+        WITH tc
+        MATCH (tag:Tag)-[:HAS_TYPE]->(tc)
+        RETURN tag.id AS tid
+    $$) AS x(tid agtype)
 ),
-valid_tags AS MATERIALIZED (
-    SELECT t.id AS tag_id,
-           ag_catalog.agtype_access_operator(VARIADIC ARRAY[t.properties, '"name"'::ag_catalog.agtype]) AS tag_name
-    FROM ldbc_snb."Tag" t
-    JOIN valid_classes vc ON t.tagclass_id = vc.class_id
-),
-friends AS (
-    SELECT friend_vid, friend_id, friend_fn, friend_ln
+traversal AS (
+    SELECT
+        (friend_id::text::bigint)               AS friend_biz_id,
+        friend_fn::text                         AS friend_fn_t,
+        friend_ln::text                         AS friend_ln_t,
+        (comment_gid::text)::ag_catalog.graphid AS comment_gid_s,
+        (tag_id::text::bigint)                  AS tag_biz_id,
+        tag_name::text                          AS tag_name_t
     FROM cypher('$graphName', $$
         MATCH (p:Person {id: $personId})-[:KNOWS]->(friend:Person)
-        RETURN id(friend), friend.id, friend.firstName, friend.lastName
-    $$) AS (friend_vid agtype, friend_id agtype, friend_fn agtype, friend_ln agtype)
+        WITH friend
+        MATCH (friend)<-[:HAS_CREATOR]-(comment:Comment)
+        WITH friend, comment
+        MATCH (comment)-[:REPLY_OF]->(post:Post)
+        WITH friend, comment, post
+        MATCH (post)-[:HAS_TAG]->(tag:Tag)
+        RETURN friend.id, friend.firstName, friend.lastName,
+               id(comment), tag.id, tag.name
+    $$) AS x(
+        friend_id   agtype,
+        friend_fn   agtype,
+        friend_ln   agtype,
+        comment_gid agtype,
+        tag_id      agtype,
+        tag_name    agtype
+    )
 ),
-friend_replies AS (
-    SELECT f.friend_id, f.friend_fn, f.friend_ln,
-           c.id AS comment_id, c.reply_of_id AS post_id
-    FROM friends f
-    JOIN ldbc_snb."Comment" c ON c.creator_id = (f.friend_vid::text)::ag_catalog.graphid
-    JOIN ldbc_snb."Post" p ON p.id = c.reply_of_id
-),
-matched AS (
-    SELECT fr.friend_id, fr.friend_fn, fr.friend_ln,
-           fr.comment_id, vt.tag_name
-    FROM friend_replies fr
-    JOIN ldbc_snb."HAS_TAG" ht ON ht.start_id = fr.post_id
-    JOIN valid_tags vt ON ht.end_id = vt.tag_id
+agg AS (
+    SELECT
+        t.friend_biz_id,
+        t.friend_fn_t,
+        t.friend_ln_t,
+        COUNT(DISTINCT t.comment_gid_s)                                              AS reply_count,
+        '[' || string_agg(DISTINCT '"' || t.tag_name_t || '"', ','
+                          ORDER BY '"' || t.tag_name_t || '"') || ']'               AS tag_names_json
+    FROM traversal t
+    WHERE EXISTS (SELECT 1 FROM valid_tag_ids v WHERE v.tag_biz_id = t.tag_biz_id)
+    GROUP BY t.friend_biz_id, t.friend_fn_t, t.friend_ln_t
+    ORDER BY reply_count DESC, t.friend_biz_id ASC
+    LIMIT 20
 )
 SELECT
-    friend_id AS personId,
-    friend_fn AS personFirstName,
-    friend_ln AS personLastName,
-    ('[' || string_agg(DISTINCT '"' || (tag_name::text) || '"', ', ') || ']')::ag_catalog.agtype AS tagNames,
-    count(DISTINCT comment_id)::text::ag_catalog.agtype AS replyCount
-FROM matched
-GROUP BY friend_id, friend_fn, friend_ln
-ORDER BY count(DISTINCT comment_id) DESC, (friend_id)::text::bigint ASC
-LIMIT 20;
+    friend_biz_id::ag_catalog.agtype                AS personId,
+    ('"' || friend_fn_t || '"')::ag_catalog.agtype  AS personFirstName,
+    ('"' || friend_ln_t || '"')::ag_catalog.agtype  AS personLastName,
+    tag_names_json::ag_catalog.agtype               AS tagNames,
+    reply_count::ag_catalog.agtype                  AS replyCount
+FROM agg
+ORDER BY reply_count DESC, friend_biz_id ASC;

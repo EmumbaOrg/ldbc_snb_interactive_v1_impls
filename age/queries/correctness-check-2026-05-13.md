@@ -44,7 +44,7 @@ Derived by attributing each Incorrect-counter increment to the query that just c
 | Query | Failures | Type | Category |
 |---|---:|---|---|
 | LdbcQuery7 | 135 | complex | Investigation needed (may include attribution noise) |
-| LdbcQuery12 | 132 | complex | Investigation needed (may include attribution noise) |
+| **LdbcQuery12** | **132** | complex | ✅ Fixed + optimized (2026-05-14) — see below |
 | LdbcQuery4 | 105 | complex | Investigation needed (may include attribution noise) |
 | ~~LdbcQuery5~~ | ~~85~~ → **0** | complex | ✅ **Re-validated 2026-05-13** — 0 real failures across all 6,818 IC5 ops + 8,087 IUs on a focused fresh-snapshot run. The 85 was attribution-recipe misalignment. |
 | LdbcQuery11 | 74 | complex | Likely property-extraction / ordering |
@@ -68,7 +68,7 @@ Subtotals:
 ## Headlines
 
 1. **The picture from the LDBC-official reference is much richer than the AGE-self-generated baseline** (46 → 2,207 failures over 10× the op count). The official file caught regressions invisible to AGE-vs-AGE comparison.
-2. **Top offenders are IC7, IC12, IC4** — none of which we've rewritten. They jump to the top of the priority list.
+2. **Top offenders were IC7, IC12, IC4**. IC12 has since been fully fixed and validated (see priority table). IC7 and IC4 remain unaddressed.
 3. ~~**IC5 has 85 failures despite the Phase 3 + side-table rewrite**, contradicting the local-validation-passed claim.~~ **Retracted 2026-05-13**: a focused IC5+IU re-validation run (all 6,818 IC5 ops + 8,087 IUs against a fresh snapshot, `age/datasets/validation_params-sf3-iu+ic5.csv`, properties at `age/driver/validate-local-ic5only.properties`) produced **zero** incorrect results. The 85 figure was an artifact of the off-by-one attribution recipe (see top of "Per-query failure histogram" section). The Phase 3 + side-table rewrite is correct.
 4. **IS3 / IS7 / IC8** failures match the Neo4j-Cypher reference-quirk pattern (duplicate emission from undirected KNOWS or `*0..` REPLY_OF over bidirectional storage). Per AGENTS.md "Validation against LDBC-official reference params" caveat #2, these can't be reproduced without semantic regression and should be documented as known divergences.
 5. **IC13/IC14 are correctly handled** — their failures are intentional and pre-disclosed.
@@ -79,8 +79,8 @@ Original priority (driven by old AGE-self-generated 46-failure baseline) put IC2
 
 | Priority | Query | Failures | Effort estimate | Notes |
 |---|---|---:|---|---|
-| 1 | **IC7** | 135 | Medium | Highest count; not yet investigated (attribution-noise caveat applies) |
-| 2 | **IC12** | 132 | High | Recursive TagClass walk + multiple denorm-column joins (current shape violates directive) |
+| 1 | **IC7** | 135 | Medium | Highest count; not yet investigated |
+| 2 | **IC12** | 132 | ✅ Fixed + validated (2026-05-14) | Correctness bug: `id(tag) IN validTagIds` compared AGE graphids vs LDBC business IDs — always failed. Fixed to `tag.id IN validTagIds`. Then rewritten as H1 Hybrid (two `cypher()` CTEs + outer SQL Hash Join), eliminating the 3.78B-comparison `agtype_in_operator` bottleneck. Spot-check: 100% pass on 200 SF3 cases (incl. 100 non-zero results). Performance: Person/broad 51s→13s, MusicalArtist 18s→8.8s. See `age/ic12-optimization-bottlenecks.md` Phase 8. |
 | 3 | **IC4** | 105 | Low-Medium | Already in parameterized list; diagnose specific shape |
 | ~~4~~ | ~~IC5~~ | ~~85~~ → 0 | — | ✅ Re-validated 2026-05-13: zero failures; no work needed. |
 | 5 | IC11 / IC1 / IC3 | 70-75 each | Mixed | Likely property-extraction / content-trim issues like IC2 had — but check attribution first; some of this may shift after Step 1 re-runs |
