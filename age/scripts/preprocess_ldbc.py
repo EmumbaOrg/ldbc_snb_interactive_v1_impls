@@ -1,9 +1,117 @@
 #!/usr/bin/env python3
+"""
+Preprocess raw LDBC SNB CSVs into a custom load-ready format.
+
+Output format (per vertex/edge file, no header):
+    Vertex:  <orig_id>|"<agtype_properties_csv_escaped>"
+    Edge:    <start_orig>|<end_orig>|<start_label>|<end_label>|"<agtype_properties_csv_escaped>"
+
+The properties field is the pre-built agtype JSON for the row, CSV-escaped
+(internal `"` doubled). The load script can concatenate it directly into a
+COPY line without per-row Python work — `agtype_value`/`build_agtype_props`
+used to live in load-production-data.py and ran for every row at COPY time
+(GIL-bound, ~15-25 min at SF10). Doing the work once here trades preprocess
+CPU for load throughput.
+"""
 
 import argparse
 import csv
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+
+# Properties that MUST be stored as agtype integers, not quoted strings.
+# AGE Cypher compares by type before value, so `MATCH (n {id: 933})` does not
+# match a stored string "933". Mirrors the prior NUMERIC_PROPS in load script.
+NUMERIC_PROPS = frozenset({
+    "id", "creationDate", "joinDate", "birthMonth", "birthDay",
+})
+
+
+def _agtype_value(key, val):
+    """Format a CSV value as the correct agtype literal.
+
+    - Empty / None  → "null" sentinel (caller drops the field).
+    - Numeric props → bare integer (e.g. 933).
+    - JSON arrays   → pass through (e.g. speaks/email semicolon→JSON happened upstream).
+    - Other         → double-quoted string with backslash + control-char escaping.
+    """
+    if val is None or val == "":
+        return "null"
+    if key in NUMERIC_PROPS:
+        try:
+            # epoch-ms values fit in int; float() first handles scientific notation
+            return str(int(float(val)))
+        except (ValueError, TypeError):
+            pass
+    stripped = val.strip()
+    if stripped.startswith("["):
+        # JSON arrays only — never objects (free-text fields can contain {…})
+        try:
+            json.loads(stripped)
+            return stripped
+        except (json.JSONDecodeError, ValueError):
+            pass
+    escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = (
+        escaped
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\x08", "\\b")
+        .replace("\x0c", "\\f")
+    )
+    return f'"{escaped}"'
+
+
+def _build_agtype_props(pairs):
+    """Build an agtype JSON object string from (key, value) pairs.
+
+    Empty / NULL values are omitted (matches the original load-time behaviour
+    that lets IS2/IS4/IC2/IC7/IC9 `coalesce(content, imageFile)` work).
+    """
+    parts = []
+    for k, v in pairs:
+        av = _agtype_value(k, v)
+        if av == "null":
+            continue
+        parts.append(f'"{k}": {av}')
+    return "{" + ", ".join(parts) + "}"
+
+
+def _csv_escape(s):
+    """Escape an agtype string for embedding in CSV double-quotes (`"` → `""`)."""
+    return s.replace('"', '""')
+
+
+def _derive_birthday_fields(row):
+    """Compute birthMonth + birthDay (1-12, 1-31) from Person.birthday (epoch ms).
+
+    UTC matches LDBC reference's `datetime({epochMillis: …}).month`. IC10 filters
+    on these precomputed ints to avoid the date-arithmetic path at query time.
+    """
+    bday_str = row.get("birthday", "")
+    if not bday_str:
+        return
+    try:
+        ts = int(bday_str)
+        dt = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc)
+        row["birthMonth"] = str(dt.month)
+        row["birthDay"] = str(dt.day)
+    except (ValueError, OverflowError):
+        pass
+
+
+def _write_vertex_line(out, orig_id, prop_pairs):
+    """Emit one vertex line: <orig_id>|"<agtype_props_csv_escaped>"\n."""
+    props = _build_agtype_props(prop_pairs)
+    out.write(f'{orig_id}|"{_csv_escape(props)}"\n')
+
+
+def _write_edge_line(out, start_id, end_id, start_label, end_label, prop_pairs):
+    """Emit one edge line with start/end labels for downstream id_map resolution."""
+    props = _build_agtype_props(prop_pairs)
+    out.write(f'{start_id}|{end_id}|{start_label}|{end_label}|"{_csv_escape(props)}"\n')
 
 
 def _semicolon_to_json_array(v):
@@ -179,14 +287,16 @@ def find_source_files(dataset_dir, subdir, base_name):
 # Streaming writers — never accumulate full datasets in memory
 # ---------------------------------------------------------------------------
 
-def stream_vertex_csv(path, dataset_dir, subdir, source_name, column_transforms=None):
-    """Stream vertex rows directly to CSV without in-memory accumulation.
-    column_transforms: {raw_col: (output_col, transform_fn)} — rename and/or transform columns.
+def stream_vertex_csv(path, dataset_dir, subdir, source_name, column_transforms=None, is_person=False):
+    """Stream vertex rows to the load-ready format.
+
+    column_transforms: {raw_col: (output_col, transform_fn)} — rename and/or
+    transform columns before agtype property construction.
+    is_person: if True, derives birthMonth/birthDay from birthday and includes them.
     Returns the list of property column names (headers minus 'id')."""
     path.parent.mkdir(parents=True, exist_ok=True)
     headers_out = None
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+    with open(path, "w", encoding="utf-8") as f:
         for file_path in find_source_files(dataset_dir, subdir, source_name):
             for headers, values in read_ldbc_csv(file_path):
                 if headers_out is None:
@@ -196,33 +306,41 @@ def stream_vertex_csv(path, dataset_dir, subdir, source_name, column_transforms=
                             for h in headers
                         ]
                     else:
-                        headers_out = headers
-                    writer.writerow(headers_out)
+                        headers_out = list(headers)
+                    if is_person:
+                        headers_out.extend(["birthMonth", "birthDay"])
                 if column_transforms:
-                    row = [
+                    transformed_values = [
                         column_transforms[h][1](v) if h in column_transforms else v
                         for h, v in zip(headers, values)
                     ]
-                    writer.writerow(row)
                 else:
-                    writer.writerow(values)
+                    transformed_values = list(values)
+                row = dict(zip(headers_out, transformed_values))
+                if is_person:
+                    _derive_birthday_fields(row)
+                orig_id = row.get("id", "")
+                # Include `id` in the agtype properties so AGE's
+                # MATCH (n:Label {id: X}) compiles to a `properties @> {"id": X}`
+                # containment that actually hits a row. orig_id is also written
+                # as the line prefix so the loader can populate id_map without
+                # re-parsing the agtype payload.
+                prop_pairs = [(k, row.get(k, "")) for k in headers_out]
+                _write_vertex_line(f, orig_id, prop_pairs)
     return [h for h in (headers_out or []) if h != "id"]
 
 
 def stream_place_vertex_csvs(vertex_dir, dataset_dir):
-    """Stream City/Country/Continent vertex CSVs and build place_types/place_names lookups.
+    """Stream City/Country/Continent vertex files in load-ready format.
     Returns (vertex_files_dict, place_types, place_names).
     place_types and place_names are small (<2K entries at any SF) — kept in memory."""
     place_types = {}
     place_names = {}
     handles = {}
-    writers = {}
     for label in ("City", "Country", "Continent"):
         path = vertex_dir / f"{label}.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
-        handles[label] = open(path, "w", newline="", encoding="utf-8")
-        writers[label] = csv.writer(handles[label], quoting=csv.QUOTE_ALL)
-        writers[label].writerow(["id", "name", "url"])
+        handles[label] = open(path, "w", encoding="utf-8")
 
     for file_path in find_source_files(dataset_dir, "static", "place"):
         for headers, values in read_ldbc_csv(file_path):
@@ -234,7 +352,11 @@ def stream_place_vertex_csvs(vertex_dir, dataset_dir):
                 continue
             place_types[record["id"]] = label
             place_names[record["id"]] = record["name"]
-            writers[label].writerow([record["id"], record["name"], record["url"]])
+            _write_vertex_line(
+                handles[label],
+                record["id"],
+                [("id", record["id"]), ("name", record["name"]), ("url", record["url"])],
+            )
 
     for h in handles.values():
         h.close()
@@ -251,7 +373,7 @@ def stream_place_vertex_csvs(vertex_dir, dataset_dir):
 
 
 def stream_organisation_vertex_csvs(vertex_dir, dataset_dir, place_names):
-    """Stream Company/University vertex CSVs and build organisation_types lookup.
+    """Stream Company/University vertex files in load-ready format.
     Returns (vertex_files_dict, organisation_types).
     organisation_types is small (<10K entries) — kept in memory."""
     org_locations = {}
@@ -260,28 +382,29 @@ def stream_organisation_vertex_csvs(vertex_dir, dataset_dir, place_names):
             org_locations[values[0]] = values[1]
 
     organisation_types = {}
-    headers_out = ["id", "name", "url", "placeId", "placeName"]
     company_path = vertex_dir / "Company.csv"
     university_path = vertex_dir / "University.csv"
 
-    with open(company_path, "w", newline="", encoding="utf-8") as cf, \
-         open(university_path, "w", newline="", encoding="utf-8") as uf:
-        cw = csv.writer(cf, quoting=csv.QUOTE_ALL)
-        uw = csv.writer(uf, quoting=csv.QUOTE_ALL)
-        cw.writerow(headers_out)
-        uw.writerow(headers_out)
+    with open(company_path, "w", encoding="utf-8") as cf, \
+         open(university_path, "w", encoding="utf-8") as uf:
         for file_path in find_source_files(dataset_dir, "static", "organisation"):
             for headers, values in read_ldbc_csv(file_path):
                 record = dict(zip(headers, values))
                 otype = record["type"].strip().lower()
                 place_id = org_locations.get(record["id"], "")
                 place_name = place_names.get(place_id, "")
-                row = [record["id"], record["name"], record["url"], place_id, place_name]
+                prop_pairs = [
+                    ("id", record["id"]),
+                    ("name", record["name"]),
+                    ("url", record["url"]),
+                    ("placeId", place_id),
+                    ("placeName", place_name),
+                ]
                 if otype == "company":
-                    cw.writerow(row)
+                    _write_vertex_line(cf, record["id"], prop_pairs)
                     organisation_types[record["id"]] = "Company"
                 elif otype == "university":
-                    uw.writerow(row)
+                    _write_vertex_line(uf, record["id"], prop_pairs)
                     organisation_types[record["id"]] = "University"
 
     org_props = ["name", "url", "placeId", "placeName"]
@@ -302,8 +425,9 @@ def resolve_organisation_edge(source_name, end_id, organisation_types):
 
 
 def stream_edge_csv(path, edge_spec, dataset_dir, place_types, organisation_types):
-    """Stream edge rows directly to CSV. For bidirectional edges (KNOWS), emits both
-    A→B and B→A from each source row. Returns list of property column names."""
+    """Stream edge rows in load-ready format. For bidirectional edges (KNOWS),
+    emits both A→B and B→A from each source row. Returns list of property
+    column names (informational for the agefreighter_config.json)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     bidirectional = edge_spec.get("bidirectional", False)
 
@@ -320,19 +444,13 @@ def stream_edge_csv(path, edge_spec, dataset_dir, place_types, organisation_type
             break  # only need headers from first file of each source
         break  # only need one source to determine prop_headers
 
-    output_headers = ["id", "start_id", "end_id", "start_vertex_type", "end_vertex_type", *prop_headers]
-    edge_id = 1
-
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-        writer.writerow(output_headers)
-
+    with open(path, "w", encoding="utf-8") as f:
         for source in edge_spec["sources"]:
             for file_path in find_source_files(dataset_dir, source["subdir"], source["name"]):
                 for headers, values in read_ldbc_csv(file_path):
                     start_id = values[0]
                     end_id = values[1]
-                    props = values[2:]
+                    prop_pairs = list(zip(headers[2:], values[2:]))
 
                     if source.get("resolver") == "is_located_in":
                         start_label, end_label = IS_LOCATED_IN_ROUTING[source["name"]]
@@ -355,12 +473,9 @@ def stream_edge_csv(path, edge_spec, dataset_dir, place_types, organisation_type
                         start_label = source["start"]
                         end_label = source["end"]
 
-                    writer.writerow([str(edge_id), start_id, end_id, start_label, end_label, *props])
-                    edge_id += 1
-
+                    _write_edge_line(f, start_id, end_id, start_label, end_label, prop_pairs)
                     if bidirectional:
-                        writer.writerow([str(edge_id), end_id, start_id, end_label, start_label, *props])
-                        edge_id += 1
+                        _write_edge_line(f, end_id, start_id, end_label, start_label, prop_pairs)
 
     return prop_headers
 
@@ -443,7 +558,8 @@ def main():
     for spec in VERTEX_SPECS:
         file_path = vertex_dir / f"{spec['label']}.csv"
         transforms = PERSON_COLUMN_TRANSFORMS if spec["label"] == "Person" else None
-        props = stream_vertex_csv(file_path, dataset_dir, spec["subdir"], spec["source"], transforms)
+        is_person = spec["label"] == "Person"
+        props = stream_vertex_csv(file_path, dataset_dir, spec["subdir"], spec["source"], transforms, is_person=is_person)
         vertex_files[spec["label"]] = {
             "csv_path": str(file_path),
             "id": "id",
