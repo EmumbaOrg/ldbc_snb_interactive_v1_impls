@@ -117,18 +117,18 @@ This section is the AI agent's lookup for what Cypher constructs AGE 1.6 actuall
 
 | Construct | Example | Test reference |
 |---|---|---|
-| `CALL fn(args) YIELD col` | `CALL sqrt(64) YIELD sqrt` | `cypher_call.out:62` |
-| `CALL` after `MATCH`/`WITH`, chained with `RETURN` | `MATCH (a) CALL sqrt(64) YIELD sqrt RETURN a, sqrt` | `cypher_call.out:135` |
-| PG function returning scalar `agtype`, called as an expression | `WHERE e.year < public.get_event_year(e.name)` | [`sql_in_cypher.html`](https://age.apache.org/age-manual/master/advanced/sql_in_cypher.html); `cypher_call.out:42` |
-| Schema-qualified function call | `public.fn(...)` (in CALL or expression) | `cypher_call.out:72` |
-| `UNWIND list_expr AS x` | `UNWIND [1,2,3] AS i` / `UNWIND row.col AS i` | `cypher_unwind.out:55,68` |
-| `range(start, end[, step])` | `RETURN range(0, 10)` and `range(1, 30, 2)` | `expr.out:7818+`, `list_comprehension.out:46` |
+| `CALL fn(args) YIELD col` | `CALL sqrt(64) YIELD sqrt` | `cypher_call.out:60` |
+| `CALL` after `MATCH`/`WITH`, chained with `RETURN` (YIELD mandatory) | `MATCH (a) CALL sqrt(64) YIELD sqrt RETURN a, sqrt` | `cypher_call.out:135` (no-YIELD form errors at `:130`) |
+| PG function returning scalar `agtype`, called as an expression | `WHERE e.year < public.get_event_year(e.name)` | [`sql_in_cypher.html`](https://age.apache.org/age-manual/master/advanced/sql_in_cypher.html); function defined at `cypher_call.out:39-43` (uses schema `call_stmt_test`, manual example uses `public`) |
+| Schema-qualified function call | `call_stmt_test.add_agtype(1,2)` (regression test) or `public.fn(...)` (manual) | `cypher_call.out:72` |
+| `UNWIND list_expr AS x` | `UNWIND [1,2,3] AS i` / `WITH n.a AS a UNWIND a AS i` | `cypher_unwind.out:55,68` |
+| `range(start, end[, step])` | `RETURN range(0, 10)`, `range(0, 10, 1)`, `range(1, 30, 2)` | `expr.out:7818,7830`; `list_comprehension.out:46` |
 | List comprehensions | `[x IN list WHERE pred \| expr]` | `list_comprehension.out:46–94` |
-| List slicing | `list[..5]`, `list[1..3]` | `list_comprehension.out` |
-| Map projection | `n {.firstName, .lastName, age: 30}` | `map_projection.out:96–103` |
-| `EXISTS { pattern }` and `EXISTS { MATCH … WHERE … RETURN … }` (incl. nested, `UNION` inside) | `WHERE EXISTS {(a)-[]->(:pet)}` | `cypher_subquery.out:36+` |
-| `COUNT { pattern }` | `WITH COUNT {(a)-[]-()} AS c` | `cypher_subquery.out` |
-| Variable-length paths with *inline-map equality* on edges | `MATCH (u:a)-[:e* {name:"main edge"}]-(v:b)` | `cypher_vle.out:233` |
+| List slicing | `list[1..4]`, `list[0..]`, `list[..11]` | `list_comprehension.out:58`; `expr.out:375,382` |
+| Map projection | `map { .firstName, .lastName, age: 30, .* }` | `map_projection.out:96,103–110` |
+| `EXISTS { pattern }` and `EXISTS { MATCH … WHERE … RETURN … }` (incl. nested, `UNION` inside) | `WHERE EXISTS {(a:person)-[]->(:pet)}` | `cypher_subquery.out:41` (pattern), `:63` (MATCH/RETURN), `:111,:129,:155` (UNION inside), `:164–166` (nested) |
+| `COUNT { pattern }` | `WHERE COUNT {(a:person)} > 1` | `cypher_subquery.out:323,331,365` |
+| Variable-length paths with *inline-map equality* on edges | `MATCH (u:begin)-[:edge* {name:"main edge"}]-(v:end)` | `cypher_vle.out:233` |
 | Aggregates | `count, collect, min, max, sum, avg, stDev, stDevP, percentileCont, percentileDisc, agtype_larger, agtype_smaller` | `agtype.c` symbol list |
 | List/element accessors | `head`, `last`, `tail`, `size`, `reverse`, `range`, `nodes`, `relationships`, `keys`, `properties`, `labels`, `label`, `type`, `id`, `start_id`, `end_id`, `startnode`, `endnode`, `length` | `agtype.c` symbol list |
 | String functions | `substring, replace, split, toLower, toUpper, ltrim, rtrim, trim, left, right, reverse` | `agtype.c` symbol list |
@@ -141,19 +141,22 @@ This section is the AI agent's lookup for what Cypher constructs AGE 1.6 actuall
 |---|---|
 | `reduce(acc = init, x IN list \| expr)` accumulator | Not in `PG_FUNCTION_INFO_V1` symbol list; zero regression tests |
 | `collect(x ORDER BY y DESC)` aggregate-input ordering | No regression test; aggregate has no order-input variant |
-| Per-arm `ORDER BY … LIMIT` inside `UNION` | Empirical: Horizon SF10 test 2026-05-14 raised `could not find rte for cd` |
-| Comparison operators inside inline edge property map (`-[:R {cd < $X}]-`) | Equality-only; comparators must move to post-MATCH `WHERE` (no early rejection during walk) |
-| `CALL { subquery }` block form | Grammar reserves `{ }` blocks for `EXISTS {}` / `COUNT {}` only |
+| Per-arm `ORDER BY … LIMIT` inside `UNION` | Two paths fail. Parser-level: subquery UNION without RETURN errors at `cypher_subquery.out:146` (`Subquery UNION without returns not yet implemented`). Empirical: our 2026-05-14 Horizon SF10 IC9 Variant-B test errored on per-arm `ORDER BY cd DESC, mid ASC LIMIT 20` with `could not find rte for cd` (`age/results/ic9-cypher-only-horizon-sf10.txt`). Treat per-arm ORDER+LIMIT inside UNION as broken in 1.6. |
+| Comparison operators inside inline edge property map (`-[:R {cd < $X}]-`) | Equality-only. Grammar `cypher_gram.y:2114` defines `map_keyval_list` as `property_key_name ':' expr` (no comparator production). Comparators must move to post-MATCH `WHERE` — which means no early rejection during walk. |
+| `CALL { subquery }` block form | Verified absent in grammar (`cypher_gram.y:388–480`): `call_stmt` accepts only `CALL expr_func_norm [YIELD …]` or `CALL expr '.' expr [YIELD …]`. The `'{' subquery_stmt '}'` production appears only under `EXISTS` (line 1955) and `COUNT` (line 1974). |
 | `SET RETURNING` functions in Cypher expressions | Per `sql_in_cypher.html`: *"Void and Scalar-Value functions only. Set returning functions are not currently supported."* |
 | `EXPLAIN` / `PROFILE` as Cypher statements | Use PG `EXPLAIN (ANALYZE) SELECT * FROM cypher(...)` instead |
 | `USING INDEX` / `USING JOIN ON` hints | Not exposed |
 | `USING PERIODIC COMMIT` | Not in grammar |
 | `apoc.*` or any top-K / heap / priority-queue builtin | None |
-| `shortestPath()`, `allShortestPaths()` | IC13/IC14 return constants (see deviations table below) |
+| `shortestPath()`, `allShortestPaths()` | Codebase has a stub enum `CSP_FINDPATH /* shortestpath, allshortestpaths, dijkstra */` at `src/include/nodes/cypher_nodes.h:30`, but no grammar production, no built-in, no regression test. IC13/IC14 return constants (see deviations table below). |
 
 ### Structural performance limits to design around
 
-These are the rules every plan should account for *before* committing to a shape:
+These limits are empirical — they come from our IC9 Phase A and Horizon SF10
+experiments (see `age/results/ic9-explain-*.txt`) plus the grammar/source
+behavior in the 1.6 tag, not directly from regression test assertions. Each
+is the rule a plan should account for *before* committing to a shape:
 
 1. **No LIMIT pushdown.** `MATCH … RETURN … ORDER BY x DESC LIMIT N` materializes the full row set before the sort. Per-creator scans that yield thousands of rows for top-10 will scan all of them. There is no Cypher rewrite that fixes this in 1.6.
 2. **Functional B-tree indexes on extracted property values do NOT bind from Cypher** (AGE issue [#1000](https://github.com/apache/age/issues/1000)). AGE wraps the vertex in `_agtype_build_vertex(...)` before the property accessor, so the indexed expression never matches. Only `gin_<label>` containment lookups via `properties @> '{"id": X}'::agtype` bind reliably.
