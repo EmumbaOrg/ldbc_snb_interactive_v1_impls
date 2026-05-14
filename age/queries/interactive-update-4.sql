@@ -1,17 +1,26 @@
--- LdbcUpdate4AddForum — create a Forum vertex with HAS_MODERATOR + HAS_TAG edges.
--- Hybrid: original Cypher block creates the graph state; a second Cypher
--- lookup yields the new Forum's graphid which the outer INSERT mirrors into
--- ForumSide so IC5 can read forum titles without touching the AGE Forum table.
+-- LdbcUpdate4AddForum — create a Forum vertex with HAS_MODERATOR + HAS_TAG edges,
+-- and mirror its identity/title into the ForumSide side table for IC5.
 --
--- Three statements:
---   1. Cypher: create Forum + HAS_MODERATOR + HAS_TAGs (unchanged from before).
---   2. INSERT into ForumSide using a second Cypher MATCH to recover id(f)
---      after the create. (Doing this via an INSERT...SELECT FROM the same
---      Cypher block fails when $tagIds is empty: the UNWIND folds away the
---      row that would have carried id(f) into the SELECT.)
---   3. Legacy moderator_id denorm on the AGE Forum table. This itself
---      violates the directive and is tracked for separate migration to a
---      side-table approach (audit 2026-05-13).
+-- AGENTS.md §14 compliance: outer SQL only touches the non-AGE side table
+-- ForumSide. All graph mutations and AGE-table reads happen inside Cypher.
+--
+-- Two Cypher calls:
+--   1. CREATE the Forum + HAS_MODERATOR + HAS_TAG edges.
+--   2. MATCH the just-created Forum to recover id(f), business_id, and title.
+--      Cannot be merged with call 1: when $tagIds is empty the UNWIND folds
+--      away the row carrying f forward into RETURN, leaving no row to feed
+--      the INSERT. Two-step is the established AGE workaround.
+--
+-- The title is pulled out of the Forum vertex via the second Cypher call
+-- rather than via SQL substitution of $forumTitle. The driver's convertString
+-- emits Cypher-style backslash escaping ('O\'Brien''s club') which is correct
+-- inside the Cypher CREATE but invalid in a SQL VALUES clause — any title
+-- containing an apostrophe would have broken the SQL parse. The Cypher path
+-- handles escaping correctly.
+--
+-- The legacy Forum.moderator_id denorm UPDATE has been removed: nothing reads
+-- that column (only IU4 wrote it). Reintroducing moderator on the read path
+-- should add it to ForumSide rather than writing back to the AGE label table.
 
 SELECT * FROM cypher('$graphName', $$
   MATCH (mod:Person {id: $moderatorPersonId})
@@ -24,16 +33,12 @@ SELECT * FROM cypher('$graphName', $$
 $$) AS (result agtype);
 
 INSERT INTO ldbc_snb."ForumSide" (forum_id, forum_business_id, title)
-SELECT (forum_gid::text)::ag_catalog.graphid,
-       $forumId,
-       $forumTitle::text
+SELECT
+  (forum_gid::text)::ag_catalog.graphid,
+  (biz_id::text)::bigint,
+  title_agt::text
 FROM cypher('$graphName', $$
   MATCH (f:Forum {id: $forumId})
-  RETURN id(f) AS forum_gid
-$$) AS (forum_gid agtype)
+  RETURN id(f) AS forum_gid, f.id AS biz_id, f.title AS title_agt
+$$) AS (forum_gid agtype, biz_id agtype, title_agt agtype)
 ON CONFLICT (forum_id) DO NOTHING;
-
-UPDATE ldbc_snb."Forum" f
-   SET moderator_id = (SELECT end_id FROM ldbc_snb."HAS_MODERATOR" WHERE start_id = f.id LIMIT 1)
- WHERE CAST(ag_catalog.agtype_object_field_text(f.properties, 'id') AS bigint) = $forumId
-;

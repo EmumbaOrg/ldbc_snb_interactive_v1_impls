@@ -151,7 +151,7 @@ on subsequent writes by the IU operations listed. All columns are of type
 
 | Column | Source edge | Maintained by |
 |---|---|---|
-| `moderator_id` | `HAS_MODERATOR`.end_id | IU4 (SQL UPDATE) |
+| `moderator_id` | `HAS_MODERATOR`.end_id | **retired 2026-05-14** — no read query referenced it; IU4 no longer writes it. Existing column + index remain (AGE 1.6 blocks `ALTER TABLE` on label tables) but values for new Forums are NULL. Reintroduce as a `ForumSide.moderator_id` column if a read query ever needs it. |
 
 ### `ldbc_snb."Person"`
 
