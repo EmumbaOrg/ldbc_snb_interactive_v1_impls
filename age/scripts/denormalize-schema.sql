@@ -27,14 +27,18 @@ SET search_path = ldbc_snb, ag_catalog, public;
 -- 1. Add denormalised graphid columns to entity tables
 -- =========================================================================
 
--- Post: HAS_CREATOR + CONTAINER_OF + IS_LOCATED_IN denorms
+-- Post: HAS_CREATOR denorm only. forum_id retired 2026-05-14 (IU6 now sources
+-- forum/author gids directly from Cypher RETURN; no external reader).
+-- country_id retired 2026-05-14 (no read consumer).
 ALTER TABLE "Post"     ADD COLUMN IF NOT EXISTS creator_id    ag_catalog.graphid;
-ALTER TABLE "Post"     ADD COLUMN IF NOT EXISTS forum_id      ag_catalog.graphid;
 ALTER TABLE "Post"     ADD COLUMN IF NOT EXISTS country_id    ag_catalog.graphid;
 
--- Comment: HAS_CREATOR + REPLY_OF + IS_LOCATED_IN denorms
-ALTER TABLE "Comment"  ADD COLUMN IF NOT EXISTS creator_id    ag_catalog.graphid;
-ALTER TABLE "Comment"  ADD COLUMN IF NOT EXISTS reply_of_id   ag_catalog.graphid;
+-- Comment: IS_LOCATED_IN denorm only.
+-- creator_id and reply_of_id retired 2026-05-14: IC12 was migrated to a
+-- Cypher-hybrid that traverses graph edges directly; IS2 uses CommentRootPost;
+-- backfill rewritten to traverse REPLY_OF directly. IU7 no longer writes them.
+-- Columns remain on disk as NULL (AGE 1.6 blocks ALTER TABLE DROP COLUMN on
+-- label tables). Indexes dropped by migration 2026-05-14-retire-comment-creator-replyof.sql.
 ALTER TABLE "Comment"  ADD COLUMN IF NOT EXISTS country_id    ag_catalog.graphid;
 
 -- Forum: HAS_MODERATOR denorm
@@ -70,28 +74,14 @@ UPDATE "Post" p
  WHERE hc.start_id = p.id
    AND p.creator_id IS NULL;
 
--- Post.forum_id ← CONTAINER_OF (Forum → Post; need inverse)
-UPDATE "Post" p
-   SET forum_id = co.start_id
-  FROM "CONTAINER_OF" co
- WHERE co.end_id = p.id
-   AND p.forum_id IS NULL;
-
+-- Post.forum_id retired 2026-05-14: IU6 now sources forum/author gids from
+-- Cypher RETURN; no external reader existed.
 -- Post.country_id retired 2026-05-14: no read consumers.
 
--- Comment.creator_id ← HAS_CREATOR (Comment → Person)
-UPDATE "Comment" c
-   SET creator_id = hc.end_id
-  FROM "HAS_CREATOR" hc
- WHERE hc.start_id = c.id
-   AND c.creator_id IS NULL;
-
--- Comment.reply_of_id ← REPLY_OF (Comment → Post|Comment)
-UPDATE "Comment" c
-   SET reply_of_id = ro.end_id
-  FROM "REPLY_OF" ro
- WHERE ro.start_id = c.id
-   AND c.reply_of_id IS NULL;
+-- Comment.creator_id and Comment.reply_of_id retired 2026-05-14: no read
+-- consumers remain. UPDATE statements removed; columns stay on disk as NULL
+-- (AGE 1.6 blocks DROP COLUMN on label tables). Indexes dropped by migration
+-- 2026-05-14-retire-comment-creator-replyof.sql.
 
 -- Comment.country_id, Forum.moderator_id, Person.city_id retired 2026-05-14:
 -- no read consumers. Comment.country_id alone took ~10 min at SF3 on the
@@ -124,11 +114,12 @@ UPDATE "TagClass" tc
 -- message_forumid + message_replyof + forum_moderatorid).
 
 -- Post / Comment indexes on live denorm columns.
-CREATE INDEX IF NOT EXISTS idx_post_creator_id    ON "Post" (creator_id);
-CREATE INDEX IF NOT EXISTS idx_post_forum_id      ON "Post" (forum_id);
-CREATE INDEX IF NOT EXISTS idx_post_forum_creator ON "Post" (forum_id, creator_id);  -- IC5 LEFT JOIN
-CREATE INDEX IF NOT EXISTS idx_comment_creator_id  ON "Comment" (creator_id);
-CREATE INDEX IF NOT EXISTS idx_comment_reply_of_id ON "Comment" (reply_of_id);
+-- idx_post_forum_id and idx_post_forum_creator retired 2026-05-14:
+-- Post.forum_id column is retired; those indexes have no consumers.
+-- idx_comment_creator_id and idx_comment_reply_of_id retired 2026-05-14:
+-- Comment.creator_id and reply_of_id have no remaining read consumers.
+-- Dropped by migration 2026-05-14-retire-comment-creator-replyof.sql.
+CREATE INDEX IF NOT EXISTS idx_post_creator_id     ON "Post" (creator_id);
 
 -- Tag hierarchy indexes (live — IC12 reads both).
 CREATE INDEX IF NOT EXISTS idx_tag_tagclass_id         ON "Tag" (tagclass_id);
@@ -223,8 +214,9 @@ CREATE TABLE IF NOT EXISTS "ForumSide" (
 -- 2026-05-14: added comment_business_id column with a unique index, so IS2
 -- can look up a Comment's root post by its LDBC bigint id without joining
 -- the AGE Comment label table. The original comment_id (graphid) PK remains
--- so the iterative backfill loop can keep using graphid-keyed joins against
--- Comment.reply_of_id during deploy.
+-- so the iterative backfill loop can join against the REPLY_OF edge table
+-- (Comment.reply_of_id was retired 2026-05-14; backfill now traverses
+-- the REPLY_OF edge table directly).
 CREATE TABLE IF NOT EXISTS "CommentRootPost" (
   comment_id            ag_catalog.graphid PRIMARY KEY,
   comment_business_id   bigint             NOT NULL,
@@ -325,11 +317,14 @@ ON CONFLICT (forum_id) DO NOTHING;
 -- Backfill via iterative depth-bounded INSERTs instead of a WITH RECURSIVE
 -- CTE: each iteration adds the Comments whose immediate parent already has
 -- a known root, and the loop exits when an iteration adds zero rows. Each
--- pass is a single indexed join (CommentRootPost.comment_id PK ⋈ Comment.
--- reply_of_id), which is much cheaper than the recursive CTE's repeated
+-- pass is a single indexed join (CommentRootPost.comment_id PK ⋈ REPLY_OF
+-- edge table), which is much cheaper than the recursive CTE's repeated
 -- materialization of intermediate chain rows. At SF10 with ~10-deep reply
 -- chains, the loop converges in 10-15 passes and runs ~3x faster than the
 -- recursive form.
+--
+-- Comment.reply_of_id retired 2026-05-14 — backfill now traverses the
+-- REPLY_OF edge table directly (no dependency on the retired denorm column).
 --
 -- Seed: every Comment whose direct parent is a Post.
 INSERT INTO "CommentRootPost" (comment_id, comment_business_id, root_post_business_id)
@@ -337,7 +332,8 @@ SELECT c.id,
        CAST(ag_catalog.agtype_object_field_text(c.properties, 'id') AS bigint),
        CAST(ag_catalog.agtype_object_field_text(p.properties, 'id') AS bigint)
 FROM "Comment" c
-JOIN "Post" p ON p.id = c.reply_of_id
+JOIN "REPLY_OF" r ON r.start_id = c.id
+JOIN "Post"     p ON p.id = r.end_id
 ON CONFLICT (comment_id) DO NOTHING;
 
 -- Walk upward through the chain in layers, one chain-depth per iteration.
@@ -352,12 +348,12 @@ BEGIN
            CAST(ag_catalog.agtype_object_field_text(c.properties, 'id') AS bigint),
            parent.root_post_business_id
     FROM "Comment" c
-    JOIN "CommentRootPost" parent ON parent.comment_id = c.reply_of_id
-    WHERE c.reply_of_id IS NOT NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM "CommentRootPost" existing
-        WHERE existing.comment_id = c.id
-      );
+    JOIN "REPLY_OF" r ON r.start_id = c.id
+    JOIN "CommentRootPost" parent ON parent.comment_id = r.end_id
+    WHERE NOT EXISTS (
+      SELECT 1 FROM "CommentRootPost" existing
+       WHERE existing.comment_id = c.id
+    );
     GET DIAGNOSTICS added = ROW_COUNT;
     EXIT WHEN added = 0;
     depth := depth + 1;
@@ -365,13 +361,16 @@ BEGIN
   RAISE NOTICE 'CommentRootPost: converged after % chain layers', depth;
 END $$;
 
--- ForumMemberPostCount: aggregate from already-denormalised Post columns.
--- ON CONFLICT DO NOTHING makes this idempotent (re-runs don't double-count).
+-- ForumMemberPostCount: aggregate Posts per (forum, creator) pair.
+-- Post.forum_id retired 2026-05-14; source the forum graphid directly from
+-- the CONTAINER_OF edge table (start_id = forum, end_id = post) joined to
+-- Post.creator_id. ON CONFLICT DO NOTHING makes this idempotent.
 INSERT INTO "ForumMemberPostCount" (forum_id, member_id, post_count)
-SELECT forum_id, creator_id, COUNT(*)::int
-FROM "Post"
-WHERE forum_id IS NOT NULL AND creator_id IS NOT NULL
-GROUP BY forum_id, creator_id
+SELECT co.start_id, p.creator_id, COUNT(*)::int
+FROM "Post" p
+JOIN "CONTAINER_OF" co ON co.end_id = p.id
+WHERE p.creator_id IS NOT NULL
+GROUP BY co.start_id, p.creator_id
 ON CONFLICT (forum_id, member_id) DO NOTHING;
 
 -- PersonPostCount: aggregate from Post.creator_id. Pre-populate every
@@ -401,9 +400,9 @@ SELECT
 FROM "Person"
 ON CONFLICT (person_business_id) DO NOTHING;
 
--- MessageByCreator: mirror Comment + Post creator_id with date/content. Both
--- legs use the already-populated creator_id graphid denorm column on the
--- vertex table; join to Person to extract the LDBC business id.
+-- MessageByCreator: mirror Comment + Post with creator, date, and content.
+-- Comment leg: Comment.creator_id retired 2026-05-14 — traverse HAS_CREATOR
+-- directly. Post leg: Post.creator_id still live (read by IC10).
 INSERT INTO "MessageByCreator" (creator_business_id, message_business_id, creation_date, content, is_post)
 SELECT
   CAST(ag_catalog.agtype_object_field_text(per.properties, 'id') AS bigint),
@@ -412,7 +411,8 @@ SELECT
   ag_catalog.agtype_object_field_text(msg.properties, 'content'),
   false
 FROM "Comment" msg
-JOIN "Person" per ON per.id = msg.creator_id
+JOIN "HAS_CREATOR" hc ON hc.start_id = msg.id
+JOIN "Person"      per ON per.id = hc.end_id
 UNION ALL
 SELECT
   CAST(ag_catalog.agtype_object_field_text(per.properties, 'id') AS bigint),

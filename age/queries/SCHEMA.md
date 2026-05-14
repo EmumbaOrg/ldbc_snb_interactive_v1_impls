@@ -135,16 +135,16 @@ on subsequent writes by the IU operations listed. All columns are of type
 
 | Column | Source edge | Maintained by |
 |---|---|---|
-| `creator_id` | `HAS_CREATOR`.end_id | IU6 (SQL UPDATE) — read by IC10 + IU6's own FMPC aggregate |
-| `forum_id` | `CONTAINER_OF`.start_id (inverse) | IU6 (SQL UPDATE) — internal to IU6's FMPC aggregate |
+| `creator_id` | `HAS_CREATOR`.end_id | IU6 (SQL UPDATE) — read by IC10 |
+| ~~`forum_id`~~ | ~~`CONTAINER_OF`.start_id (inverse)~~ | **retired 2026-05-14** — IU6 now sources forum/author gids from Cypher RETURN; no external reader. UPDATE removed from IU6; column + indexes dropped by migration `2026-05-14-drop-post-forum-id.sql`. |
 | ~~`country_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no read consumer. UPDATE removed from IU6 and `denormalize-schema.sql`; column + index remain (AGE 1.6 ALTER limit). |
 
 ### `ldbc_snb."Comment"`
 
 | Column | Source edge | Maintained by |
 |---|---|---|
-| `creator_id` | `HAS_CREATOR`.end_id | IU7 (SQL UPDATE) — read by IC12 |
-| `reply_of_id` | `REPLY_OF`.end_id | IU7 (SQL UPDATE) — read by IC12 + IS2 + CommentRootPost upkeep |
+| ~~`creator_id`~~ | ~~`HAS_CREATOR`.end_id~~ | **retired 2026-05-14** — IC12 was migrated to a Cypher-hybrid traversing `(friend)<-[:HAS_CREATOR]-(comment)-[:REPLY_OF]->(post)` directly; no remaining runtime reader. IU7 no longer writes it. Indexes dropped by migration `2026-05-14-retire-comment-creator-replyof.sql`; column stays on disk as NULL (AGE 1.6 ALTER limit). |
+| ~~`reply_of_id`~~ | ~~`REPLY_OF`.end_id~~ | **retired 2026-05-14** — IC12 migration removed the last runtime reader. IS2 uses `CommentRootPost`; `denormalize-schema.sql` backfill rewritten to traverse `REPLY_OF` directly. IU7 no longer writes it. Indexes dropped by migration `2026-05-14-retire-comment-creator-replyof.sql`; column stays on disk as NULL (AGE 1.6 ALTER limit). |
 | ~~`country_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no read consumer. UPDATE removed from IU7 and `denormalize-schema.sql` (was the slowest deploy-time UPDATE at SF3 → ~10 min saved at SF10+). |
 
 ### `ldbc_snb."Forum"`
@@ -196,8 +196,8 @@ each top-20 row.
 
 | Table | Column | Source | Status |
 |---|---|---|---|
-| `Tag` | `tagclass_id` | `HAS_TYPE`.end_id | active — read by IC12 |
-| `TagClass` | `subclass_of_id` | `IS_SUBCLASS_OF`.end_id | active — read by IC12 |
+| `Tag` | `tagclass_id` | `HAS_TYPE`.end_id | active — IC12 now traverses `HAS_TYPE` via Cypher; column may be read by future queries |
+| `TagClass` | `subclass_of_id` | `IS_SUBCLASS_OF`.end_id | active — IC12 now traverses `IS_SUBCLASS_OF` via Cypher; column may be read by future queries |
 | ~~`City`~~ | ~~`country_id`~~ | ~~`IS_PART_OF`.end_id~~ | **retired 2026-05-14** — no consumer |
 | ~~`Country`~~ | ~~`continent_id`~~ | ~~`IS_PART_OF`.end_id~~ | **retired 2026-05-14** — no consumer |
 | ~~`University`~~ | ~~`city_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no consumer |
@@ -226,7 +226,7 @@ section 5 for the DDL.
 - Stores the count of Posts each Person (member) made in each Forum.
 - Used by IC5 V11: replaces a per-pair `Post` LEFT JOIN with a single index lookup.
 - Maintained by IU6 (AddPost): `INSERT … ON CONFLICT … DO UPDATE SET post_count = post_count + 1`.
-- Populated at load time by `denormalize-schema.sql` section 6 (aggregate from `Post.creator_id` + `Post.forum_id`).
+- Populated at load time by `denormalize-schema.sql` section 6 (aggregate from `CONTAINER_OF ⋈ Post.creator_id` — `Post.forum_id` was retired 2026-05-14).
 - Secondary index: `idx_fmpc_member` on `member_id`.
 
 ### `ldbc_snb."PersonPostCount"`
@@ -281,7 +281,8 @@ UNIQUE INDEX (comment_business_id)  -- added 2026-05-14 for IS2 lookup-by-bizid
 
 - For each Comment, stores the LDBC business id of the root Post reachable
   by walking `REPLY_OF*`. The `comment_id` (graphid) PK lets the iterative
-  deploy-time backfill loop join against `Comment.reply_of_id` (graphid).
+  deploy-time backfill loop join against the `REPLY_OF` edge table directly
+  (`Comment.reply_of_id` denorm was retired 2026-05-14).
 - Used by IS2 to skip the recursive REPLY_OF walk: a single lookup on
   `comment_business_id` yields the root post id without touching any AGE
   label table. (IS6 was the original target but currently falls back to
@@ -290,8 +291,8 @@ UNIQUE INDEX (comment_business_id)  -- added 2026-05-14 for IS2 lookup-by-bizid
   root = `$replyToId`; when it replies to another Comment, root inherits
   the parent comment's `root_post_business_id` via a CommentRootPost lookup.
 - Populated at load time by `denormalize-schema.sql` section 6: seed every
-  Comment whose direct parent is a Post, then walk upward iteratively
-  (replaces the prior recursive CTE — see commit `82865047`).
+  Comment whose direct parent is a Post (by traversing `REPLY_OF` edge table),
+  then walk upward iteratively (replaces the prior recursive CTE — see commit `82865047`).
 
 ### `ldbc_snb."PersonSide"` (2026-05-14, IC9 Phase C)
 

@@ -15,11 +15,20 @@
 --         WITH CTE: if Cypher said the parent was a Post, root = $replyToId;
 --         otherwise we look up the parent Comment's existing CommentRootPost
 --         row by comment_business_id.
--- Call 2: HAS_TAG batch (post-MVCC-window).
+-- Call 2: HAS_TAG batch (post-MVCC-window). DO NOT merge into Call 1 — MVCC split is
+--         non-negotiable (AGE issue #1954 / AGENTS.md §11).
 -- Call 3: MATCH Comment and RETURN content for the MessageByCreator INSERT.
 --
--- SQL UPDATE keeps the still-live Comment.creator_id and Comment.reply_of_id
--- denorm columns (IC12 reads them). Comment.country_id retired 2026-05-14.
+-- Comment.creator_id is fully retired — IC12 was migrated to a Cypher-hybrid
+-- that traverses (friend)<-[:HAS_CREATOR]-(comment)-[:REPLY_OF]->(post) directly.
+-- Comment.reply_of_id is consumed only by deploy-time backfill; denormalize-schema.sql
+-- was rewritten to traverse REPLY_OF directly, so IU7 no longer writes either column.
+-- Comment.country_id was previously retired 2026-05-14.
+--
+-- AGENTS.md §14 compliance: outer SQL only reads/writes non-AGE side tables
+--   * CommentRootPost  — graphid PK + comment_business_id + root_post_business_id
+--   * MessageByCreator — creator_business_id + message_business_id + content
+-- No outer-SQL reads or writes of AGE label tables (Comment, HAS_CREATOR, REPLY_OF, etc.).
 
 WITH new_comment AS (
   SELECT
@@ -66,14 +75,6 @@ SELECT * FROM cypher('$graphName', $$
     CREATE (comment)-[:HAS_TAG]->(t)
   RETURN count(comment)
 $$) AS (result agtype);
-
--- Comment.country_id retired 2026-05-14: no read consumers (see SCHEMA.md).
--- creator_id and reply_of_id remain — IC12 reads them.
-UPDATE ldbc_snb."Comment" c
-   SET creator_id  = (SELECT end_id FROM ldbc_snb."HAS_CREATOR" WHERE start_id = c.id LIMIT 1),
-       reply_of_id = (SELECT end_id FROM ldbc_snb."REPLY_OF"    WHERE start_id = c.id LIMIT 1)
- WHERE CAST(ag_catalog.agtype_object_field_text(c.properties, 'id') AS bigint) = $commentId
-;
 
 -- MessageByCreator: content sourced from a third Cypher MATCH (the Comment
 -- is committed after Call 1) to avoid SQL substitution of $content.

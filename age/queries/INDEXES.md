@@ -155,9 +155,9 @@ CREATE UNIQUE INDEX idx_msgbycreator_creator_date_msg
 | IC9 | `gin_person` (entry), `idx_knows_start` (directed 1+2-hop friend ids via Cypher UNION), `idx_msgbycreator_creator_date_msg` (per-friend date-DESC walk with LATERAL LIMIT 20 — composite `(creator_business_id, creation_date DESC, message_business_id)`), `PersonSide_pkey` (friend name projection) |
 | IC10 | `gin_person` (entry), `idx_knows_start` (directed 2-hop FoF), `idx_islocatedin_*` (city), `idx_post_creator_id` (denorm: per-FoF post scan), `idx_hastag_*`, `idx_hasinterest_start_end` (composite), `PersonPostCount` PK (total post count) |
 | IC11 | `gin_person`, `idx_knows_*`, `idx_workat_*`, `idx_islocatedin_*`, `idx_country_name` |
-| IC12 | `gin_person` (friends), `gin_tagclass` (root TagClass seed), `idx_tagclass_subclass_of_id` (recursive subclass walk), `idx_tag_tagclass_id` (valid tags), `idx_comment_creator_id` (denorm), `idx_comment_reply_of_id` (denorm), `idx_hastag_*` |
+| IC12 | `gin_person` (friends via directed KNOWS), `gin_tagclass` (root TagClass seed), `idx_knows_start` (friend hop), `idx_hascreator_end` (reverse HAS_CREATOR), `idx_replyof_start` (REPLY_OF to Post), `idx_hastag_*` (post tags); traverses graph entirely via Cypher — `idx_comment_creator_id` and `idx_comment_reply_of_id` retired 2026-05-14 |
 | IS1, IS3 | `gin_person`, `idx_islocatedin_*` (IS1), `idx_knows_start` (IS3 — directed) |
-| IS2 | `gin_person`, `idx_hascreator_*`, `idx_replyof_start` (recursive CTE REPLY_OF walk), `idx_comment_date_id` / `idx_post_date_id` |
+| IS2 | `gin_person`, `idx_hascreator_*`, `idx_commentrootpost_business_id` (comment_business_id → root_post_business_id lookup), `idx_msgbycreator_message` (root post creator lookup), `PersonSide_pkey` (author name projection) |
 | IS4, IS5 | `gin_comment` / `gin_post`, `idx_hascreator_*` (IS5) |
 | IS6 | `gin_comment` / `gin_post` (seed MATCH inside Cypher call), `idx_replyof_start` (variable-length walk `REPLY_OF*1..10`), `idx_containerof_end`, `idx_hasmoderator_start`, `idx_post_id`, `idx_comment_id` |
 | IS7 | `gin_comment` / `gin_post`, `idx_replyof_end`, `idx_hascreator_*`, `idx_knows_start` (directed, know-check) |
@@ -174,14 +174,20 @@ on the entity tables without going through the AGE edge tables.
 ### Single-column denorm indexes
 
 ```sql
--- Post / Comment denorm columns with live read consumers
+-- Post denorm columns with live read consumers
 CREATE INDEX idx_post_creator_id     ON ldbc_snb."Post"     (creator_id);   -- IC10
-CREATE INDEX idx_post_forum_id       ON ldbc_snb."Post"     (forum_id);     -- IU6 internal (FMPC)
-CREATE INDEX idx_comment_creator_id  ON ldbc_snb."Comment"  (creator_id);   -- IC12
-CREATE INDEX idx_comment_reply_of_id ON ldbc_snb."Comment"  (reply_of_id);  -- IC12 + IS2
-CREATE INDEX idx_tag_tagclass_id         ON ldbc_snb."Tag"      (tagclass_id);       -- IC12
-CREATE INDEX idx_tagclass_subclass_of_id ON ldbc_snb."TagClass" (subclass_of_id);    -- IC12
+-- Tag hierarchy indexes — live (may be used by future queries; IC12 now traverses via Cypher)
+CREATE INDEX idx_tag_tagclass_id         ON ldbc_snb."Tag"      (tagclass_id);
+CREATE INDEX idx_tagclass_subclass_of_id ON ldbc_snb."TagClass" (subclass_of_id);
 ```
+
+**Retired 2026-05-14** — `Comment.creator_id` and `Comment.reply_of_id` columns retired; these indexes dropped by migration `2026-05-14-retire-comment-creator-replyof.sql`:
+- `idx_comment_creator_id` — IC12 migrated to Cypher traversal; no remaining runtime reader of `Comment.creator_id`
+- `idx_comment_reply_of_id` — IC12 migrated; IS2 uses `CommentRootPost`; no remaining runtime reader of `Comment.reply_of_id`
+
+**Retired 2026-05-14** — `Post.forum_id` column retired; these indexes dropped by migration `2026-05-14-drop-post-forum-id.sql`:
+- `idx_post_forum_id` (single-column on `forum_id`)
+- `idx_post_forum_creator` (composite `(forum_id, creator_id)` — the "IC5 LEFT JOIN" comment was stale; IC5 reads `ForumMemberPostCount` directly)
 
 **Retired 2026-05-14** (no read consumers, removed from `denormalize-schema.sql`):
 `idx_post_country_id`, `idx_comment_country_id`, `idx_forum_moderator_id`,
@@ -192,10 +198,9 @@ at the operator's convenience.
 
 ### Composite covering indexes (hot JOIN patterns)
 
-```sql
--- IC5: forum_id = X AND creator_id = Y (Post LEFT JOIN in ForumMemberPostCount)
-CREATE INDEX idx_post_forum_creator ON ldbc_snb."Post" (forum_id, creator_id);
-```
+`idx_post_forum_creator` on `(forum_id, creator_id)` was retired 2026-05-14: the
+comment "IC5 LEFT JOIN" was stale — IC5 reads `ForumMemberPostCount` directly and
+never touches `Post`. Dropped by migration `2026-05-14-drop-post-forum-id.sql`.
 
 #### Removed composites (IC2 rewrite 2026-05-13)
 

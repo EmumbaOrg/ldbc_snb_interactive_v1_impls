@@ -73,7 +73,7 @@ For each query, read both the YAML spec and the SQL file, then verify:
 2. **Graph traversal** — the MATCH pattern must follow the spec description exactly. Pay attention to:
    - Hop count (1-hop friends vs 2-hop friends-of-friends)
    - Node types (`Post` vs `Comment` vs generic `Message` — AGE uses separate labels for each)
-   - Edge directions (e.g. `(post)-[:HAS_CREATOR]->(person)` not the reverse)
+   - Edge directions (e.g. `(post)-[:HAS_CREATOR]->(person)` not the reverse). A reversed `<-` traversal returns 0 rows silently because the edge with that direction doesn't exist; benchmarks won't catch it but LDBC validation will. IC3 regressed on this in 2026-05-14 (Comment + Post arms both had `(msg)<-[:HAS_CREATOR]-(friend)`).
    - **KNOWS direction must always be `-[:KNOWS]->` (directed, never undirected).** Undirected `-[:KNOWS]-` forces a full seq-scan on the entire KNOWS edge table regardless of seed-node selectivity (AGE-QUIRKS §11). IU8 stores KNOWS bidirectionally, so directed traversal finds all friends. Applies to IC1, IC2, IC3, IC5, IC6, IC9, IC10, IC11, IS3, IS7.
    - Whether the same node variable is reused across MATCH clauses — anonymous `(:Post)` creates a new unbound node; named `(post)` reuses the previously bound one. Using anonymous nodes where a named variable is required is a common bug.
 
@@ -87,7 +87,7 @@ For each query, read both the YAML spec and the SQL file, then verify:
 
 5. **Result columns** — the YAML `result` list defines the exact columns and order. Verify the RETURN clause produces those columns in that order.
 
-6. **Sort order** — the YAML `sort` list defines primary/secondary sort keys and directions (`asc`/`desc`). The SQL `ORDER BY` must match exactly, including tie-breakers. For queries with an inner `LIMIT` (e.g. IS2), the inner `ORDER BY` must use the same tie-breaker direction as the outer one.
+6. **Sort order** — the YAML `sort` list defines primary/secondary sort keys and directions (`asc`/`desc`). The SQL `ORDER BY` must match exactly, including tie-breakers. For queries with an inner `LIMIT` (e.g. IS2), the inner `ORDER BY` must use the same tie-breaker direction as the outer one. **Outer-SQL string tie-breakers on agtype must use `::text COLLATE "C"`** — PG's default `en_US.UTF-8` sorts punctuation (`_`, `-`, …) after letters; the LDBC oracle uses codepoint order. See AGE-QUIRKS §14. IC4 regressed on this 2026-05-14 (tag tie-breaker).
 
 7. **Limit** — the YAML `limit` field must match `LIMIT N` in the SQL.
 
@@ -97,7 +97,7 @@ For each query, read both the YAML spec and the SQL file, then verify:
 
 10. **IC12 tag source** — tags must come from the original Post, not from the Comment/reply. Use `(post:Post)-[:HAS_TAG]->(tag)` not `(reply)-[:HAS_TAG]->(tag)`.
 
-11. **IU cypher() call count** — each `interactive-update-N.sql` contains the minimum number of `cypher()` calls needed. Most IUs use exactly one call. **IU7 is the exception: it uses two calls** to avoid an AGE MVCC concurrency bug (AGE issue #1954 — see `../AGE-1.6-MVCC-BUG.md` for full context and mitigation — the `HAS_TAG` UNWIND must run in a separate visibility window after the Comment is committed). Do not merge IU7's two calls back into one. For all other IUs, keep operations inside a single `$$...$$` block using `WITH ... CREATE` chaining.
+11. **IU cypher() call count** — each `interactive-update-N.sql` contains the minimum number of `cypher()` calls needed. Most IUs use exactly one call. **IU7 is the exception: it uses three calls** to avoid an AGE MVCC concurrency bug (AGE issue #1954 — see `../AGE-1.6-MVCC-BUG.md` for full context and mitigation — the `HAS_TAG` UNWIND must run in a separate visibility window after the Comment is committed). A third call reads the committed Comment's `content` property for the `MessageByCreator` INSERT (content arrives Cypher-escaped and cannot be safely substituted in a SQL string literal). Do not merge IU7's three calls back into two or one. For all other IUs, keep operations inside a single `$$...$$` block using `WITH ... CREATE` chaining.
 
 12. **SF-appropriate tactics** — Reject any tactic that improves SF≤10 latency at the cost of SF100+ performance. Concrete guidance:
     - Avoid materializing the full edge result set if SF1000 will OOM; prefer streaming joins.
@@ -224,9 +224,9 @@ Consult: `postgres/queries/N.sql`, `postgres/ddl/schema_constraints.sql`, `duckd
 These implementations have no graph layer — what they offer is a SQL backbone that AGE's hybrid queries can mirror in the outer SQL around a `cypher()` call.
 
 **Cross-check against AGE's existing tactics first.** Before adding anything new, review `age/scripts/denormalize-schema.sql` and `age/queries/INDEXES.md`. AGE already has:
-- Denorm `graphid` columns (`Post.creator_id`, `Comment.reply_of_id`, etc.)
-- Precomputed side tables (`ForumMemberPostCount`, `PersonPostCount`)
-- Composite indexes (e.g., `(forum_id, creator_id)`)
+- Denorm `graphid` columns (`Post.creator_id` — load-bearing for IC10 pending Tier 2 retirement)
+- Precomputed side tables (`ForumMemberPostCount`, `PersonPostCount`, `MessageByCreator`, `CommentRootPost`, `PersonSide`, `HasMemberSide`, `ForumSide`)
+- Composite indexes (e.g., `idx_fmpc_member_forum` on `(member_id, forum_id)`)
 - GIN + functional-B-tree splits that `postgres/` and `duckdb/` do not have
 
 If a tactic from a relational implementation looks useful, propose adding the underlying denorm column or index in AGE's schema first, then write the hybrid query that uses it. Do not convert the AGE query to Pure SQL to mimic the relational shape.

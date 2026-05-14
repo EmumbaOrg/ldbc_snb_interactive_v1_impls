@@ -6,6 +6,11 @@
 -- label-OR predicate (AGE-QUIRKS §3). Friend-set uses graphid collect, not full vertex
 -- objects, to avoid Sort+GroupAggregate on ~500-byte agtype blobs at scale (AGE-QUIRKS §6).
 -- IC3 is excluded from age_parameterized_queries because outer SQL references country names.
+--
+-- HAS_CREATOR direction: edges are stored (Message)-[:HAS_CREATOR]->(Person), so the
+-- correct pattern is `(msg)-[:HAS_CREATOR]->(friend)`. A reversed `<-` form returns 0
+-- rows silently (AGENTS.md "How to Review a Query" §2 — edge directions).
+--
 -- TODO: denorm Person.country_name to collapse friend-country anti-join from 2-hop to a
 --       property check (saves ~10-30 ms per call at SF1000+).
 
@@ -34,7 +39,7 @@ FROM (
     WITH friend
     // (4) Drive from country side: idx_country_name → idx_islocatedin_end →
     //     Comment lookup → date post-filter.
-    MATCH (country:Country)<-[:IS_LOCATED_IN]-(msg:Comment)<-[:HAS_CREATOR]-(friend)
+    MATCH (country:Country)<-[:IS_LOCATED_IN]-(msg:Comment)-[:HAS_CREATOR]->(friend)
     WHERE country.name IN [$countryXName, $countryYName]
       AND msg.creationDate >= $startDate AND msg.creationDate < $endDate
     RETURN friend.id, friend.firstName, friend.lastName, country.name
@@ -55,7 +60,7 @@ FROM (
     MATCH (friend)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(fCountry:Country)
     WHERE fCountry.name <> $countryXName AND fCountry.name <> $countryYName
     WITH friend
-    MATCH (country:Country)<-[:IS_LOCATED_IN]-(msg:Post)<-[:HAS_CREATOR]-(friend)
+    MATCH (country:Country)<-[:IS_LOCATED_IN]-(msg:Post)-[:HAS_CREATOR]->(friend)
     WHERE country.name IN [$countryXName, $countryYName]
       AND msg.creationDate >= $startDate AND msg.creationDate < $endDate
     RETURN friend.id, friend.firstName, friend.lastName, country.name
