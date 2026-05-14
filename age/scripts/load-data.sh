@@ -93,8 +93,12 @@ psql "$CONNECTION_STRING" \
     2>&1 | grep -v NOTICE || true
 
 # ---------------------------------------------------------------------------
-echo "=== Step 4: VACUUM ANALYZE ==="
-bash "${SCRIPT_DIR}/vacuum-analyze.sh"
+# Step 4 (VACUUM ANALYZE) intentionally omitted: denormalize-schema.sql
+# section 7 already runs targeted ANALYZE on every table it touches, and a
+# fresh load produces zero dead tuples so VACUUM has nothing to reclaim. The
+# full-DB `VACUUM (ANALYZE, VERBOSE)` scanned ~150M heap rows at SF10 for no
+# new information (~15-30 min wasted). restore-database.sh still runs
+# vacuum-analyze.sh because pg_restore doesn't update planner stats.
 
 # ---------------------------------------------------------------------------
 echo "=== Step 5: Taking snapshot ==="

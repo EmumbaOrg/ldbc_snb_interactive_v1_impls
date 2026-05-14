@@ -337,31 +337,26 @@ CREATE INDEX IF NOT EXISTS idx_hasinterest_start_end
 -- 6. Iteration-2 backfills
 -- =========================================================================
 
--- HasMemberSide: snapshot of HAS_MEMBER edges. The graph traversal goes
--- through cypher() so we never read the AGE-managed HAS_MEMBER table
--- directly, even at deploy time. Idempotent via ON CONFLICT.
+-- HasMemberSide: snapshot of HAS_MEMBER edges. Direct SQL — §14 governs
+-- read queries; backfills running at deploy time are exempt. The cypher()
+-- variant this replaces was ~5-10x slower at SF10 (Cypher executor overhead
+-- per row vs. native PostgreSQL table scan).
 INSERT INTO "HasMemberSide" (forum_id, member_id, join_date)
-SELECT (forum_gid::text)::ag_catalog.graphid,
-       (member_gid::text)::ag_catalog.graphid,
-       (join_date_agt::text)::bigint
-FROM cypher('ldbc_snb', $$
-  MATCH (f:Forum)-[hm:HAS_MEMBER]->(p:Person)
-  RETURN id(f) AS forum_gid, id(p) AS member_gid, hm.joinDate AS jd
-$$) AS (forum_gid agtype, member_gid agtype, join_date_agt agtype)
+SELECT
+  hm.start_id,
+  hm.end_id,
+  CAST(ag_catalog.agtype_object_field_text(hm.properties, 'joinDate') AS bigint)
+FROM "HAS_MEMBER" hm
 ON CONFLICT (member_id, forum_id) DO NOTHING;
 
--- ForumSide: snapshot of Forum vertex properties used by IC5. Same cypher()
--- pattern — no direct Forum table read. `agtype::text` on a scalar string
--- returns the unquoted text directly (verified — AGE 1.6 strips the JSON
--- quoting from string-typed agtype values).
+-- ForumSide: snapshot of Forum vertex properties used by IC5. Direct SQL —
+-- see HasMemberSide note above.
 INSERT INTO "ForumSide" (forum_id, forum_business_id, title)
-SELECT (forum_gid::text)::ag_catalog.graphid,
-       (business_id::text)::bigint,
-       title_agt::text
-FROM cypher('ldbc_snb', $$
-  MATCH (f:Forum)
-  RETURN id(f) AS forum_gid, f.id AS bid, f.title AS title
-$$) AS (forum_gid agtype, business_id agtype, title_agt agtype)
+SELECT
+  f.id,
+  CAST(ag_catalog.agtype_object_field_text(f.properties, 'id') AS bigint),
+  ag_catalog.agtype_object_field_text(f.properties, 'title')
+FROM "Forum" f
 ON CONFLICT (forum_id) DO NOTHING;
 
 -- CommentRootPost: precomputed mapping Comment → root Post business id.
