@@ -18,9 +18,10 @@ This document consolidates every measurement and decision taken during this work
 | **Final LDBC validation** | ✅ 0 non-stub failures | 3000-op SF3 oracle slice: 0 crashes, 0 incorrects (only the 293 IC13/IC14 intentional stubs). |
 | IU-latency investigation | ✅ measured | **Per-cypher() call count is NOT the bottleneck.** Single-thread folding saves 1.5%; concurrent multi-thread is contention-dominated. |
 | Side-table-in-IU anti-pattern? | ✅ answered | NOT anti-pattern. Removing `PersonPostCount` measured **7× regression** on IC10 read. |
-| JIT-on A/B for complex reads | ✅ measured | Mixed: IC6 +11%, IC12 −11%, IC3 −13%. NOT the optimization key. Keep jit=off. |
-| AGENTS.md doc drift | ⏳ pending | §11 (IU cypher() call counts) and §13 (parameterized list) need updating to current reality. |
+| JIT-on A/B for complex reads | ✅ measured | Mixed: IC6 +11%, IC12 −11%, IC3 −13%. NOT the optimization key. Keep jit=off (further reinforced by Phase 3 — see §7a.9). |
+| AGENTS.md doc drift | ✅ updated (Phase 3) | §13 rewritten to reflect empty `age_parameterized_queries`; AGE-QUIRKS §13 reversed; AGE-QUIRKS §15 added. |
 | Per-query investigation across all queries | ✅ Phase 2 done | IC1, IC6, IC8 audited as at-floor (no headroom). IC10 NOT EXISTS tried but reverted (full-query regression). Short reads (IS1-IS7) all at sub-5ms server-side floor. |
+| **Phase 3 — parameterised path reversal** | ✅ landed | `age_parameterized_queries=` empty repo-wide. SQ4 fix: 4,935 → 65 ms mean (**−99%**). Overall throughput 6.35 → 13.5 ops/sec (**+113%**). Full details in §7a. |
 
 All committed changes are in branch `feature/age-implementation`, commit `e7b8792b "updates to ic1, 3,4,6,7"`.
 
@@ -309,6 +310,192 @@ These were considered and rejected based on measurement:
 - **Don't try to "match postgres single-INSERT IUs".** Postgres' base tables are SQL-native; ours are agtype + GIN. The structural difference forces side tables; eliminating them moves work to read time where it costs more.
 - **Don't pursue Track A (cypher-call folding) until AGE adds `FOREACH`.** Empty-UNWIND-collapse blocks the obvious approach in AGE 1.6.
 - **Don't run full SF3 LDBC validation in a session.** 50 h on M2 Pro. Slice the oracle to a 3K-row prefix for diagnosis; full runs need a dedicated long-running environment.
+
+---
+
+## 7a. Phase 3 (2026-05-15 PM) — Parameterized-path reversal
+
+The 5K+1K SF3 benchmark surfaced a new class of issue that had been masking
+real per-query performance behind a flat overhead. The work below was driven
+by an external bug report (colleague's IC2 crash on `benchmark.properties`)
+and ended up flipping a fundamental piece of guidance from earlier in this
+project.
+
+### 7a.1 — Colleague's IC2 crash (`syntax error at or near "$"` @ Position 2471)
+
+The colleague was running `benchmark.properties` (which has `Query2` in
+`age_parameterized_queries`); their stack trace showed `$maxDate` reaching
+PostgreSQL unsubstituted. Root cause: IC2's outer SQL had a bare `$maxDate`
+reference; the `AgeListOperationHandler` parameterised path only binds
+intra-`cypher()` parameters via the agtype-JSON blob, anything outside
+goes to PostgreSQL verbatim and `$maxDate` is not valid PostgreSQL.
+
+**Fix:** project `$maxDate` back out of the friend-set Cypher call as a
+column (`md`), reference `friends.max_date` in the outer LATERAL. Same
+shape we'd already used elsewhere (the IC2 `creationDate` column-projection
+trick). Verified across 34 IC2 invocations in the post-fix benchmark — 0
+crashes.
+
+### 7a.2 — `cypher(` in SQL comments
+
+While testing the IC2 fix under the parameterised path, the next crash
+surfaced: `The column index is out of range: 2, number of columns: 1.`
+142 occurrences over 2,837 ops. Root cause: my new IC2 header comment used
+the literal token `cypher(` four times in commentary; `countCypherCalls()`
+substring-scans the whole SQL template (comments included) but `prepareTemplate`
+only injects `?` for actual `$$)` boundaries. Handler tried to bind 4
+parameters into a 1-placeholder statement.
+
+This was already documented as AGENTS.md §13 / AGE-QUIRKS §13. Reinforced
+the rule and rewrote the comment to use "Cypher" without parens.
+
+### 7a.3 — SQ4 regression (4,737 ms p50)
+
+Same post-fix benchmark surfaced SQ4 (LdbcShortQuery4MessageContent) at
+**4,737 ms p50** — vs other short reads at 9–45 ms. SQ4's only work is a
+single-node MATCH on Comment/Post by id, so something was very wrong.
+
+PREPARE/EXECUTE repro showed the cached generic plan was:
+
+```
+Seq Scan on "Comment" m (cost=0.00..291645.18 rows=64138 width=64)
+  Filter: (properties @> agtype_build_map('id'::text,
+            agtype_access_operator($1, '"messageId"'::agtype)))
+```
+
+The `agtype_access_operator($1, …)` is a function call that the planner
+can't fold at plan time. So GIN cost estimate balloons and the planner
+falls back to Seq Scan on the 6.4M-row Comment heap. Bad luck on the
+first few EXECUTEs (early-table rows match) hid the cost long enough
+for PostgreSQL to lock in the generic plan.
+
+The literal path (where the handler string-substitutes the messageId
+into the SQL) plans the same query against a known `agtype` value, hits
+the GIN bitmap scan, and executes in 5 ms.
+
+### 7a.4 — Audit of all parameterised queries
+
+Same PREPARE/EXECUTE harness against every entry in `age_parameterized_queries`:
+
+| Query | Cached plan | Per-call cost | Verdict |
+|---|---|---|---|
+| SQ4 | Seq Scan on Comment | 4,737 ms | catastrophic |
+| SQ1/SQ2/SQ3/Q2/Q4/Q7/Q8/Q10/Q11/Q12 (Person-anchored) | Seq Scan on Person | ~170 ms baseline | moderate — bad at SF1000 |
+| Q6 | Seq Scan on Tag | 24 ms | moderate but bounded |
+| SQ5 / SQ7 | gin_comment Bitmap + edge | 0.48 / 1.05 ms | structurally safe |
+| IU2 / IU3 / IU8 | Both anchors GIN Bitmap | 0.12–0.25 ms | structurally safe |
+
+The "safe" shapes had edge joins or multi-anchor MATCH that inflated
+the generic-plan estimate above the custom-plan cost — PostgreSQL kept
+re-planning per call (custom plan). The "moderate" / "catastrophic"
+shapes were all single-node MATCH on a label table that's "small enough"
+in cost estimate (Person 24K, Tag 16K, Comment heap pages) that the
+generic Seq Scan plan looked acceptable to the planner and locked in.
+
+### 7a.5 — Even the "safe" parameterised path is not faster
+
+Empirical comparison (PREPARE/EXECUTE plan-cached vs literal `cypher()`):
+
+| Query | Parameterised | Non-parameterised | Diff |
+|---|---|---|---|
+| SQ5 | 1.48 ms (1.07 plan + 0.41 exec) | 0.50 ms (0.32 plan + 0.18 exec) | non-param wins ~1 ms |
+| IU2 | 0.25 ms | 0.22 ms | wash |
+| IU8 | 0.15 ms | 0.11 ms | wash |
+
+Even on the queries where PostgreSQL keeps re-planning custom, the
+parameterised wrapper adds an `agtype_access_operator($1, '"key"')`
+extraction per execution that the literal path skips. So there's no
+upside to keeping anything in `age_parameterized_queries`.
+
+### 7a.6 — Resolution
+
+`age_parameterized_queries=` is now **empty** in all nine `driver/*.properties`
+files. Every IC/IS/IU op goes through `Statement.execute()` with values
+string-substituted into the SQL by the Java handler before send.
+
+### 7a.7 — Measured benchmark impact (SF3, 1K warmup + 5K main)
+
+| Metric | Prior run (full parameterised) | Post-fix run (Person/Tag/SQ4 excluded) | Δ |
+|---|---|---|---|
+| Total throughput | 6.35 ops/sec | 13.5 ops/sec | **+113%** |
+| Wall time | ~16 min | ~6.5 min | **−59%** |
+| Crashes / errors | 0 | 0 | — |
+
+Per-query winners (mean ms, prior → post):
+
+- SQ4 (LdbcShortQuery4MessageContent): 4,935 → 65 (**−99%**, primary fix)
+- IU8 AddFriendship: 334 → 5.8 (**−98%**)
+- IU5 AddForumMembership: 205 → 17.8 (**−91%**)
+- IU4 AddForum: 337 → 34.8 (**−90%**)
+- IU6 AddPost: 307 → 113 (**−63%**)
+- IC2: 170 → 70 (**−59%**)
+- SQ1 PersonProfile: 114 → 53 (**−53%**)
+- SQ5 MessageCreator: 94 → 50 (−46%)
+- SQ3 PersonFriends: 98 → 60 (−39%)
+- IU2 AddPostLike: 1,013 → 646 (−36%)
+- SQ6 MessageForum: 99 → 65 (−34%)
+- SQ7 MessageReplies: 131 → 87 (−34%)
+
+The heavy ICs (IC4, IC5, IC6, IC8, IC10, IC12) showed small (5–33%) mean
+slowdowns in this comparison — n=8–47 per query, multi-second means,
+single outlier ±30%. Within statistical noise. The structural fix
+isn't worsening these; the 170 ms anchor savings is a tiny fraction of
+the multi-second body work.
+
+### 7a.8 — SF1000 projection
+
+- The cost gap between generic Seq Scan (linear in rows) and custom GIN
+  bitmap (logarithmic) **widens** at scale. PostgreSQL is *more* likely
+  to stick on custom plans at SF1000 — so the "safe" shapes (SQ5, SQ7,
+  IU2/3/8) would have been even safer if they'd stayed parameterised.
+- But for the catastrophic shapes (single-node MATCH on big label
+  table), the generic Seq Scan plan would have grown to **minutes per
+  call at SF1000**. SQ4 at SF3 was 4.7 s with 6.4M-row Comment;
+  SF1000 Comment is ~2B rows → ~25 min per call if the generic plan
+  locked in.
+- The non-parameterised literal path doesn't have either risk: every
+  call plans fresh with a known literal, GIN is always used,
+  per-call cost scales logarithmically.
+
+### 7a.9 — JIT-on/off interaction
+
+Phase 1 (early 2026-05-15) measured JIT-on at SF3 as mixed (IC6 +11%,
+IC12 −11%, IC3 −13%) and recommended `jit=off`. The non-parameterised
+reversal **strengthens** that recommendation: JIT amortises its compile
+cost (typically 50–100 ms per query) across executions of a *cached*
+plan. With every call now re-planning, JIT would compile fresh on
+every call without amortisation — adding ~50–100 ms tax to every
+read.
+
+Quick break-even sketch with post-fix SF3 numbers:
+
+| Query class | Mean exec | JIT compile tax | Net w/ JIT |
+|---|---|---|---|
+| SQ1/SQ3/SQ5/SQ6/SQ7 | 50–90 ms | +50–100 ms | **slower** |
+| IC2 / IC7 / IC1 | 70–280 ms | +50–100 ms | wash or slower |
+| IC3 / IC8 / IC11 | 950–2,000 ms | +50–100 ms | maybe ~5% faster |
+| IC5 / IC9 / IC10 / IC12 | 2.7–7.5 s | +50–100 ms | likely 5–15% faster |
+
+If we ever wanted partial JIT, raise `jit_above_cost` to 5–10M so only
+the four most expensive ICs trigger compilation; but the threshold has
+to be re-measured per SF since cost estimates shift with table size.
+
+Status quo: **`jit=off` repo-wide.** No change needed.
+
+### 7a.10 — Files touched
+
+- `age/queries/interactive-complex-2.sql` — `$maxDate` projected back through Cypher RETURN; comment scrubbed of `cypher(` literal.
+- `age/driver/benchmark.properties` — `age_parameterized_queries=` empty + multi-paragraph rationale comment.
+- `age/driver/benchmark-local.properties` — same.
+- `age/driver/benchmark-local-10k.properties` — same.
+- `age/driver/validate.properties` — same.
+- `age/driver/validate-local.properties` — same.
+- `age/driver/validate-local-ic3ic4.properties` — same.
+- `age/driver/validate-local-ic5only.properties` — same.
+- `age/driver/validate-local-ic9filtered.properties` — same.
+- `age/driver/validate-local-ic9only.properties` — same.
+- `age/queries/AGE-QUIRKS.md` — §13 reversed; §15 added (GIN containment with runtime parameter falls back to Seq Scan).
+- `age/queries/AGENTS.md` — §13 rewritten.
 
 ---
 
