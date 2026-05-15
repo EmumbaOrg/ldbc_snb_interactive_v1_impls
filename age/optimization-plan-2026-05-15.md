@@ -10,16 +10,37 @@ This document consolidates every measurement and decision taken during this work
 
 | Workstream | Status | Material outcome |
 |---|---|---|
-| IU §14 cleanup (Tier 1: IU1 + IU6) | ✅ landed | Outer SQL no longer reads `Person`/`Post`/`CONTAINER_OF` from AGE label tables. `Post.forum_id` retired. |
-| IU §14 cleanup (Tier 2: IU7) | ✅ landed | `Comment.creator_id` + `Comment.reply_of_id` retired (after colleague's IC12 + earlier IS2 migrations). |
-| IC3 correctness fix | ✅ landed | HAS_CREATOR direction reversed on lines 37+58. Verified output now matches LDBC oracle byte-for-byte. |
-| IC4 correctness fix | ✅ landed | Outer SQL `ORDER BY tagName` requires `COLLATE "C"` to match LDBC oracle codepoint sort. |
+| IU §14 cleanup (Tier 1: IU1 + IU6) | ✅ landed `e7b8792b` | Outer SQL no longer reads `Person`/`Post`/`CONTAINER_OF` from AGE label tables. `Post.forum_id` retired. |
+| IU §14 cleanup (Tier 2: IU7) | ✅ landed `e7b8792b` | `Comment.creator_id` + `Comment.reply_of_id` retired (after colleague's IC12 + earlier IS2 migrations). |
+| IC3 correctness fix | ✅ landed `e7b8792b` | HAS_CREATOR direction reversed on lines 37+58. Output now matches LDBC oracle byte-for-byte. |
+| IC4 correctness fix | ✅ landed `e7b8792b` | Outer SQL `ORDER BY tagName` requires `COLLATE "C"` to match LDBC oracle codepoint sort. |
+| **Phase 2 query audit** | ✅ landed (uncommitted) | IC2: **193× speedup**. IC3: **9× speedup** (caveat below). IC7: **124× speedup**. IC11 + IC12: collation correctness fixes. IU7: ON CONFLICT bug eliminated 20 crashes + ~45 cascade incorrects. |
+| **Final LDBC validation** | ✅ 0 non-stub failures | 3000-op SF3 oracle slice: 0 crashes, 0 incorrects (only the 293 IC13/IC14 intentional stubs). |
 | IU-latency investigation | ✅ measured | **Per-cypher() call count is NOT the bottleneck.** Single-thread folding saves 1.5%; concurrent multi-thread is contention-dominated. |
 | Side-table-in-IU anti-pattern? | ✅ answered | NOT anti-pattern. Removing `PersonPostCount` measured **7× regression** on IC10 read. |
+| JIT-on A/B for complex reads | ✅ measured | Mixed: IC6 +11%, IC12 −11%, IC3 −13%. NOT the optimization key. Keep jit=off. |
 | AGENTS.md doc drift | ⏳ pending | §11 (IU cypher() call counts) and §13 (parameterized list) need updating to current reality. |
-| All-queries deep investigation + JIT-on test | ⏳ pending | Bookmarked as Track #14 — should be next major workstream. |
+| Per-query investigation across all queries | ✅ Phase 2 done | IC1, IC6, IC8 audited as at-floor (no headroom). IC10 NOT EXISTS tried but reverted (full-query regression). Short reads (IS1-IS7) all at sub-5ms server-side floor. |
 
 All committed changes are in branch `feature/age-implementation`, commit `e7b8792b "updates to ic1, 3,4,6,7"`.
+
+Phase 2 changes (IC2 V2, IC7 V2, IC11, IC12, IU7 ON CONFLICT) are uncommitted in the working tree pending review.
+
+---
+
+## 2a. Phase 2 — what landed in the working tree (uncommitted)
+
+| File | Change | Measured impact |
+|---|---|---|
+| `interactive-complex-2.sql` | Replaced 2-arm Comment+Post Cypher UNION with single-hop friend Cypher + LATERAL LIMIT 20 per friend on `MessageByCreator`. Same IC9-Phase-C shape. | **193× mean speedup** (327-908 ms → 2-4 ms warm, 5 sample params). Byte-identical output. |
+| `interactive-complex-7.sql` | Replaced `OPTIONAL MATCH (p)-[knows:KNOWS]->(liker) ... RETURN knows IS NULL` with `NOT EXISTS { MATCH (p)-[:KNOWS]->(liker) }`. AGE 1.6 EXISTS subqueries short-circuit. | **124× mean speedup** (1652-2007 ms → 8-35 ms, 5 sample params). Byte-identical. |
+| `interactive-complex-11.sql` | Added `organizationName::text COLLATE "C" DESC` to outer-SQL tie-breaker. en_US.UTF-8 sorts `_` after letters; LDBC oracle uses codepoint. | **5 IC11 failures → 0** in validation slice. |
+| `interactive-complex-12.sql` | Added `COLLATE "C"` to both DISTINCT and ORDER BY in `string_agg(DISTINCT tagName ORDER BY tagName)`. PG aggregate rule: DISTINCT + ORDER BY expressions must match. | Pre-emptive (no IC12 incorrects pre-fix). Avoided latent bug on tags with underscores. |
+| `interactive-update-7.sql` | `ON CONFLICT (comment_id)` → `ON CONFLICT DO NOTHING` (no target — catches violations on EITHER PK or the unique `idx_commentrootpost_business_id`). MVCC retry path was creating duplicate Comment vertices with the same business_id, breaking the secondary unique index. | **20 IU7 crashes → 0**; cascade effects on IC9/IS2/IS3/IC2/IC8/IC10 (~45 incorrects) eliminated as a knock-on. |
+
+### IC3 V3 — pragmatic note on the country-first + EXISTS rewrite
+
+`interactive-complex-3.sql` was rewritten to drive from country side + EXISTS-check 1-hop/2-hop friendship per message-creator. Measured **9× mean speedup** at SF3 (303-2097 ms vs 3378-3848 ms baseline). **Caveat raised by a reviewer**: the 2-hop `EXISTS { (p)-[:KNOWS]->(:Person)-[:KNOWS]->(friend) }` probe runs per surviving (country, msg) row, giving `O(M × D)` cost. At SF1000 with M ~500K messages × D ~200 friend-degree, this potentially regresses vs a pre-compute-friends-once + hash-join shape (`O(M + F)`). The SF3 measurements may not predict SF1000. Open: validate at SF10/SF100 before treating V3 as canonical.
 
 ---
 

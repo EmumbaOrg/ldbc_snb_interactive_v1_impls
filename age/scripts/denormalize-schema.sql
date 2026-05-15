@@ -26,40 +26,32 @@ SET search_path = ldbc_snb, ag_catalog, public;
 -- =========================================================================
 -- 1. Add denormalised graphid columns to entity tables
 -- =========================================================================
+-- Only ONE live denorm column remains: Post.creator_id (read by IC10).
+-- All other label-table denorm columns are retired — no runtime IC/IS/IU
+-- query reads them. Tier 3 cleanup (2026-05-15) removed the ALTER TABLE
+-- statements so fresh loads no longer create them.
+--
+-- Retired column inventory (NOT created on fresh loads after 2026-05-15):
+--   Post:        forum_id, country_id
+--   Comment:     creator_id, reply_of_id, country_id
+--   Forum:       moderator_id
+--   Person:      city_id
+--   Tag:         tagclass_id          (IC12 traverses HAS_TYPE via Cypher)
+--   TagClass:    subclass_of_id        (IC12 traverses IS_SUBCLASS_OF via Cypher)
+--   City:        country_id
+--   Country:     continent_id
+--   University:  city_id
+--   Company:     country_id
+--
+-- For existing deployments where these columns were previously created:
+-- AGE 1.6 blocks `ALTER TABLE ... DROP COLUMN` on label tables with
+-- "table X is for label X". The columns persist as NULL and are inert;
+-- they cannot be physically dropped until AGE 1.7+ relaxes this guard
+-- (or via a full graph rebuild). Tier-3 migration
+-- `migrations/2026-05-15-tier3-drop-unused-indexes.sql` drops the matching
+-- indexes (which IS allowed by AGE 1.6).
 
--- Post: HAS_CREATOR denorm only. forum_id retired 2026-05-14 (IU6 now sources
--- forum/author gids directly from Cypher RETURN; no external reader).
--- country_id retired 2026-05-14 (no read consumer).
-ALTER TABLE "Post"     ADD COLUMN IF NOT EXISTS creator_id    ag_catalog.graphid;
-ALTER TABLE "Post"     ADD COLUMN IF NOT EXISTS country_id    ag_catalog.graphid;
-
--- Comment: IS_LOCATED_IN denorm only.
--- creator_id and reply_of_id retired 2026-05-14: IC12 was migrated to a
--- Cypher-hybrid that traverses graph edges directly; IS2 uses CommentRootPost;
--- backfill rewritten to traverse REPLY_OF directly. IU7 no longer writes them.
--- Columns remain on disk as NULL (AGE 1.6 blocks ALTER TABLE DROP COLUMN on
--- label tables). Indexes dropped by migration 2026-05-14-retire-comment-creator-replyof.sql.
-ALTER TABLE "Comment"  ADD COLUMN IF NOT EXISTS country_id    ag_catalog.graphid;
-
--- Forum: HAS_MODERATOR denorm
-ALTER TABLE "Forum"    ADD COLUMN IF NOT EXISTS moderator_id  ag_catalog.graphid;
-
--- Person: IS_LOCATED_IN (→City) denorm
-ALTER TABLE "Person"   ADD COLUMN IF NOT EXISTS city_id       ag_catalog.graphid;
-
--- Tag → TagClass via HAS_TYPE
-ALTER TABLE "Tag"      ADD COLUMN IF NOT EXISTS tagclass_id   ag_catalog.graphid;
-
--- TagClass → parent TagClass via IS_SUBCLASS_OF (NULL for root)
-ALTER TABLE "TagClass" ADD COLUMN IF NOT EXISTS subclass_of_id ag_catalog.graphid;
-
--- Place hierarchy via IS_PART_OF
-ALTER TABLE "City"     ADD COLUMN IF NOT EXISTS country_id    ag_catalog.graphid;
-ALTER TABLE "Country"  ADD COLUMN IF NOT EXISTS continent_id  ag_catalog.graphid;
-
--- Organisation locations via IS_LOCATED_IN
-ALTER TABLE "University" ADD COLUMN IF NOT EXISTS city_id    ag_catalog.graphid;
-ALTER TABLE "Company"    ADD COLUMN IF NOT EXISTS country_id ag_catalog.graphid;
+ALTER TABLE "Post" ADD COLUMN IF NOT EXISTS creator_id ag_catalog.graphid;
 
 -- =========================================================================
 -- 2. Load-time backfill from edge tables
@@ -87,19 +79,14 @@ UPDATE "Post" p
 -- no read consumers. Comment.country_id alone took ~10 min at SF3 on the
 -- 6.4M-row Comment table; the saving compounds at SF10+.
 
--- Tag.tagclass_id ← HAS_TYPE (Tag → TagClass)
-UPDATE "Tag" t
-   SET tagclass_id = ht.end_id
-  FROM "HAS_TYPE" ht
- WHERE ht.start_id = t.id
-   AND t.tagclass_id IS NULL;
-
--- TagClass.subclass_of_id ← IS_SUBCLASS_OF (TagClass → TagClass)
-UPDATE "TagClass" tc
-   SET subclass_of_id = isc.end_id
-  FROM "IS_SUBCLASS_OF" isc
- WHERE isc.start_id = tc.id
-   AND tc.subclass_of_id IS NULL;
+-- Tag.tagclass_id + TagClass.subclass_of_id backfills retired 2026-05-15
+-- (Tier 3). IC12 (the only consumer that previously read these) was migrated
+-- to traverse `HAS_TYPE` / `IS_SUBCLASS_OF` via Cypher directly. No runtime
+-- query reads these denorm columns. The ALTER TABLE ADD COLUMN statements
+-- are also removed (section 1) so fresh loads don't create them. Existing
+-- deployments retain the columns as NULL (AGE 1.6 blocks DROP COLUMN); the
+-- matching indexes are dropped by
+-- `migrations/2026-05-15-tier3-drop-unused-indexes.sql`.
 
 -- Geographic hierarchy denorm columns (City.country_id, Country.continent_id,
 -- University.city_id, Company.country_id) retired 2026-05-14: no read consumers
@@ -113,24 +100,15 @@ UPDATE "TagClass" tc
 -- hottest JOIN patterns (mirrors postgres ref's message_creatorid +
 -- message_forumid + message_replyof + forum_moderatorid).
 
--- Post / Comment indexes on live denorm columns.
--- idx_post_forum_id and idx_post_forum_creator retired 2026-05-14:
--- Post.forum_id column is retired; those indexes have no consumers.
--- idx_comment_creator_id and idx_comment_reply_of_id retired 2026-05-14:
--- Comment.creator_id and reply_of_id have no remaining read consumers.
--- Dropped by migration 2026-05-14-retire-comment-creator-replyof.sql.
-CREATE INDEX IF NOT EXISTS idx_post_creator_id     ON "Post" (creator_id);
-
--- Tag hierarchy indexes (live — IC12 reads both).
-CREATE INDEX IF NOT EXISTS idx_tag_tagclass_id         ON "Tag" (tagclass_id);
-CREATE INDEX IF NOT EXISTS idx_tagclass_subclass_of_id ON "TagClass" (subclass_of_id);
-
--- Indexes on retired columns (Post.country_id, Comment.country_id,
--- Forum.moderator_id, Person.city_id, City.country_id, Country.continent_id,
--- University.city_id, Company.country_id) retired 2026-05-14: no consumer
--- ever read these columns. CREATE INDEX statements removed to save load
--- time. Existing indexes in older deployments are inert and can be dropped
--- with DROP INDEX IF EXISTS at the operator's convenience.
+-- Only one live denorm-column index remains: idx_post_creator_id (used by IC10).
+-- Tier 3 (2026-05-15) retired idx_tag_tagclass_id + idx_tagclass_subclass_of_id
+-- because IC12 (their only past consumer) now traverses HAS_TYPE / IS_SUBCLASS_OF
+-- via Cypher. All other denorm-column indexes were retired earlier:
+--   idx_post_forum_id, idx_post_forum_creator (Tier 1)
+--   idx_comment_creator_id, idx_comment_reply_of_id (Tier 2)
+-- Migration `migrations/2026-05-15-tier3-drop-unused-indexes.sql` drops these
+-- from existing deployments (DROP INDEX IS allowed by AGE 1.6, unlike DROP COLUMN).
+CREATE INDEX IF NOT EXISTS idx_post_creator_id ON "Post" (creator_id);
 
 -- =========================================================================
 -- 4. Per-friend top-K message composite indexes — DROPPED (IC2 rewrite 2026-05-13)

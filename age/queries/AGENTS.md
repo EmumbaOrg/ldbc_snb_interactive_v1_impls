@@ -107,7 +107,11 @@ For each query, read both the YAML spec and the SQL file, then verify:
 
 13. **Never write `cypher(` literally in SQL comments for parameterized queries.** The JDBC handler binds one agtype JSON parameter per `cypher(` occurrence found in the SQL via naive `indexOf("cypher(")` — it does NOT strip comments. If a comment contains `cypher()` or `cypher(` literally, the handler will try to bind more parameters than there are `?` placeholders and the query crashes with `column index is out of range: N, number of columns: M`. Write "Cypher" (no parens) or "the Cypher call" in commentary instead. Applies to any query listed in `age_parameterized_queries` in `driver/*-local.properties` — currently IC4, IC6-IC8, IC10-IC12, IS1-IS5, IS7, IU2, IU3, IU5, IU8. Tracked durable fix: strip SQL comments in `countCypherCalls()` in `AgeUpdateOperationHandler` / `AgeSingletonOperationHandler` / `AgeListOperationHandler`.
 
-14. A query should never access the AGE tables directly from the outer SQL. Its strictly forbidden. 
+14. A query should never access the AGE tables directly from the outer SQL. Its strictly forbidden.
+
+    **Scope:** this rule applies to runtime query files in `age/queries/` (the IC, IS, and IU SQL files invoked by the LDBC driver). Deploy-time tooling in `age/scripts/` is exempt — `denormalize-schema.sql`, the load-time backfill, and one-off migrations routinely read AGE label tables to populate side tables. That is the job of those scripts. They are not on the runtime path; they run once after bulk load (or as part of an explicit migration) and are not subject to the per-query optimisation rules that motivate §14.
+
+    Rationale for the runtime-vs-deploy split: the §14 ban is about queries that fight the AGE planner — agtype property access from outer SQL is fragile, slow at SF100+, and creates a moral hazard toward pure-SQL implementations that bypass Cypher (AGENTS.md §3). Deploy-time scripts don't have those concerns: they run once on a known dataset shape, performance is amortised across the deployment lifetime, and writing to side tables via SQL is the explicit denormalization mechanism.
 
 ## AGE 1.6 Cypher Constructs — Reference for Query Design
 
