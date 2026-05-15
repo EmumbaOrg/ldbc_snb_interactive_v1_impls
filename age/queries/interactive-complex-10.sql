@@ -1,16 +1,18 @@
 -- LdbcQuery10 — FoF with birth-window match, scored by common-interest posts vs total posts.
 -- V7: Two-call structure splits FoF walk from interest scoring.
--- First call: directed 2-hop KNOWS walk, birthday window, direct-friend exclusion, city lookup.
--- Second call: traverses p's interests ONCE per query (not once per friend), changing scaling
+-- Cypher 1: directed 2-hop KNOWS walk, birthday window, direct-friend exclusion, city lookup.
+-- Cypher 2: traverses p's interests ONCE per query (not once per friend), changing scaling
 -- from O(friends × posts_per_friend) to O(interests × posts_per_tag).
--- SQL outer layer joins the two Cypher results and the PersonPostCount side table only.
+-- SQL outer layer joins the two Cypher results and PersonPostCount side table only.
+-- MATERIALIZED is required on both CTEs: without it PostgreSQL inlines the two cypher() calls
+-- into a single cross-product plan that does not terminate in finite time.
 -- Directed -[:KNOWS]-> per AGE-QUIRKS §11. Fixed-depth 2-hop per AGE-QUIRKS §4.
 -- count(DISTINCT post) aggregated in WITH before RETURN per AGE-QUIRKS §5.
 -- Indexes: gin_person (seed), idx_knows_start (FoF), idx_islocatedin_start (city),
 --          idx_hasinterest_start (p->tags), idx_hastag_end (tag<-posts),
 --          idx_hascreator_start (post->creator), PersonPostCount PK.
 
-WITH surviving_friends AS (
+WITH surviving_friends AS MATERIALIZED (
   SELECT
     (friend_gid::text)::ag_catalog.graphid  AS friend_gid,
     (friend_id::text::bigint)               AS friend_biz_id,
@@ -33,7 +35,7 @@ WITH surviving_friends AS (
           friend_first_name agtype, friend_last_name agtype,
           friend_gender agtype, city_name agtype)
 ),
-interest_post_counts AS (
+interest_post_counts AS MATERIALIZED (
   SELECT
     (creator_gid::text)::ag_catalog.graphid  AS creator_gid,
     (score::text)::bigint                    AS common_post_count

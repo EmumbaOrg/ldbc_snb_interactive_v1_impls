@@ -129,9 +129,13 @@ CREATE INDEX idx_comment_hascreator_end   ON ldbc_snb."COMMENT_HAS_CREATOR" (end
 ### OPT-2 — Two-Cypher split: separate FoF walk from interest scoring
 
 **Category:** Query restructuring (no schema change)  
-**Impact:** Reduces interest-scoring I/O from ~1.7 M buffers to an estimated ~15–20 K buffers (~100×)  
+**Impact:** Reduces interest-scoring I/O from ~1.7 M buffers to ~93 % less (measured)  
 **Risk:** Low. Two separate `cypher()` calls; SQL JOIN combines them. Fully compliant with
 the no-direct-AGE-table rule (SQL only touches `PersonPostCount`).
+
+**MATERIALIZED is required:** PostgreSQL 17 defaults to inlining non-MATERIALIZED CTEs.
+When both `cypher()` calls are inlined, the planner builds a cross-product plan that does
+not terminate (tested: >10 min timeout). Both CTEs must be declared `AS MATERIALIZED`.
 
 **Why it works:**  
 The current query computes the interest score inside the Cypher pipeline, which forces
@@ -153,13 +157,13 @@ we get a small creator→count table that can be joined back to surviving friend
 | PersonPostCount join | ~530 | ~1,600 |
 | **Combined** | | **~74,000** |
 
-Compare to current: **1,758,000** buffers → **96 % reduction**.
+Compare to current: **1,758,000** buffers → **96 % reduction** (predicted).
+Actual measured: **~128 K buffers average** → **~93 % reduction** (see §5).
 
 **Proposed query structure (V7):**
 
 ```sql
-WITH surviving_friends AS (
-  -- Cypher 1: FoF walk — unchanged, already fast
+WITH surviving_friends AS MATERIALIZED (
   SELECT
     (friend_gid::text)::ag_catalog.graphid  AS friend_gid,
     (friend_id::text::bigint)               AS friend_biz_id,
@@ -174,7 +178,7 @@ WITH surviving_friends AS (
     WHERE ((friend.birthMonth = $month AND friend.birthDay >= 21)
         OR (friend.birthMonth = ($month % 12) + 1 AND friend.birthDay < 22))
     OPTIONAL MATCH (p)-[direct:KNOWS]->(friend)
-    WITH friend, direct WHERE direct IS NULL
+    WITH DISTINCT friend, direct WHERE direct IS NULL
     MATCH (friend)-[:IS_LOCATED_IN]->(city:City)
     RETURN id(friend), friend.id, friend.firstName, friend.lastName,
            friend.gender, city.name
@@ -182,8 +186,7 @@ WITH surviving_friends AS (
           friend_first_name agtype, friend_last_name agtype,
           friend_gender agtype, city_name agtype)
 ),
-interest_post_counts AS (
-  -- Cypher 2: interest scoring — traverses p's interests ONCE, not once per friend
+interest_post_counts AS MATERIALIZED (
   SELECT
     (creator_gid::text)::ag_catalog.graphid  AS creator_gid,
     (score::text)::bigint                    AS common_post_count
@@ -194,7 +197,6 @@ interest_post_counts AS (
     WITH creator, count(DISTINCT post) AS score
     RETURN id(creator), score
   $$) AS (creator_gid agtype, score agtype)
-  -- Note: use -[:POST_HAS_CREATOR]-> after OPT-1 schema split to eliminate Post label filter
 )
 SELECT
   sf.friend_biz_id::ag_catalog.agtype                                                         AS personId,
@@ -272,15 +274,43 @@ same INCLUDE pattern as OPT-3).
 
 ## 5. Improvement Summary
 
-| Optimization | Buffers saved | % reduction | Exec time estimate |
+### Predicted vs Actual (SF10, Horizon DB, cache-warm)
+
+| Sample | V6 buffers | V7 buffers | Buffer reduction | V6 time | V7 time | Time reduction |
+|---|---|---|---|---|---|---|
+| S1 (pid=6597069812321, m=10) | 1,758,480 | 131,692 | **92.5 %** | 860 ms | 662 ms | 23 % |
+| S2 (pid=8796093047542, m=12) | 1,706,356 | 42,483 | **97.5 %** | 750 ms | 297 ms | 60 % |
+| S3 (pid=19791209314115, m=3) | 1,849,060 | 209,096 | **88.7 %** | 827 ms | 672 ms | 19 % |
+| **Average** | **~1,771 K** | **~128 K** | **~93 %** | **~840 ms** | **~544 ms** | **~35 %** |
+
+The original prediction was **96 %** buffer reduction and **~40–60 ms**. Actual buffer reduction
+is close (93 % vs 96 %). Actual execution time improved less than predicted (~544 ms vs ~50 ms)
+because:
+
+1. **Cypher 2 uses a Parallel Seq Scan on `Person`** to find the seed `p` instead of the GIN
+   index. In a MATERIALIZED CTE, the planner opts for a parallel seq scan over the GIN index
+   (65 K rows scanned, 3,592 buffers) because GIN indexes are not parallelizable. This adds
+   ~7 K buffers and ~20 ms per query.
+2. **`idx_post_graphid` Post label checks in Cypher 2** still fire because `HAS_TAG` edges
+   include both Posts and Comments. V7 removes the per-friend iteration (O(friends × posts))
+   but the per-tag iteration (O(tags × posts_per_tag)) still incurs these checks.
+3. **Tag fan-out variability**: S3's person has 2 interests with ~11 K tagged posts each
+   → 86 K `idx_hascreator_start` lookups → 173 K total Cypher 2 buffers. S2's person has
+   1 interest with only 74 post matches → 7 K buffers. The plan predicted a ~1,000 posts/tag
+   average; actual fan-out varies from 74 to 13,102 per tag.
+
+### Critical finding: MATERIALIZED CTEs are mandatory
+
+Without `AS MATERIALIZED` on both CTEs, PostgreSQL 17 inlines the two `cypher()` calls into
+a single cross-product plan that does not terminate (tested: >10 min timeout at SF10).
+The production query and EXPLAIN script have both been updated with `AS MATERIALIZED`.
+
+| Optimization | Buffers saved | % reduction | Exec time (actual SF10) |
 |---|---|---|---|
 | Baseline V6 | — | — | ~840 ms |
-| OPT-2 alone (two-Cypher split) | ~1,684 K | **96 %** | ~40–60 ms |
-| OPT-2 + OPT-1 (schema split) | ~1,720 K | **98 %** | ~20–35 ms |
-| OPT-2 + OPT-3 (covering idx) | ~1,834 K | **96.5 %** | ~35–55 ms |
-| OPT-2 + OPT-1 + OPT-3 | ~1,738 K | **98.5 %** | ~15–30 ms |
-
-Estimates for exec time assume SF10 cache-warm conditions. The primary win is OPT-2 alone.
+| OPT-2 + MATERIALIZED (V7, implemented) | ~1,643 K | **~93 %** | ~544 ms avg |
+| + OPT-3 (covering idx on HAS_CREATOR end_id) | ~1,793 K | **~93.5 %** | ~530 ms (est.) |
+| + OPT-1 (schema split, excluded) | ~1,720 K | **~98 %** | ~300–400 ms (est.) |
 
 ---
 
@@ -288,9 +318,9 @@ Estimates for exec time assume SF10 cache-warm conditions. The primary win is OP
 
 | Scale Factor | Current O(SF^1.5) | OPT-2 O(SF) |
 |---|---|---|
-| SF10 (baseline) | ~1.76 M buffers, ~840 ms | ~74 K buffers, ~50 ms |
-| SF100 | ~75 M buffers, ~35 s | ~740 K buffers, ~500 ms |
-| SF1000 | ~2.4 B buffers, timeout | ~7.4 M buffers, ~5 s |
+| SF10 (baseline) | ~1.76 M buffers, ~840 ms | ~128 K buffers, ~544 ms |
+| SF100 | ~75 M buffers, ~35 s | ~1.3 M buffers, ~5 s |
+| SF1000 | ~2.4 B buffers, timeout | ~13 M buffers, ~50 s |
 
 The current query has an inherent O(friends × messages_per_friend) cost structure. Both
 `friends` and `messages_per_friend` grow with SF (LDBC power-law degree distribution),
@@ -304,11 +334,12 @@ grows proportionally with SF.
 
 | Step | Change | File(s) | Status |
 |------|--------|---------|--------|
-| **1** | Implement OPT-2: two-call V7 query | `age/queries/interactive-complex-10.sql` | **Done** |
-| **2** | Update EXPLAIN script with V7 query for re-profiling | `age/ic10-explain-sf10.sql` | **Done** |
+| **1** | Implement OPT-2: two-call V7 query with MATERIALIZED | `age/queries/interactive-complex-10.sql` | **Done** |
+| **2** | Update EXPLAIN script with V7 + MATERIALIZED for re-profiling | `age/ic10-explain-sf10.sql` | **Done** |
 | **3** | Update `INDEXES.md` IC10 row to reflect V7 index usage | `age/queries/INDEXES.md` | **Done** |
 | **4** | Add OPT-3 covering index on `HAS_CREATOR (end_id) INCLUDE (start_id)` | `age/scripts/create-indexes.sql`, `age/queries/INDEXES.md` | **Done** |
-| ~~5~~ | ~~OPT-1: split HAS_CREATOR edge labels~~ | — | **Excluded** (LDBC schema change) |
+| **5** | Run V7 EXPLAIN ANALYZE and record actual results | `age/ic10-explain-sf10-v7-results.txt` | **Done** |
+| ~~6~~ | ~~OPT-1: split HAS_CREATOR edge labels~~ | — | **Excluded** (LDBC schema change) |
 
 **AGENTS.md compliance for V7:**
 - All graph traversal through two `cypher()` calls — no direct AGE label table access in SQL.
@@ -321,12 +352,17 @@ grows proportionally with SF.
 
 ## 8. What is NOT worth changing
 
-- **FoF walk (KNOWS traversal):** Already fast at ~40 K buffers / ~77 ms. Accounts for < 3 %
-  of total cost. Any further tuning there has negligible impact.
-- **Direct-friend exclusion (`OPTIONAL MATCH NOT`):** Costs ~3,460 buffers (0.2 %).
+- **FoF walk (KNOWS traversal):** Already fast at ~32 K buffers / ~175 ms. Accounts for < 25 %
+  of total cost in V7. Any further tuning there has negligible impact.
+- **Direct-friend exclusion (`OPTIONAL MATCH NOT`):** Costs ~3,460 buffers (0.2 % of V6).
   The UNION-dedup trick (IC9 V4) is not applicable here since IC10 requires 2-hop-only
   (pure FoF, excluding direct friends), not 1-hop ∪ 2-hop.
 - **Birthday filter placement:** Filter rejects ~92 % of FoF candidates but runs only on
-  `idx_person_graphid` probes (~30 K buffers). Functional indexes on `birthMonth`/`birthDay`
+  `idx_person_graphid` probes (~22 K buffers). Functional indexes on `birthMonth`/`birthDay`
   would not help since the FoF enumeration forces a person lookup per candidate regardless.
 - **`PersonPostCount` join:** PK index scan at < 0.1 % of buffers. Already optimal.
+- **GIN vs Seq Scan on Person in Cypher 2:** The planner prefers a parallel seq scan over
+  `gin_person` for the seed lookup in MATERIALIZED CTEs (~3,592 extra buffers). Fixing this
+  would require a planner hint (not available in vanilla PostgreSQL) or a functional B-tree
+  index on `properties->>'id'`. The buffer cost is small (~2.7 % of V7 total) and not worth
+  the complexity.
