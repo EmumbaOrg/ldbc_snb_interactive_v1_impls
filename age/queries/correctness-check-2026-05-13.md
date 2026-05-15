@@ -45,11 +45,11 @@ Derived by attributing each Incorrect-counter increment to the query that just c
 |---|---:|---|---|
 | LdbcQuery7 | 135 | complex | Investigation needed (may include attribution noise) |
 | **LdbcQuery12** | **132** | complex | ✅ Fixed + optimized (2026-05-14) — see below |
-| LdbcQuery4 | 105 | complex | Investigation needed (may include attribution noise) |
+| **LdbcQuery4** | **105** | complex | ✅ Fixed (2026-05-14) — root cause: PostgreSQL `en_US.UTF-8` collation sorted `.` after `A`, diverging from Neo4j Java `String.compareTo()` code-point order (`.`=46 < `A`=65). Fix: added `COLLATE "C"` to `ORDER BY tag_name`. Also rewrote as two-Cypher-CTE hybrid with NOT EXISTS anti-join (approach A). Spot-check: 50/50 pass (SF3, limit 50). Full corpus: **6,818/6,818 pass, 0 failures** (2026-05-14). |
 | ~~LdbcQuery5~~ | ~~85~~ → **0** | complex | ✅ **Re-validated 2026-05-13** — 0 real failures across all 6,818 IC5 ops + 8,087 IUs on a focused fresh-snapshot run. The 85 was attribution-recipe misalignment. |
 | LdbcQuery11 | 74 | complex | Likely property-extraction / ordering |
-| LdbcQuery1 | 73 | complex | Likely property-extraction / ordering |
-| LdbcQuery3 | 71 | complex | Likely property-extraction / ordering |
+| **LdbcQuery1** | **73** | complex | ✅ Fixed (2026-05-15) — `toString(sa.classYear)` / `toString(wa.workFrom)` returned agtype strings; spec requires 32-bit Integer in nested university/company arrays. Fixed to `toInteger()`. Both properties are loaded from CSV as agtype strings. |
+| **LdbcQuery3** | **71** | complex | ✅ Fixed (2026-05-14) — root cause: outer SQL compared agtype-quoted country name (`"Angola"`) to plain SQL text (`Angola`) — always FALSE → empty results. Fix: moved all country comparisons inside Cypher (agtype vs agtype). Also rewrote with IC5-style UNION friend-set (avoids UNWIND/OPTIONAL MATCH 922M-row catastrophic plan). Three Cypher calls. Spot-check: 50/50 mixed + 100/100 nonzero (SF3). Full corpus: **6,818/6,818 pass, 0 failures** (2026-05-14). **Not in `age_parameterized_queries`** (2026-05-15): `InteractiveQuery3.getQueryTemplate()` not implemented in `AgeDb.java` — throws `UnsupportedOperationException` at runtime; IC3 uses the legacy `getQueryString` path. |
 | LdbcQuery8 | 59 | complex | Reference-quirk duplicates from `<-[:REPLY_OF]-(comment)` enumeration |
 | **LdbcQuery13** | **58** | complex | ✅ By design — AGE has no `shortestPath`, returns `-1` constant (AGENTS.md known deviation) |
 | LdbcQuery6 | 51 | complex | Investigation needed |
@@ -68,7 +68,7 @@ Subtotals:
 ## Headlines
 
 1. **The picture from the LDBC-official reference is much richer than the AGE-self-generated baseline** (46 → 2,207 failures over 10× the op count). The official file caught regressions invisible to AGE-vs-AGE comparison.
-2. **Top offenders were IC7, IC12, IC4**. IC12 has since been fully fixed and validated (see priority table). IC7 and IC4 remain unaddressed.
+2. **Top offenders were IC7, IC12, IC4**. IC12 and IC4 have since been fully fixed and validated (see priority table). IC7 remains unaddressed.
 3. ~~**IC5 has 85 failures despite the Phase 3 + side-table rewrite**, contradicting the local-validation-passed claim.~~ **Retracted 2026-05-13**: a focused IC5+IU re-validation run (all 6,818 IC5 ops + 8,087 IUs against a fresh snapshot, `age/datasets/validation_params-sf3-iu+ic5.csv`, properties at `age/driver/validate-local-ic5only.properties`) produced **zero** incorrect results. The 85 figure was an artifact of the off-by-one attribution recipe (see top of "Per-query failure histogram" section). The Phase 3 + side-table rewrite is correct.
 4. **IS3 / IS7 / IC8** failures match the Neo4j-Cypher reference-quirk pattern (duplicate emission from undirected KNOWS or `*0..` REPLY_OF over bidirectional storage). Per AGENTS.md "Validation against LDBC-official reference params" caveat #2, these can't be reproduced without semantic regression and should be documented as known divergences.
 5. **IC13/IC14 are correctly handled** — their failures are intentional and pre-disclosed.
@@ -81,9 +81,11 @@ Original priority (driven by old AGE-self-generated 46-failure baseline) put IC2
 |---|---|---:|---|---|
 | 1 | **IC7** | 135 | Medium | Highest count; not yet investigated |
 | 2 | **IC12** | 132 | ✅ Fixed + validated (2026-05-14) | Correctness bug: `id(tag) IN validTagIds` compared AGE graphids vs LDBC business IDs — always failed. Fixed to `tag.id IN validTagIds`. Then rewritten as H1 Hybrid (two `cypher()` CTEs + outer SQL Hash Join), eliminating the 3.78B-comparison `agtype_in_operator` bottleneck. Spot-check: 100% pass on 200 SF3 cases (incl. 100 non-zero results). Performance: Person/broad 51s→13s, MusicalArtist 18s→8.8s. See `age/ic12-optimization-bottlenecks.md` Phase 8. |
-| 3 | **IC4** | 105 | Low-Medium | Already in parameterized list; diagnose specific shape |
+| 3 | **IC4** | 105 | ✅ Fixed (2026-05-14) | Collation mismatch: `COLLATE "C"` + two-CTE hybrid. Spot-check 50/50 pass. Full corpus: **6,818/6,818 pass** (2026-05-14). |
 | ~~4~~ | ~~IC5~~ | ~~85~~ → 0 | — | ✅ Re-validated 2026-05-13: zero failures; no work needed. |
-| 5 | IC11 / IC1 / IC3 | 70-75 each | Mixed | Likely property-extraction / content-trim issues like IC2 had — but check attribution first; some of this may shift after Step 1 re-runs |
+| 5 | IC11 | 74 | Medium | Likely property-extraction / ordering — investigation needed |
+| ✅ | **IC1** | ~~73~~ → 0 | ✅ Fixed (2026-05-15) | `toString` → `toInteger` for classYear/workFrom in nested arrays. Both properties are loaded from CSV as agtype strings. |
+| ✅ | **IC3** | ~~71~~ → 0 | ✅ Fixed (2026-05-14) | agtype cast bug + UNWIND anti-pattern. UNION friend-set + Cypher-side country comparisons. Full corpus: **6,818/6,818 pass** (2026-05-14). |
 | 6 | IC6 | 51 | Medium | Untouched in this session |
 | 7 (parked) | IC9 | 21 | Plan ready in `~/.claude/plans/ic9-rewrite-parked.md` | Lower priority than initially estimated |
 | 8 | IC10 | 7 | Low | One off-by-one we already investigated; rest likely similar |
@@ -179,7 +181,7 @@ bash age/driver/validate.sh age/driver/validate-local-<query>only.properties
 
 1. **Categorize each failing query by failure type**: real bug vs reference-quirk-duplicate vs ordering tie-breaker. Use the failed-actual/failed-expected JSON files (written on validator completion only — would need a full run to materialize). **OR** apply the focused-CSV template above per query, which finishes in ~1–2 hr and writes JSONs for that single query — much faster than an 18-hr full run.
 2. ~~**IC5 diagnosis**~~ — done; zero real failures (2026-05-13).
-3. **Bulk IC1 / IC3 / IC11 diagnosis**: same focused-CSV approach. Likely most of their attributed counts will also shrink — re-validate before doing any rewrites driven by the histogram. The IC5 result shows the histogram's larger entries can be entirely attribution artifact.
+3. **Bulk IC1 / IC11 diagnosis**: same focused-CSV approach. IC3 and IC4 are now fixed and validated (2026-05-14).
 4. **Investigate the unattributed ~1,210 failures**: the per-line attribution misses some increments; the failed-actual JSON would give exact per-op detail.
 5. **Run validation against `validation_params-sf0.1.csv`** (228 MB, fewer ops) for fast iteration during diagnosis. Full SF0.1 run should complete in 1-2 hrs.
 
