@@ -226,22 +226,92 @@ only (~30K rows, fits in memory, no temp spill). Measured improvement: **~344 ms
 
 **Affected queries:** IC1 (all 3 hop arms). Any query using a 2-hop `(n)-[e:EDGE]->(x:Label)-[:IS_LOCATED_IN]->(:Country)` OPTIONAL MATCH pattern in Cypher may trigger the same pathology.
 
-## 13. `cypher()` is plan-cached only when parameterised
+## 13. Prepared-statement plan caching is a net loss for AGE Cypher property MATCH (2026-05-15 reversal)
 
-If we inline parameter values into the Cypher source as text (e.g.
-`MATCH (p:Person {id: 933})`), every call is a fresh parse + plan.
-Passing parameters as the third argument
-(`cypher('graph', $$ MATCH (p:Person {id: $personId}) ... $$, $1)`)
-lets the cypher() function cache the plan across calls with the same
-shape — a 30–60% improvement on hot queries.
+**Earlier guidance in this section claimed the parameterised path was 30-60%
+faster on hot queries. That was wrong — measured empirically against SF3 on
+2026-05-15, the parameterised path is equal-or-slower for every shape
+we ship, and catastrophically slower for several.**
 
-**Implications:**
-- Every IC, IS, and IU query is parameterised. Parameters arrive as a
-  single agtype JSON object built by the Java handler from the LDBC
-  driver's input. IC3 is the only query that has a parameter reference
-  in *outer SQL* (`SUM(CASE WHEN country = $countryXName)`) — its
-  outer SQL is not prepared-statement-cached, but each inner
-  `cypher()` arm still is.
+### Why the parameterised path can't bind GIN
+
+`MATCH (n:Label {prop: $param})` compiles to
+`properties @> agtype_build_map('prop', agtype_access_operator($1, '"param"'::agtype))`.
+The `agtype_access_operator($1, …)` call is a runtime function — PostgreSQL
+can't fold it at plan time, so the GIN cost estimate balloons and the
+planner falls back to **`Seq Scan` on the label table**.
+
+Whether PostgreSQL sticks with the generic plan (Seq Scan) or re-plans
+custom each call (GIN bitmap with literal) depends on which is cheaper
+on paper. For shapes where the generic Seq Scan estimate looks "small
+enough" (single-node MATCH on a small-to-medium table), PostgreSQL
+locks in the generic plan and you eat Seq Scan forever.
+
+### Measured impact at SF3 (PREPARE/EXECUTE repro)
+
+| Shape | Cached plan | Per-call cost |
+|---|---|---|
+| `MATCH (m:Comment {id:$})` *(SQ4)* | **Seq Scan on Comment (6.4M rows)** | **4,737 ms p50** |
+| `MATCH (p:Person {id:$}) ...` *(SQ1, IC2…)* | **Seq Scan on Person (24K rows)** | **~170 ms baseline** |
+| `MATCH (t:Tag {name:$})` *(Q6)* | **Seq Scan on Tag (16K rows)** | **24 ms** |
+| `MATCH (m:Comment {id:$})-[:HAS_CREATOR]->(p)` *(SQ5)* | Custom plan, gin_comment | 0.48 ms |
+| `MATCH (m:Post {id:$})<-[:REPLY_OF]-...` *(SQ7)* | Custom plan, gin_post | 1.05 ms |
+| `MATCH (p:Person {id:$1}), (post:Post {id:$2})` *(IU2/3/8)* | Custom plan, both GIN | 0.14 ms |
+
+The bottom three are safe because the edge or multi-anchor join inflates
+the generic-plan estimate above the custom-plan cost — PostgreSQL keeps
+re-planning. But **even when the cached path uses a custom plan**, the
+parameterised wrapper adds an `agtype_access_operator($1, '"key"')`
+extraction per execution that the literal path skips:
+
+| Query | Parameterised total | Non-parameterised total | Diff |
+|---|---|---|---|
+| SQ5 | 1.48 ms | 0.50 ms | non-param wins ~1 ms |
+| IU2 | 0.25 ms | 0.22 ms | wash |
+| IU8 | 0.15 ms | 0.11 ms | wash |
+
+### Projected SF1000 behaviour
+
+- Tables grow ~313× (Comment 6.4M → 2B, Person 24K → 10M).
+- Seq Scan cost grows linearly → minutes-to-hours per call where the
+  generic plan locks in.
+- GIN bitmap scan grows logarithmically → barely changes (one or two
+  extra btree levels).
+- The cost gap between generic Seq Scan and custom GIN *widens* at scale,
+  so PostgreSQL is *more* likely to stay on custom plans for the
+  safe shapes at SF1000. But the dangerous shapes (single-node MATCH
+  on a big table) don't auto-recover — they'd just get worse.
+
+### Resolution (durable, repo-wide)
+
+**`age_parameterized_queries=` is empty in every `driver/*.properties` file.**
+Every IC/IS/IU op goes through `Statement.execute()` with the value
+string-substituted into the SQL by the Java handler before send. The
+planner sees a literal, evaluates GIN cost against the known value, and
+picks the bitmap-scan path. Per-call savings are ~0.5-1 ms on the safe
+shapes and 4,700 ms on SQ4.
+
+Do not add queries back to `age_parameterized_queries` without
+PREPARE/EXECUTE re-measurement against the current SF — the planner's
+generic-plan threshold is a function of table-size cost estimates that
+shift as the dataset grows.
+
+### Side benefit
+
+Empty parameterised list also eliminates the `countCypherCalls()` trap
+in `AgeListOperationHandler` (AGENTS.md §13 → see new quirk **§15**
+below) — the handler is bypassed entirely. Writing the literal token
+`cy` + `pher(` in a SQL comment no longer crashes the query.
+
+**Implications for query authors:**
+- Every IC, IS, and IU query is non-parameterised. Parameters arrive
+  as a single `Map<String, Object>` built by the Java handler from the
+  LDBC driver's input; the handler substitutes them as quoted literals
+  into the SQL template before send.
+- The Cypher source can still use `$paramName` for AGE's own
+  intra-Cypher parameter binding — that's a separate mechanism (the
+  third argument of `cypher()`) and works fine. What's gone is the
+  prepared-statement plan caching at the PostgreSQL layer.
 
 ## 14. Outer-SQL `ORDER BY` on agtype strings needs `COLLATE "C"`
 
@@ -275,6 +345,55 @@ this knob doesn't apply — the fix lives in outer SQL only.
 non-alphanumeric ASCII is potentially affected; audit IC6, IC12 and IS2
 when next touched.
 
+## 15. GIN containment with a runtime parameter falls back to Seq Scan
+
+The deepest reason §13 had to be reversed: AGE 1.6's Cypher property
+MATCH compiles to a `properties @> agtype_build_map(key, value)`
+predicate against the label table's `gin_<label>` index. PostgreSQL's
+GIN bitmap-scan cost estimator can only consult statistics when the
+search term is a **literal `agtype` value known at plan time**. When the
+search term arrives as `agtype_access_operator($1, '"key"')`, the
+estimator has no histogram to consult, the estimated bitmap cost stays
+high, and the planner picks the cheaper-looking estimate — which is
+`Seq Scan` for tables with low row count or small heap size.
+
+Three concrete failure modes:
+
+1. **Large label table, single-node MATCH** — generic plan locks in
+   Seq Scan, per-call cost is "scan most rows × agtype `@>` recheck
+   cost." SQ4 at SF3 hits this: 4,737 ms p50 vs 5 ms for the literal
+   path.
+2. **Medium label table, single-node MATCH** — Seq Scan looks cheap
+   (~1,700 cost units for Person at SF3) so generic plan picks Seq
+   Scan; baseline ~170 ms per call. Bad at SF1000 where Person scales
+   to ~10M rows.
+3. **Small label table, single-node MATCH** — Seq Scan estimate is
+   competitive with GIN; planner picks Seq Scan. Q6's Tag (16K rows)
+   shows ~24 ms baseline; Tag stays small at SF1000 so the cost is
+   bounded, but it's still wasted relative to GIN's ~1 ms.
+
+**What protects against this:**
+- An edge join after the property MATCH inflates the generic-plan
+  estimate enough that PostgreSQL falls back to per-call custom plans
+  (which use the literal-substituted GIN bitmap scan). SQ5/SQ7 stay
+  fast for this reason.
+- Multi-anchor MATCH (e.g. `(person:Person {id:$1}), (post:Post {id:$2})`)
+  multiplies the generic-plan cost beyond the custom-plan cost.
+  IU2/IU3/IU8 stay fast for this reason.
+
+**The durable workaround** (now in place): force literal substitution
+by emptying `age_parameterized_queries` everywhere. See §13 for
+measurements and rationale. Any future query that property-MATCHes a
+single node and would benefit from plan caching must verify under
+`PREPARE/EXECUTE` that the cached plan does *not* Seq Scan — preferably
+at SF100 or higher.
+
+**Affected queries** (all now use literal substitution as of 2026-05-15):
+SQ4 (catastrophic), Q6 (24 ms tax), SQ1/SQ2/SQ3/Q2/Q4/Q7/Q8/Q10/Q11/Q12
+(170 ms tax via Person anchor). SQ5, SQ7, IU2, IU3, IU8 are
+structurally safe but excluded too for code-path simplicity (the per-call
+parse-savings of the parameterised path don't materialise; see §13).
+
 ---
 
 ## Summary table — quirk → affected queries
@@ -293,5 +412,6 @@ when next touched.
 | 10 | `NOT (p)-[:TYPE]-(n)` negation rejected by parser | IC9 V4 (uses UNION dedup instead) |
 | 11 | Undirected traversal disables seed-node index | IC1, IC2, IC3, IC5, IC6, IC9, IC10, IC11, IS3, IS7 (all fixed: use directed `->`, IU8 guarantees symmetry) |
 | 12 | Multi-hop OPTIONAL MATCH triggers backward hash join + disk spill | IC1 (WORK_AT 2-hop pattern; fixed by splitting into two 1-hop steps with intermediate WITH) |
-| 13 | Plan caching needs params | every query (parameterised path) |
+| 13 | Prepared-statement plan caching is a net loss for property MATCH | every query (now all non-parameterised) |
 | 14 | PG default collation sorts punctuation after letters | IC4 (fixed: `::text COLLATE "C"` in outer SQL ORDER BY tie-breaker) |
+| 15 | GIN containment with runtime param → Seq Scan | SQ4, Q6, all Person-anchored ICs (root cause behind §13 reversal) |

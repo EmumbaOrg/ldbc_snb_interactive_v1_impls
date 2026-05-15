@@ -23,7 +23,28 @@
 -- internal trailing whitespace (LDBC datagen produces messages with significant
 -- trailing chars). A ::text cast bypasses the unwrap and triggers .trim() on
 -- the bare value, stripping the trailing space and breaking validation.
+--
+-- Parameterized-path note: $maxDate is projected back out of the friend-set
+-- Cypher call (as "md") rather than referenced as bare outer SQL. The driver's
+-- parameterized handler only binds the agtype-JSON parameter map into AGE
+-- Cypher invocations; any $name in outer SQL reaches Postgres unsubstituted
+-- and trips "syntax error at or near $". Same agtype payload is reused per
+-- row — no extra invocation, no extra binding, no per-row overhead at plan
+-- time (the LATERAL sees friends.max_date as a row-local constant and can
+-- still range-scan idx_msgbycreator_creator_date_msg).
+-- AGE-QUIRKS §13 reminder: the literal token "cy" + "pher(" must never appear
+-- in SQL comments here, because AgeListOperationHandler.countCypherCalls
+-- substring-scans the whole template (including comments) and would over-bind.
 
+WITH friends AS (
+  SELECT
+    (fid::text)::bigint AS person_id,
+    (md::text)::bigint  AS max_date
+  FROM cypher('$graphName', $$
+    MATCH (p:Person {id: $personId})-[:KNOWS]->(friend:Person)
+    RETURN friend.id AS fid, $maxDate AS md
+  $$) AS x(fid agtype, md agtype)
+)
 SELECT
   m.creator_business_id::ag_catalog.agtype  AS personId,
   ag_catalog.text_to_agtype(ps.first_name)  AS personFirstName,
@@ -31,18 +52,12 @@ SELECT
   m.message_business_id::ag_catalog.agtype  AS messageId,
   ag_catalog.text_to_agtype(m.content)      AS messageContent,
   m.creation_date::ag_catalog.agtype        AS messageCreationDate
-FROM (
-  SELECT (fid::text)::bigint AS person_id
-  FROM cypher('$graphName', $$
-    MATCH (p:Person {id: $personId})-[:KNOWS]->(friend:Person)
-    RETURN friend.id AS fid
-  $$) AS x(fid agtype)
-) friends
+FROM friends
 CROSS JOIN LATERAL (
   SELECT mm.creator_business_id, mm.message_business_id, mm.creation_date, mm.content
   FROM ldbc_snb."MessageByCreator" mm
   WHERE mm.creator_business_id = friends.person_id
-    AND mm.creation_date <= $maxDate
+    AND mm.creation_date <= friends.max_date
   ORDER BY mm.creation_date DESC, mm.message_business_id ASC
   LIMIT 20
 ) m
