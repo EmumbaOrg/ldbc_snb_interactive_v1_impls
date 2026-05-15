@@ -4,6 +4,11 @@
 -- Two-branch UNION ALL: fixed-depth MATCH instead of variable-length path (AGE-QUIRKS §4).
 -- FoF branch uses OPTIONAL MATCH direct exclusion pattern (AGE-QUIRKS §10).
 -- Directed `-[:KNOWS]->` per AGE-QUIRKS §11.
+--
+-- Tie-breaker collation: organizationName DESC must use `COLLATE "C"` (codepoint order)
+-- to match the LDBC oracle. Default en_US.UTF-8 sorts punctuation (`_`) AFTER letters,
+-- which flips the order of company names like "Air_Niugini" vs "Airlines_PNG" at tie
+-- positions (same year + same personId, different company). See AGE-QUIRKS §14.
 
 SELECT * FROM (
   SELECT * FROM cypher('$graphName', $$
@@ -24,5 +29,5 @@ SELECT * FROM (
   $$) AS (personId agtype, personFirstName agtype, personLastName agtype,
           organizationName agtype, organizationWorkFromYear agtype)
 ) results
-ORDER BY organizationWorkFromYear ASC, personId ASC, organizationName DESC
+ORDER BY organizationWorkFromYear ASC, personId ASC, organizationName::text COLLATE "C" DESC
 LIMIT 10;

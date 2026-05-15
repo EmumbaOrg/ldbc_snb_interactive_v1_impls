@@ -78,8 +78,11 @@ agg AS (
         t.friend_fn_t,
         t.friend_ln_t,
         COUNT(DISTINCT t.comment_gid_s)                                              AS reply_count,
+        -- tag_name sort uses COLLATE "C" (codepoint order) to match LDBC oracle.
+        -- en_US.UTF-8 default sorts punctuation (`_`, `-`) after letters; LDBC uses codepoint.
+        -- See AGE-QUIRKS §14 + IC11 / IC4 precedents.
         '[' || string_agg(DISTINCT '"' || t.tag_name_t || '"', ','
-                          ORDER BY '"' || t.tag_name_t || '"') || ']'               AS tag_names_json
+                          ORDER BY ('"' || t.tag_name_t || '"') COLLATE "C") || ']'  AS tag_names_json
     FROM traversal t
     WHERE EXISTS (SELECT 1 FROM valid_tag_ids v WHERE v.tag_biz_id = t.tag_biz_id)
     GROUP BY t.friend_biz_id, t.friend_fn_t, t.friend_ln_t
