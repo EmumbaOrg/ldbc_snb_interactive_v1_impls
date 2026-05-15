@@ -325,19 +325,20 @@ BEGIN
 END $$;
 
 -- ForumMemberPostCount: aggregate Posts per (forum, creator) pair.
--- Post.forum_id retired 2026-05-14; source the forum graphid directly from
--- the CONTAINER_OF edge table (start_id = forum, end_id = post) joined to
--- Post.creator_id. ON CONFLICT DO NOTHING makes this idempotent.
+-- Post.forum_id retired 2026-05-14, Post.creator_id retired 2026-05-15 (Tier 3b);
+-- both edges are now sourced directly from CONTAINER_OF + HAS_CREATOR.
+-- ON CONFLICT DO NOTHING makes this idempotent.
 INSERT INTO "ForumMemberPostCount" (forum_id, member_id, post_count)
-SELECT co.start_id, p.creator_id, COUNT(*)::int
+SELECT co.start_id, hc.end_id, COUNT(*)::int
 FROM "Post" p
 JOIN "CONTAINER_OF" co ON co.end_id = p.id
-WHERE p.creator_id IS NOT NULL
-GROUP BY co.start_id, p.creator_id
+JOIN "HAS_CREATOR"  hc ON hc.start_id = p.id
+GROUP BY co.start_id, hc.end_id
 ON CONFLICT (forum_id, member_id) DO NOTHING;
 
--- PersonPostCount: aggregate from Post.creator_id. Pre-populate every
--- Person (even those with 0 posts) so IU6 increment can use UPDATE.
+-- PersonPostCount: aggregate posts per Person via HAS_CREATOR. Pre-populate
+-- every Person (even those with 0 posts) so IU6 increment can use UPDATE.
+-- (Post.creator_id retired 2026-05-15; traverse HAS_CREATOR directly.)
 INSERT INTO "PersonPostCount" (person_id, post_count)
 SELECT id, 0 FROM "Person"
 ON CONFLICT (person_id) DO NOTHING;
@@ -345,12 +346,12 @@ ON CONFLICT (person_id) DO NOTHING;
 UPDATE "PersonPostCount" ppc
    SET post_count = sub.cnt
   FROM (
-    SELECT creator_id, COUNT(*)::int AS cnt
-    FROM "Post"
-    WHERE creator_id IS NOT NULL
-    GROUP BY creator_id
+    SELECT hc.end_id AS person_gid, COUNT(*)::int AS cnt
+    FROM "Post" p
+    JOIN "HAS_CREATOR" hc ON hc.start_id = p.id
+    GROUP BY hc.end_id
   ) sub
- WHERE ppc.person_id = sub.creator_id
+ WHERE ppc.person_id = sub.person_gid
    AND ppc.post_count = 0;
 
 -- PersonSide: mirror Person {id, firstName, lastName} for IC9 + future use.
