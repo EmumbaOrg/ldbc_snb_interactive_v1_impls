@@ -17,8 +17,10 @@
 -- Outer SQL: Hash Join msgs x friends on graphid (O(msgs + friends) — both small),
 --   GROUP BY / HAVING / ORDER on native SQL types, agtype wrap in final SELECT.
 --
--- Three Cypher call occurrences -> JDBC handler binds the same agtype JSON to all three.
--- IC3 is in age_parameterized_queries (all params including country names inside JSON).
+-- Three Cypher call occurrences — all params (incl. country names) live inside the agtype JSON blob.
+-- IC3 is NOT in age_parameterized_queries: InteractiveQuery3.getQueryTemplate() is not implemented in
+-- AgeDb.java (throws UnsupportedOperationException). IC3 runs on the legacy getQueryString path until
+-- the Java override is added. See benchmark.properties / validate.properties exclusion comments.
 
 WITH friends AS MATERIALIZED (
     SELECT (friend_gid::text)::ag_catalog.graphid  AS friend_graphid,

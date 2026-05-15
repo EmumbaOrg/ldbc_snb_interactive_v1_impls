@@ -107,7 +107,10 @@ public class AgeDb extends BaseDb<AgeQueryStore> {
         }
     }
 
-    // IC3 has $countryXName/$countryYName in both Cypher and outer SQL — legacy path only
+    // IC3: getQueryTemplate() not implemented — base class throws UnsupportedOperationException.
+    // All IC3 params are inside the agtype JSON (no outer-SQL param references), so a
+    // getQueryTemplate override is feasible, but it has not been written yet.
+    // Until added, IC3 must NOT appear in age_parameterized_queries; it runs via getQueryString.
     public static class InteractiveQuery3
             extends AgeListOperationHandler<LdbcQuery3, LdbcQuery3Result> {
 

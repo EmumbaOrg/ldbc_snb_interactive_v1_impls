@@ -14,8 +14,8 @@
 --   Splitting forces binding of (f) and (co) separately so AGE can use idx_workat_start and
 --   idx_islocatedin_start per candidate rather than a full backward hash join.
 -- STUDY_AT aggregation uses the combined 2-hop pattern (already uses idx_studyat_start correctly).
--- toString() applied to integer fields (classYear, workFrom) to maintain the agtype-string array
---   format expected by the LDBC Java driver result consumer.
+-- toInteger() applied to string-stored fields (classYear, workFrom): both are loaded from CSV as
+--   agtype strings; the LDBC spec requires 32-bit Integer in the nested university/company arrays.
 -- Outer dedup: DISTINCT ON (friend_id bigint) ordered by dist ASC picks the minimum-distance row
 --   for each person — equivalent to the MIN(dist) GROUP BY candidates approach used in V3.
 
@@ -33,14 +33,14 @@ WITH
       OPTIONAL MATCH (f)-[sa:STUDY_AT]->(u:University)-[:IS_LOCATED_IN]->(uc:City)
       WITH f, city,
            collect(CASE WHEN u IS NOT NULL
-                        THEN [u.name, toString(sa.classYear), uc.name]
+                        THEN [u.name, toInteger(sa.classYear), uc.name]
                         ELSE null END) AS unis
       OPTIONAL MATCH (f)-[wa:WORK_AT]->(co:Company)
       WITH f, city, unis, wa, co
       OPTIONAL MATCH (co)-[:IS_LOCATED_IN]->(cc:Country)
       WITH f, city, unis,
            collect(CASE WHEN co IS NOT NULL
-                        THEN [co.name, toString(wa.workFrom), cc.name]
+                        THEN [co.name, toInteger(wa.workFrom), cc.name]
                         ELSE null END) AS companies
       RETURN f.id, f.lastName, 1 AS dist,
              f.birthday, f.creationDate, f.gender, f.browserUsed, f.locationIP,
@@ -70,14 +70,14 @@ WITH
       OPTIONAL MATCH (f)-[sa:STUDY_AT]->(u:University)-[:IS_LOCATED_IN]->(uc:City)
       WITH f, city,
            collect(CASE WHEN u IS NOT NULL
-                        THEN [u.name, toString(sa.classYear), uc.name]
+                        THEN [u.name, toInteger(sa.classYear), uc.name]
                         ELSE null END) AS unis
       OPTIONAL MATCH (f)-[wa:WORK_AT]->(co:Company)
       WITH f, city, unis, wa, co
       OPTIONAL MATCH (co)-[:IS_LOCATED_IN]->(cc:Country)
       WITH f, city, unis,
            collect(CASE WHEN co IS NOT NULL
-                        THEN [co.name, toString(wa.workFrom), cc.name]
+                        THEN [co.name, toInteger(wa.workFrom), cc.name]
                         ELSE null END) AS companies
       RETURN f.id, f.lastName, 2 AS dist,
              f.birthday, f.creationDate, f.gender, f.browserUsed, f.locationIP,
@@ -109,14 +109,14 @@ WITH
       OPTIONAL MATCH (f)-[sa:STUDY_AT]->(u:University)-[:IS_LOCATED_IN]->(uc:City)
       WITH f, city,
            collect(CASE WHEN u IS NOT NULL
-                        THEN [u.name, toString(sa.classYear), uc.name]
+                        THEN [u.name, toInteger(sa.classYear), uc.name]
                         ELSE null END) AS unis
       OPTIONAL MATCH (f)-[wa:WORK_AT]->(co:Company)
       WITH f, city, unis, wa, co
       OPTIONAL MATCH (co)-[:IS_LOCATED_IN]->(cc:Country)
       WITH f, city, unis,
            collect(CASE WHEN co IS NOT NULL
-                        THEN [co.name, toString(wa.workFrom), cc.name]
+                        THEN [co.name, toInteger(wa.workFrom), cc.name]
                         ELSE null END) AS companies
       RETURN f.id, f.lastName, 3 AS dist,
              f.birthday, f.creationDate, f.gender, f.browserUsed, f.locationIP,

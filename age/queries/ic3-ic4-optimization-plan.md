@@ -48,7 +48,7 @@ Keep the 2-arm UNION ALL shape. Fix the cast bug by moving country comparison lo
 - **Schema cost**: none.
 - **Expected perf**: 5-10× at SF100 (drive direction was wrong).
 - **AGENTS.md §13/§14**: 2 `cypher(` calls; outer SQL only reads `PersonSide`.
-- **Becomes parameterized**: add IC3 to `age_parameterized_queries`.
+- **Parameterization**: IC3 is **not** in `age_parameterized_queries` — `InteractiveQuery3.getQueryTemplate()` is not implemented; listing it throws `UnsupportedOperationException`. Uses legacy `getQueryString` path.
 
 #### Approach B — IC12-style three-CTE hybrid
 
@@ -191,7 +191,7 @@ python3 age/scripts/spot-check.py --query IC4 --sf 3 --all
 
 # 3. Re-enable IC3/IC4 in driver properties (done 2026-05-14):
 #    age/driver/validate.properties: LdbcQuery3_enable=true, LdbcQuery4_enable=true
-#    IC3 added to age_parameterized_queries in benchmark.properties + validate.properties
+#    IC3 NOT added to age_parameterized_queries (getQueryTemplate not implemented — see AgeDb.java)
 bash age/driver/validate.sh age/driver/validate.properties
 
 # 4. SF3 EXPLAIN ANALYZE (2026-05-14): ✅
@@ -209,5 +209,5 @@ bash age/driver/validate.sh age/driver/validate.properties
 | `age/queries/correctness-check-2026-05-13.md` | Attribution caveat + per-query status table |
 | `age/queries/interactive-complex-5.sql` | Gold-standard hybrid reference (MATERIALIZED CTE + side-table join) |
 | `age/queries/interactive-complex-12.sql` | H1 two-CTE hybrid reference (IC4 Approach A shape) |
-| `age/driver/validate.properties` | ✅ `LdbcQuery3_enable=true`, `LdbcQuery4_enable=true` (re-enabled 2026-05-14); `Query3` added to `age_parameterized_queries` |
-| `age/driver/benchmark.properties` | ✅ IC3 added to `age_parameterized_queries` (2026-05-14); comment updated to note 3 Cypher calls bound to `$1` |
+| `age/driver/validate.properties` | ✅ `LdbcQuery3_enable=true`, `LdbcQuery4_enable=true` (re-enabled 2026-05-14); `Query3` **not** in `age_parameterized_queries` — `getQueryTemplate` not implemented (2026-05-15) |
+| `age/driver/benchmark.properties` | ✅ `Query3` removed from `age_parameterized_queries` (2026-05-15): `InteractiveQuery3.getQueryTemplate()` throws `UnsupportedOperationException`; IC3 runs via `getQueryString` |
