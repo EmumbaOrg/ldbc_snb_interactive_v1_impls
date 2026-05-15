@@ -1,7 +1,21 @@
 -- LdbcUpdate1AddPerson — create a Person vertex with all edges and maintain side-table state.
--- Hybrid: Cypher block creates Person + IS_LOCATED_IN + HAS_INTEREST + STUDY_AT + WORK_AT in
--- one chained WITH/UNWIND block. SQL INSERT maintains:
---   PersonPostCount(person_id)  (iter-2 side table — initialised to 0)
+-- Hybrid: two Cypher calls.
+--
+-- Call 1: CREATE Person + IS_LOCATED_IN + HAS_INTEREST + STUDY_AT + WORK_AT in
+--         one chained WITH/UNWIND block. RETURN count(*) ensures exactly one row
+--         is produced even when $tagIds, $studyAt, or $workAt are empty lists
+--         (UNWIND [] produces 0 rows; count(*) aggregates them back to 1).
+-- Call 2: MATCH the just-created Person and RETURN id(p), p.firstName, p.lastName.
+--         Feeds PersonPostCount and PersonSide via a writable CTE so outer SQL
+--         never reads the AGE Person label table (AGENTS.md §14).
+--         firstName/lastName sourced from Cypher RETURN (not $personFirstName /
+--         $personLastName) because the driver's convertString() emits Cypher-style
+--         backslash escaping ('O\'Brien') that breaks SQL string literals.
+--         agtype string ::text removes the JSON quotes — verified: fn::text for a
+--         Cypher-returned property yields the bare unquoted text.
+--
+-- Side tables maintained:
+--   PersonPostCount(person_id)                    (iter-2, initialised to 0)
 --   PersonSide(person_business_id, first_name, last_name)  (Phase C mirror)
 --
 -- Person.city_id (iter-1 denorm) was previously written here but had no read
@@ -36,21 +50,31 @@ SELECT * FROM cypher('$graphName', $$
     CREATE (p)-[:WORK_AT {workFrom: w.year}]->(comp)
   RETURN count(*)
 $$) AS (result agtype);
-INSERT INTO ldbc_snb."PersonPostCount" (person_id, post_count)
-SELECT id, 0 FROM ldbc_snb."Person"
- WHERE CAST(ag_catalog.agtype_object_field_text(properties, 'id') AS bigint) = $personId
-ON CONFLICT (person_id) DO NOTHING
-;
--- PersonSide mirror. Source names from the just-inserted Person vertex rather
--- than $personFirstName/$personLastName because the driver's convertString()
--- emits Cypher-style backslash escaping ('O\'Brien') that breaks SQL string
--- literals. The Person vertex already has the value stored correctly.
+-- Call 2: MATCH the committed Person and feed both side tables in one statement
+-- via a writable CTE. The intermediate insert_ppc CTE consumes new_person for
+-- PersonPostCount; the outer INSERT consumes new_person again for PersonSide.
+-- Both run atomically in one SQL statement so new_person is evaluated once.
+WITH new_person AS (
+  SELECT
+    (new_gid::text)::ag_catalog.graphid AS person_gid,
+    fn::text                            AS first_name,
+    ln::text                            AS last_name
+  FROM cypher('$graphName', $$
+    MATCH (p:Person {id: $personId})
+    RETURN id(p) AS new_gid, p.firstName AS fn, p.lastName AS ln
+  $$) AS x(new_gid ag_catalog.agtype, fn ag_catalog.agtype, ln ag_catalog.agtype)
+),
+insert_ppc AS (
+  INSERT INTO ldbc_snb."PersonPostCount" (person_id, post_count)
+  SELECT person_gid, 0 FROM new_person
+  ON CONFLICT (person_id) DO NOTHING
+  RETURNING person_id
+)
 INSERT INTO ldbc_snb."PersonSide" (person_business_id, first_name, last_name)
 SELECT
   $personId,
-  ag_catalog.agtype_object_field_text(pr.properties, 'firstName'),
-  ag_catalog.agtype_object_field_text(pr.properties, 'lastName')
-FROM ldbc_snb."Person" pr
-WHERE CAST(ag_catalog.agtype_object_field_text(pr.properties, 'id') AS bigint) = $personId
+  np.first_name,
+  np.last_name
+FROM new_person np
 ON CONFLICT (person_business_id) DO NOTHING
 ;

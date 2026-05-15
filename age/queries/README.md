@@ -26,10 +26,10 @@ Use the `./check-feature.sh` script to check for Cypher features used across que
 
 ### IS2 implementation note
 
-IS2 was previously implemented with an 8-level chained `OPTIONAL MATCH` ladder in Cypher to walk the REPLY_OF chain. This caused Parallel Append seq-scans over all vertex labels at each level (the "unlabeled intermediate" pathology documented in AGE-QUIRKS §9) and produced ~2.8 s latency at SF0.1. The current implementation (V2) eliminates this pathology:
+IS2 was previously implemented with an 8-level chained `OPTIONAL MATCH` ladder in Cypher to walk the REPLY_OF chain. This caused Parallel Append seq-scans over all vertex labels at each level (the "unlabeled intermediate" pathology documented in AGE-QUIRKS §9) and produced ~2.8 s latency at SF0.1. The current implementation (V2, updated 2026-05-14) eliminates this pathology:
 
 - Two Cypher calls (`Comment` branch, `Post` branch) fetch the top-10 messages via `HAS_CREATOR`, each with `ORDER BY … LIMIT 10` as a final `RETURN` — safe because there is no mid-query `LIMIT` feeding further Cypher clauses.
-- A SQL `WITH RECURSIVE` CTE walks the `REPLY_OF` edge table directly (depth cap 20) to find each comment's root Post. Each step is one indexed lookup on `idx_replyof_start`. LDBC reply chains are bounded ~8 across all SFs; the depth-20 cap is a safety margin.
+- The `CommentRootPost` side table resolves each comment's root Post via a single index lookup on `comment_business_id` — replacing the earlier `WITH RECURSIVE` CTE that walked the `REPLY_OF` edge table directly. The `MessageByCreator` side table provides the root post's author, and `PersonSide` provides author name. Outer SQL only joins these three non-AGE side tables (AGENTS.md §14).
 
 The historical investigation notes (EXPLAIN ANALYZE traces, solutions explored) are preserved in the git commit history around the SQ2 investigation session.
 
@@ -218,24 +218,19 @@ since before `$workFromYear`. **Two-arm UNION**. Outer SQL sorts by
 ### IC12 — replies to posts in a tag class hierarchy
 
 Friends' Comments that reply to Posts whose tags belong to a given TagClass
-or any subclass thereof. The current implementation is **hybrid**:
+or any subclass thereof. The current implementation (V2 as of 2026-05-14) is **hybrid**:
 
-- One Cypher call resolves the root `TagClass` graphid by name.
-- A SQL `WITH RECURSIVE` CTE walks the `TagClass.subclass_of_id` denorm column
-  (iter-3) to collect all subclass ids.
-- A `valid_tags` CTE filters `Tag` rows via `Tag.tagclass_id` denorm (iter-3).
-- SQL JOINs use `Comment.creator_id` and `Comment.reply_of_id` denorm columns
-  (iter-1) plus `HAS_TAG` for matched comments — no Cypher traversal required
-  for the main join.
-- A second Cypher call fetches direct friends of `$personId`.
+- First Cypher call: resolves the `TagClass` hierarchy (up to 6 levels of
+  `IS_SUBCLASS_OF`) and returns all valid `tag.id` (LDBC business ids) via
+  chained `OPTIONAL MATCH`. MATERIALIZED forces a single evaluation.
+- Second Cypher call: main traversal — `(person)-[:KNOWS]->(friend)<-[:HAS_CREATOR]-(comment)-[:REPLY_OF]->(post:Post)-[:HAS_TAG]->(tag)`.
+  Each hop in its own WITH clause. Directed `KNOWS` per AGE-QUIRKS §11.
+- Outer SQL: Hash Semi Join filters comments whose tag appears in the first
+  CTE's valid-tag set; aggregates reply count and tag list per friend.
 
-This replaces the earlier single-Cypher approach that unrolled `IS_SUBCLASS_OF`
-to 6 levels with chained `OPTIONAL MATCH`. The recursive CTE on denorm columns
-is cleaner and scales better than Cypher unrolling.
-
-> **Why depth cap in the CTE?** PostgreSQL's recursive CTE terminates naturally
-> when no new rows are produced. No explicit depth cap is needed for `IS_SUBCLASS_OF`
-> because the LDBC TagClass hierarchy is acyclic.
+This replaced the earlier SQL-JOIN shape (which used `Comment.creator_id` and
+`Comment.reply_of_id` denorm columns plus a SQL recursive CTE for `IS_SUBCLASS_OF`).
+`Comment.creator_id` and `Comment.reply_of_id` were retired 2026-05-14 following this migration.
 
 ### IC13 / IC14 — shortest path queries
 
@@ -265,18 +260,18 @@ Single `MATCH` on Person by id, plus `IS_LOCATED_IN -> City`.
 ### IS2 — recent messages with original post
 
 Last 10 messages by `$personId` plus the root Post each is rooted in.
-The current implementation (V2) is **hybrid**:
+The current implementation (V2, updated 2026-05-14) is **hybrid**:
 
 - Two Cypher calls (Comment branch, Post branch) each return up to 10 messages
   via `HAS_CREATOR`, with `ORDER BY … LIMIT 10` as a final `RETURN` (safe).
-- A SQL `WITH RECURSIVE` CTE walks the `REPLY_OF` edge table to find each
-  comment's root Post (depth cap 20; each step is one indexed lookup on
-  `idx_replyof_start`).
-- The outer SQL joins root graphids back to the `Post` and `Person` tables
-  for author info, then re-sorts and returns the top 10.
+- The outer SQL looks up each comment's root Post via a single index probe on
+  `CommentRootPost.comment_business_id`, then joins `MessageByCreator` for the
+  root post author and `PersonSide` for author name. No direct reads of AGE
+  label tables (AGENTS.md §14).
 
 See the IS2 implementation note at the top of this file for the history of
-why the earlier 8-level Cypher unroll was replaced.
+why the earlier 8-level Cypher unroll and the subsequent RECURSIVE CTE were
+both replaced.
 
 ### IS3 — friends sorted by friendship date
 
@@ -318,11 +313,14 @@ input id can be either label.
 
 ## Update operations (IU1–IU8)
 
-These are write transactions. Most contain a single `cypher()` call that
+These are write transactions. Most contain a single Cypher call that
 `MATCH`es the referenced nodes and `CREATE`s the new edges/nodes. IU7 is
-the exception — it uses two `cypher()` calls to avoid an AGE MVCC concurrency
-bug (see IU7 below and the file header comment). Several IUs also include a
-SQL `UPDATE` after the Cypher `CREATE` to maintain denorm columns (iter-1).
+the exception — it uses **three** Cypher calls: Call 1 creates the Comment
+and drives the `CommentRootPost` INSERT via a writable CTE; Call 2 runs the
+`HAS_TAG` UNWIND in a fresh MVCC visibility window (AGE issue #1954); Call 3
+fetches the content string for the `MessageByCreator` INSERT. Several IUs
+also include a SQL `UPDATE` after the Cypher CREATE to maintain live denorm
+columns (e.g. `Post.creator_id` for IC10).
 
 ### IU1 — add Person
 
@@ -366,12 +364,17 @@ not both — we never store empty strings as content).
 ### IU7 — add Comment
 
 Creates a Comment with `HAS_CREATOR`, `REPLY_OF`, `IS_LOCATED_IN`, and
-`HAS_TAG` edges. The implementation uses **two `cypher()` calls** split to
-avoid an AGE MVCC concurrency bug (issue #1954):
+`HAS_TAG` edges. The implementation uses **three Cypher calls** (AGENTS.md §11
+— MVCC split is non-negotiable):
 
-- **Call 1**: resolves the `replyTo` target using `OPTIONAL MATCH (rp:Post {id: $replyToId})` + `OPTIONAL MATCH (rc:Comment {id: $replyToId})` with `COALESCE(rp, rc) AS replyTo` — typed OPTIONAL MATCH avoids the untyped-intermediate pathology (AGE-QUIRKS §9). Creates the Comment vertex plus `HAS_CREATOR`, `REPLY_OF`, and `IS_LOCATED_IN` edges.
-- **Call 2**: MATCHes the newly committed Comment, `UNWIND $tagIds`, and creates `HAS_TAG` edges. Runs in a fresh visibility window where the Comment is already visible, avoiding the MVCC trigger.
-- A SQL `UPDATE` maintains `Comment.{creator_id, reply_of_id, country_id}` denorm columns (iter-1).
+- **Call 1**: resolves the `replyTo` target using `OPTIONAL MATCH (rp:Post {id: $replyToId})` + `OPTIONAL MATCH (rc:Comment {id: $replyToId})` with `COALESCE(rp, rc) AS replyTo` — typed OPTIONAL MATCH avoids the untyped-intermediate pathology (AGE-QUIRKS §9). Creates the Comment vertex plus `HAS_CREATOR`, `REPLY_OF`, and `IS_LOCATED_IN` edges. A writable CTE drives the `CommentRootPost` INSERT in the same SQL statement.
+- **Call 2**: MATCHes the newly committed Comment, `UNWIND $tagIds`, and creates `HAS_TAG` edges. Runs in a fresh visibility window where the Comment is already visible, avoiding the MVCC trigger (AGE issue #1954).
+- **Call 3**: MATCHes the committed Comment and returns `content` for the `MessageByCreator` INSERT. Content is sourced from Cypher to avoid SQL substitution of the Cypher-escaped `$content` param.
+
+`Comment.creator_id` and `Comment.reply_of_id` denorm columns are fully retired
+2026-05-14 — the SQL `UPDATE` that wrote them has been removed. `Comment.country_id`
+was previously retired 2026-05-14. Outer SQL now only writes non-AGE side tables:
+`CommentRootPost` and `MessageByCreator` (AGENTS.md §14).
 
 ### IU8 — add Friendship
 
