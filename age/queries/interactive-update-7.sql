@@ -86,18 +86,21 @@ SELECT * FROM cypher('$graphName', $$
   RETURN count(comment)
 $$) AS (result agtype);
 
--- MessageByCreator: content sourced from a third Cypher MATCH (the Comment
--- is committed after Call 1) to avoid SQL substitution of $content.
-INSERT INTO ldbc_snb."MessageByCreator" (creator_business_id, message_business_id, creation_date, content, is_post)
+-- MessageByCreator: content + comment graphid sourced from a third Cypher
+-- MATCH (the Comment is committed after Call 1) to avoid SQL substitution of
+-- $content and to populate the message_id column (added 2026-05-15 so IC10
+-- can JOIN HAS_TAG by graphid without reading the AGE Post table).
+INSERT INTO ldbc_snb."MessageByCreator" (creator_business_id, message_business_id, message_id, creation_date, content, is_post)
 SELECT
   $authorPersonId,
   $commentId,
+  (comment_gid::text)::ag_catalog.graphid,
   $creationDate,
   content_agt::text,
   false
 FROM cypher('$graphName', $$
   MATCH (c:Comment {id: $commentId})
-  RETURN c.content AS content_agt
-$$) AS (content_agt ag_catalog.agtype)
+  RETURN id(c) AS comment_gid, c.content AS content_agt
+$$) AS (comment_gid ag_catalog.agtype, content_agt ag_catalog.agtype)
 ON CONFLICT DO NOTHING
 ;

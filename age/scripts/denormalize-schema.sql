@@ -26,13 +26,12 @@ SET search_path = ldbc_snb, ag_catalog, public;
 -- =========================================================================
 -- 1. Add denormalised graphid columns to entity tables
 -- =========================================================================
--- Only ONE live denorm column remains: Post.creator_id (read by IC10).
--- All other label-table denorm columns are retired — no runtime IC/IS/IU
--- query reads them. Tier 3 cleanup (2026-05-15) removed the ALTER TABLE
--- statements so fresh loads no longer create them.
+-- ALL label-table denorm columns are retired as of 2026-05-15 (Tier 3b).
+-- Post.creator_id — the last live denorm column — was retired when IC10
+-- migrated to use MessageByCreator.message_id for the HAS_TAG join.
 --
 -- Retired column inventory (NOT created on fresh loads after 2026-05-15):
---   Post:        forum_id, country_id
+--   Post:        forum_id, country_id, creator_id        (creator_id Tier 3b)
 --   Comment:     creator_id, reply_of_id, country_id
 --   Forum:       moderator_id
 --   Person:      city_id
@@ -47,68 +46,46 @@ SET search_path = ldbc_snb, ag_catalog, public;
 -- AGE 1.6 blocks `ALTER TABLE ... DROP COLUMN` on label tables with
 -- "table X is for label X". The columns persist as NULL and are inert;
 -- they cannot be physically dropped until AGE 1.7+ relaxes this guard
--- (or via a full graph rebuild). Tier-3 migration
--- `migrations/2026-05-15-tier3-drop-unused-indexes.sql` drops the matching
--- indexes (which IS allowed by AGE 1.6).
+-- (or via a full graph rebuild). Migrations
+-- `migrations/2026-05-15-tier3-drop-unused-indexes.sql` and
+-- `migrations/2026-05-15-tier3b-drop-post-creator-id-usage.sql`
+-- drop the matching indexes (which IS allowed by AGE 1.6).
 
-ALTER TABLE "Post" ADD COLUMN IF NOT EXISTS creator_id ag_catalog.graphid;
+-- (no ALTER TABLE ADD COLUMN statements remain; section retained for
+--  context. Future denorm columns added here would land in this section.)
 
 -- =========================================================================
 -- 2. Load-time backfill from edge tables
 -- =========================================================================
--- Each denorm column is filled by joining the entity table to its corresponding
--- edge table (NULL-safe — preserves existing values if re-run on partial data).
+-- All label-table denorm-column backfills are retired as of 2026-05-15 (Tier 3b).
+-- Backfill of message_id on MessageByCreator happens inline with the MessageByCreator
+-- INSERT in section 6 (using HAS_CREATOR + Post/Comment.id directly).
 
--- Post.creator_id ← HAS_CREATOR (Post → Person)
-UPDATE "Post" p
-   SET creator_id = hc.end_id
-  FROM "HAS_CREATOR" hc
- WHERE hc.start_id = p.id
-   AND p.creator_id IS NULL;
-
--- Post.forum_id retired 2026-05-14: IU6 now sources forum/author gids from
--- Cypher RETURN; no external reader existed.
+-- Post.creator_id retired 2026-05-15 (Tier 3b): IC10 migrated to use
+-- MessageByCreator.message_id; IU6 no longer writes Post.creator_id.
+-- Post.forum_id retired 2026-05-14: IU6 sources forum gid from Cypher RETURN.
 -- Post.country_id retired 2026-05-14: no read consumers.
-
--- Comment.creator_id and Comment.reply_of_id retired 2026-05-14: no read
--- consumers remain. UPDATE statements removed; columns stay on disk as NULL
--- (AGE 1.6 blocks DROP COLUMN on label tables). Indexes dropped by migration
--- 2026-05-14-retire-comment-creator-replyof.sql.
-
--- Comment.country_id, Forum.moderator_id, Person.city_id retired 2026-05-14:
--- no read consumers. Comment.country_id alone took ~10 min at SF3 on the
--- 6.4M-row Comment table; the saving compounds at SF10+.
-
--- Tag.tagclass_id + TagClass.subclass_of_id backfills retired 2026-05-15
--- (Tier 3). IC12 (the only consumer that previously read these) was migrated
--- to traverse `HAS_TYPE` / `IS_SUBCLASS_OF` via Cypher directly. No runtime
--- query reads these denorm columns. The ALTER TABLE ADD COLUMN statements
--- are also removed (section 1) so fresh loads don't create them. Existing
--- deployments retain the columns as NULL (AGE 1.6 blocks DROP COLUMN); the
--- matching indexes are dropped by
--- `migrations/2026-05-15-tier3-drop-unused-indexes.sql`.
-
--- Geographic hierarchy denorm columns (City.country_id, Country.continent_id,
--- University.city_id, Company.country_id) retired 2026-05-14: no read consumers
--- in any IC/IS/IU query. Tables are small (<2K rows total) so the saved time
--- is modest, but every retired write is also a §14 reduction.
+-- Comment.{creator_id, reply_of_id, country_id} retired 2026-05-14.
+-- Forum.moderator_id, Person.city_id retired 2026-05-14.
+-- Tag.tagclass_id, TagClass.subclass_of_id retired 2026-05-15 (Tier 3).
+-- City.country_id, Country.continent_id, University.city_id, Company.country_id
+-- retired 2026-05-14.
+--
+-- All retired columns persist as NULL on existing deployments (AGE 1.6 blocks
+-- `ALTER TABLE ... DROP COLUMN` on label tables). Corresponding indexes dropped by:
+--   migrations/2026-05-14-drop-post-forum-id.sql           (Tier 1)
+--   migrations/2026-05-14-retire-comment-creator-replyof.sql (Tier 2)
+--   migrations/2026-05-15-tier3-drop-unused-indexes.sql    (Tier 3)
+--   migrations/2026-05-15-tier3b-drop-post-creator-id-usage.sql (Tier 3b)
 
 -- =========================================================================
 -- 3. Indexes on the new columns
 -- =========================================================================
--- Single-column indexes for direct lookups, plus a few composites for the
--- hottest JOIN patterns (mirrors postgres ref's message_creatorid +
--- message_forumid + message_replyof + forum_moderatorid).
-
--- Only one live denorm-column index remains: idx_post_creator_id (used by IC10).
--- Tier 3 (2026-05-15) retired idx_tag_tagclass_id + idx_tagclass_subclass_of_id
--- because IC12 (their only past consumer) now traverses HAS_TYPE / IS_SUBCLASS_OF
--- via Cypher. All other denorm-column indexes were retired earlier:
---   idx_post_forum_id, idx_post_forum_creator (Tier 1)
---   idx_comment_creator_id, idx_comment_reply_of_id (Tier 2)
--- Migration `migrations/2026-05-15-tier3-drop-unused-indexes.sql` drops these
--- from existing deployments (DROP INDEX IS allowed by AGE 1.6, unlike DROP COLUMN).
-CREATE INDEX IF NOT EXISTS idx_post_creator_id ON "Post" (creator_id);
+-- All denorm-column indexes are retired as of 2026-05-15 (Tier 3b).
+-- The last live denorm-column index, idx_post_creator_id, was retired when
+-- IC10 migrated to use MessageByCreator.message_id (which has its own
+-- composite + secondary indexes — see section 5d below). Existing deployments
+-- drop idx_post_creator_id via migrations/2026-05-15-tier3b-drop-post-creator-id-usage.sql.
 
 -- =========================================================================
 -- 4. Per-friend top-K message composite indexes — DROPPED (IC2 rewrite 2026-05-13)
@@ -230,13 +207,21 @@ CREATE TABLE IF NOT EXISTS "PersonPostCount" (
 -- business id (bigint). Composite index gives per-creator date-DESC walks
 -- with a true Index Cond on `creation_date`, enabling the LATERAL LIMIT 20
 -- per-friend shape used by IC9. Maintained by IU6/IU7. Backfilled below.
+--
+-- The `message_id` (graphid) column was added 2026-05-15 so IC10 can JOIN
+-- HAS_TAG by graphid without reading the AGE Post label table — this lets
+-- us retire Post.creator_id (the last live denorm column).
 CREATE TABLE IF NOT EXISTS "MessageByCreator" (
-  creator_business_id bigint  NOT NULL,
-  message_business_id bigint  NOT NULL,
-  creation_date       bigint  NOT NULL,
+  creator_business_id bigint            NOT NULL,
+  message_business_id bigint            NOT NULL,
+  message_id          ag_catalog.graphid NOT NULL,
+  creation_date       bigint            NOT NULL,
   content             text,
-  is_post             boolean NOT NULL
+  is_post             boolean           NOT NULL
 );
+-- For existing tables created before 2026-05-15: ensure the new column exists
+-- (idempotent — no-op if already added by Tier 3b migration).
+ALTER TABLE "MessageByCreator" ADD COLUMN IF NOT EXISTS message_id ag_catalog.graphid;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_msgbycreator_creator_date_msg
   ON "MessageByCreator" (creator_business_id, creation_date DESC, message_business_id);
 -- Secondary unique index by message_business_id alone — IS2 looks up a
@@ -378,13 +363,16 @@ SELECT
 FROM "Person"
 ON CONFLICT (person_business_id) DO NOTHING;
 
--- MessageByCreator: mirror Comment + Post with creator, date, and content.
--- Comment leg: Comment.creator_id retired 2026-05-14 — traverse HAS_CREATOR
--- directly. Post leg: Post.creator_id still live (read by IC10).
-INSERT INTO "MessageByCreator" (creator_business_id, message_business_id, creation_date, content, is_post)
+-- MessageByCreator: mirror Comment + Post with creator, date, content, and
+-- the message graphid. Both legs traverse HAS_CREATOR directly (2026-05-15
+-- Tier 3b: Post leg switched off Post.creator_id, which is now retired).
+-- The `message_id` (graphid) column lets IC10 JOIN HAS_TAG by graphid without
+-- reading the AGE Post label table.
+INSERT INTO "MessageByCreator" (creator_business_id, message_business_id, message_id, creation_date, content, is_post)
 SELECT
   CAST(ag_catalog.agtype_object_field_text(per.properties, 'id') AS bigint),
   CAST(ag_catalog.agtype_object_field_text(msg.properties, 'id') AS bigint),
+  msg.id,
   CAST(ag_catalog.agtype_object_field_text(msg.properties, 'creationDate') AS bigint),
   ag_catalog.agtype_object_field_text(msg.properties, 'content'),
   false
@@ -395,6 +383,7 @@ UNION ALL
 SELECT
   CAST(ag_catalog.agtype_object_field_text(per.properties, 'id') AS bigint),
   CAST(ag_catalog.agtype_object_field_text(msg.properties, 'id') AS bigint),
+  msg.id,
   CAST(ag_catalog.agtype_object_field_text(msg.properties, 'creationDate') AS bigint),
   COALESCE(
     ag_catalog.agtype_object_field_text(msg.properties, 'content'),
@@ -402,7 +391,8 @@ SELECT
   ),
   true
 FROM "Post" msg
-JOIN "Person" per ON per.id = msg.creator_id
+JOIN "HAS_CREATOR" hc ON hc.start_id = msg.id
+JOIN "Person"      per ON per.id = hc.end_id
 ON CONFLICT DO NOTHING;
 
 -- =========================================================================
