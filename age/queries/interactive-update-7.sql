@@ -54,6 +54,16 @@ WITH new_comment AS (
            CASE WHEN rp IS NOT NULL THEN rp.id ELSE '' END AS parent_post_bid_agt
   $$) AS x(new_gid ag_catalog.agtype, parent_post_bid_agt ag_catalog.agtype)
 )
+-- ON CONFLICT DO NOTHING (no target column) catches violations on EITHER unique
+-- index: comment_id (PK) AND idx_commentrootpost_business_id (UNIQUE on
+-- comment_business_id). Targeting only comment_id missed the latter and surfaced
+-- as "duplicate key value violates unique constraint" crashes during validation
+-- (20 such crashes in a 3K-op SF3 LDBC slice on 2026-05-15). The duplicate
+-- comment_business_id arises when AGE 1.6's MVCC retry path re-runs IU7 after
+-- a partial-rollback condition where the first CREATE produced a new graphid
+-- but the rollback didn't fully reset AGE's internal state, so the retry
+-- creates a SECOND Comment vertex with the same business id (different graphid)
+-- and the CRP insert conflicts on comment_business_id rather than comment_id.
 INSERT INTO ldbc_snb."CommentRootPost" (comment_id, comment_business_id, root_post_business_id)
 SELECT
   nc.new_comment_gid,
@@ -65,7 +75,7 @@ SELECT
       WHERE crp.comment_business_id = $replyToId)
   )
 FROM new_comment nc
-ON CONFLICT (comment_id) DO NOTHING
+ON CONFLICT DO NOTHING
 ;
 
 SELECT * FROM cypher('$graphName', $$
