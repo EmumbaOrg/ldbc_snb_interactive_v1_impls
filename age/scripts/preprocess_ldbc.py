@@ -526,6 +526,106 @@ def build_config(vertex_files, edge_files, edge_prop_map):
     return {"edge": edge_entries}
 
 
+def emit_comment_root_post(side_tables_dir, dataset_dir):
+    """One-pass walk over REPLY_OF edges to compute (comment_business_id, root_post_business_id).
+
+    Seeds from comment_replyOf_post (direct parent is a Post, so root is that Post).
+    Iterates over comment_replyOf_comment in memory to propagate root upward.
+    Emits side_tables/commentRootPost.csv with no header:
+        comment_business_id|root_post_business_id
+    """
+    side_tables_dir.mkdir(parents=True, exist_ok=True)
+    out_path = side_tables_dir / "commentRootPost.csv"
+
+    # Build reply-of-comment map: child_id -> parent_comment_id
+    reply_of_comment = {}
+    for file_path in find_source_files(dataset_dir, "dynamic", "comment_replyOf_comment"):
+        for headers, values in read_ldbc_csv(file_path):
+            reply_of_comment[values[0]] = values[1]
+
+    # Seed: comments whose direct parent is a Post
+    root_of = {}
+    for file_path in find_source_files(dataset_dir, "dynamic", "comment_replyOf_post"):
+        for headers, values in read_ldbc_csv(file_path):
+            root_of[values[0]] = values[1]  # comment_id -> post_id (business id)
+
+    # Propagate: for each comment->comment chain, resolve root by following chain
+    # Process until every comment_replyOf_comment entry has a root
+    resolved_new = True
+    while resolved_new:
+        resolved_new = False
+        for child, parent in reply_of_comment.items():
+            if child in root_of:
+                continue
+            if parent in root_of:
+                root_of[child] = root_of[parent]
+                resolved_new = True
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        for comment_bid, post_bid in root_of.items():
+            f.write(f"{comment_bid}|{post_bid}\n")
+
+    print(f"  commentRootPost: {len(root_of)} rows")
+
+
+def emit_message_by_creator(side_tables_dir, dataset_dir):
+    """Emit (creator_business_id, message_business_id, creation_date, content, is_post)
+    for all Comments and Posts from the LDBC source CSVs.
+
+    Emits side_tables/messageByCreator.csv with no header:
+        creator_business_id|message_business_id|creation_date|content|is_post
+    The message_id (graphid) column is NOT included — it is resolved at load time
+    via JOIN with the loaded Comment/Post vertex tables.
+    """
+    side_tables_dir.mkdir(parents=True, exist_ok=True)
+    out_path = side_tables_dir / "messageByCreator.csv"
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        # Comments
+        for file_path in find_source_files(dataset_dir, "dynamic", "comment_hasCreator_person"):
+            creator_map = {}
+            for headers, values in read_ldbc_csv(file_path):
+                creator_map[values[0]] = values[1]  # comment_id -> person_id
+
+            # Read comment properties for creationDate and content
+            comment_files = find_source_files(dataset_dir, "dynamic", "comment")
+            for cf in comment_files:
+                for headers, values in read_ldbc_csv(cf):
+                    row = dict(zip(headers, values))
+                    cid = row["id"]
+                    creator_bid = creator_map.get(cid, "")
+                    if not creator_bid:
+                        continue
+                    creation_date = row.get("creationDate", "")
+                    content = row.get("content", "").replace("|", " ")  # pipe-escape
+                    f.write(f"{creator_bid}|{cid}|{creation_date}|{content}|false\n")
+
+        # Posts
+        for file_path in find_source_files(dataset_dir, "dynamic", "post_hasCreator_person"):
+            creator_map = {}
+            for headers, values in read_ldbc_csv(file_path):
+                creator_map[values[0]] = values[1]  # post_id -> person_id
+
+            post_files = find_source_files(dataset_dir, "dynamic", "post")
+            for pf in post_files:
+                for headers, values in read_ldbc_csv(pf):
+                    row = dict(zip(headers, values))
+                    pid = row["id"]
+                    creator_bid = creator_map.get(pid, "")
+                    if not creator_bid:
+                        continue
+                    creation_date = row.get("creationDate", "")
+                    # Posts use imageFile when content is empty (mirrors UNION ALL SELECT)
+                    content = row.get("content", "") or row.get("imageFile", "")
+                    content = content.replace("|", " ")
+                    f.write(f"{creator_bid}|{pid}|{creation_date}|{content}|true\n")
+
+    # Count rows emitted
+    with open(out_path, encoding="utf-8") as f:
+        row_count = sum(1 for _ in f)
+    print(f"  messageByCreator: {row_count} rows")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sf", default="3")
@@ -545,6 +645,7 @@ def main():
     output_dir = base_dir / "converted" / f"sf{sf_str}"
     vertex_dir = output_dir / "vertices"
     edge_dir = output_dir / "edges"
+    side_tables_dir = output_dir / "side_tables"
     vertex_dir.mkdir(parents=True, exist_ok=True)
     edge_dir.mkdir(parents=True, exist_ok=True)
 
@@ -578,6 +679,11 @@ def main():
         edge_prop_map[edge_spec["label"]] = props
         suffix = " (bidirectional)" if edge_spec.get("bidirectional") else ""
         print(f"  {edge_spec['label']}{suffix}: streamed")
+
+    # --- Side tables ---
+    print("Building side table CSVs…")
+    emit_comment_root_post(side_tables_dir, dataset_dir)
+    emit_message_by_creator(side_tables_dir, dataset_dir)
 
     # --- Config ---
     config = build_config(vertex_files, edge_files, edge_prop_map)

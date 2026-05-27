@@ -273,56 +273,10 @@ SELECT
 FROM "Forum" f
 ON CONFLICT (forum_id) DO NOTHING;
 
--- CommentRootPost: precomputed mapping Comment → root Post business id.
--- IS6 needs this because AGE 1.6 cannot express the REPLY_OF* walk in Cypher
--- (untyped intermediates break on Person's denorm columns).
---
--- Backfill via iterative depth-bounded INSERTs instead of a WITH RECURSIVE
--- CTE: each iteration adds the Comments whose immediate parent already has
--- a known root, and the loop exits when an iteration adds zero rows. Each
--- pass is a single indexed join (CommentRootPost.comment_id PK ⋈ REPLY_OF
--- edge table), which is much cheaper than the recursive CTE's repeated
--- materialization of intermediate chain rows. At SF10 with ~10-deep reply
--- chains, the loop converges in 10-15 passes and runs ~3x faster than the
--- recursive form.
---
--- Comment.reply_of_id retired 2026-05-14 — backfill now traverses the
--- REPLY_OF edge table directly (no dependency on the retired denorm column).
---
--- Seed: every Comment whose direct parent is a Post.
-INSERT INTO "CommentRootPost" (comment_id, comment_business_id, root_post_business_id)
-SELECT c.id,
-       CAST(ag_catalog.agtype_object_field_text(c.properties, 'id') AS bigint),
-       CAST(ag_catalog.agtype_object_field_text(p.properties, 'id') AS bigint)
-FROM "Comment" c
-JOIN "REPLY_OF" r ON r.start_id = c.id
-JOIN "Post"     p ON p.id = r.end_id
-ON CONFLICT (comment_id) DO NOTHING;
-
--- Walk upward through the chain in layers, one chain-depth per iteration.
-DO $$
-DECLARE
-  added bigint;
-  depth int := 1;
-BEGIN
-  LOOP
-    INSERT INTO "CommentRootPost" (comment_id, comment_business_id, root_post_business_id)
-    SELECT c.id,
-           CAST(ag_catalog.agtype_object_field_text(c.properties, 'id') AS bigint),
-           parent.root_post_business_id
-    FROM "Comment" c
-    JOIN "REPLY_OF" r ON r.start_id = c.id
-    JOIN "CommentRootPost" parent ON parent.comment_id = r.end_id
-    WHERE NOT EXISTS (
-      SELECT 1 FROM "CommentRootPost" existing
-       WHERE existing.comment_id = c.id
-    );
-    GET DIAGNOSTICS added = ROW_COUNT;
-    EXIT WHEN added = 0;
-    depth := depth + 1;
-  END LOOP;
-  RAISE NOTICE 'CommentRootPost: converged after % chain layers', depth;
-END $$;
+-- CommentRootPost is loaded from preprocess-emitted CSV by load-side-tables.py
+-- (run as a separate step from load-data.sh after this script). The \copy
+-- approach previously here failed inside `psql -f` with sed-substituted paths;
+-- copy_expert over libpq is robust and works against managed Horizon DB.
 
 -- ForumMemberPostCount: aggregate Posts per (forum, creator) pair.
 -- Post.forum_id retired 2026-05-14, Post.creator_id retired 2026-05-15 (Tier 3b);
@@ -364,37 +318,9 @@ SELECT
 FROM "Person"
 ON CONFLICT (person_business_id) DO NOTHING;
 
--- MessageByCreator: mirror Comment + Post with creator, date, content, and
--- the message graphid. Both legs traverse HAS_CREATOR directly (2026-05-15
--- Tier 3b: Post leg switched off Post.creator_id, which is now retired).
--- The `message_id` (graphid) column lets IC10 JOIN HAS_TAG by graphid without
--- reading the AGE Post label table.
-INSERT INTO "MessageByCreator" (creator_business_id, message_business_id, message_id, creation_date, content, is_post)
-SELECT
-  CAST(ag_catalog.agtype_object_field_text(per.properties, 'id') AS bigint),
-  CAST(ag_catalog.agtype_object_field_text(msg.properties, 'id') AS bigint),
-  msg.id,
-  CAST(ag_catalog.agtype_object_field_text(msg.properties, 'creationDate') AS bigint),
-  ag_catalog.agtype_object_field_text(msg.properties, 'content'),
-  false
-FROM "Comment" msg
-JOIN "HAS_CREATOR" hc ON hc.start_id = msg.id
-JOIN "Person"      per ON per.id = hc.end_id
-UNION ALL
-SELECT
-  CAST(ag_catalog.agtype_object_field_text(per.properties, 'id') AS bigint),
-  CAST(ag_catalog.agtype_object_field_text(msg.properties, 'id') AS bigint),
-  msg.id,
-  CAST(ag_catalog.agtype_object_field_text(msg.properties, 'creationDate') AS bigint),
-  COALESCE(
-    ag_catalog.agtype_object_field_text(msg.properties, 'content'),
-    ag_catalog.agtype_object_field_text(msg.properties, 'imageFile')
-  ),
-  true
-FROM "Post" msg
-JOIN "HAS_CREATOR" hc ON hc.start_id = msg.id
-JOIN "Person"      per ON per.id = hc.end_id
-ON CONFLICT DO NOTHING;
+-- MessageByCreator is loaded from preprocess-emitted CSV by load-side-tables.py
+-- (run as a separate step from load-data.sh after this script). See the
+-- CommentRootPost comment above for the rationale.
 
 -- =========================================================================
 -- 7. ANALYZE all touched tables

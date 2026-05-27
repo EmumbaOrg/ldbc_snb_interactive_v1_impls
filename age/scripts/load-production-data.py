@@ -24,17 +24,21 @@ Usage:
     python3 scripts/load-production-data.py \\
         --config converted/sf0.1/agefreighter_config.json \\
         [--graph-name ldbc_snb] \\
-        [--connection-string postgresql://postgres:postgres@localhost:5432/postgres]
+        [--connection-string postgresql://postgres:postgres@localhost:5432/postgres] \\
+        [--workers 6]
 """
 
 import argparse
 import io
 import json
+import multiprocessing
 import os
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import psycopg2
+import psycopg2.extras
 
 GRAPH = "ldbc_snb"
 COPY_BATCH = 50_000          # rows per COPY flush (keeps memory bounded)
@@ -108,6 +112,34 @@ def setup_graph(conn, cur, graph_name):
     print("  Graph and labels created.")
 
 
+def setup_id_map(conn, cur, graph_name):
+    """Create the (label, business_id) -> graphid mapping table in the graph
+    schema. Replaces the in-memory Python id_maps dict so the loader scales
+    past SF100 (where the dict would exceed available RAM). UNLOGGED — we
+    rebuild it on every load and don't need crash recovery.
+
+    Edge load and side-table load both resolve via SQL JOIN against this
+    table; it is dropped by load-side-tables.py after the side tables are
+    populated.
+    """
+    cur.execute(
+        f'DROP TABLE IF EXISTS {graph_name}."_id_map" CASCADE'
+    )
+    # graphid column is ag_catalog.graphid (not bigint) so INSERT-SELECT into
+    # AGE label tables doesn't need a per-row cast (no implicit bigint→graphid
+    # cast exists). COPY parses graphid from text via graphid_in.
+    cur.execute(
+        f'CREATE UNLOGGED TABLE {graph_name}."_id_map" ('
+        f'  label       text NOT NULL,'
+        f'  business_id bigint NOT NULL,'
+        f'  graphid     ag_catalog.graphid NOT NULL,'
+        f'  PRIMARY KEY (label, business_id)'
+        f')'
+    )
+    conn.commit()
+    print("  _id_map table created.")
+
+
 # ---------------------------------------------------------------------------
 # COPY helpers
 # ---------------------------------------------------------------------------
@@ -120,27 +152,50 @@ def copy_flush(cur, conn, sql, lines):
 
 
 # ---------------------------------------------------------------------------
-# Vertex loading
+# Vertex loading (worker function — runs in a subprocess)
 # ---------------------------------------------------------------------------
+
+def _load_vertex_worker(args):
+    """Worker: load one vertex label."""
+    connection_string, graph_name, label, csv_path = args
+    conn, cur = connect(connection_string)
+    try:
+        load_vertex_csv(conn, cur, graph_name, label, csv_path)
+    finally:
+        cur.close()
+        conn.close()
+    return label
+
 
 def load_vertex_csv(conn, cur, graph_name, label, csv_path):
     """
-    Stream-load a preprocessed vertex file via COPY.
+    Stream-load a preprocessed vertex file via COPY, and in the same pass
+    write (label, business_id, graphid) rows into the _id_map table so edges
+    and side tables can resolve graphids via indexed SQL JOIN instead of an
+    in-memory Python dict.
 
     Input file format (no header), one row per line:
         <orig_id>|"<agtype_properties_csv_escaped>"
 
-    The properties field is already CSV-quoted by preprocess (internal `"`
-    doubled). We just prepend the graphid and stream straight to COPY.
-
-    Returns {original_id_str: graphid} for downstream edge resolution.
+    The properties field is already CSV-quoted by preprocess.
     """
     label_id = get_label_id(cur, graph_name, label)
-    copy_sql = f'COPY {graph_name}."{label}" FROM STDIN (FORMAT CSV)'
+    vertex_copy_sql = f'COPY {graph_name}."{label}" FROM STDIN (FORMAT CSV)'
+    id_map_copy_sql = (
+        f'COPY {graph_name}."_id_map" (label, business_id, graphid) '
+        f'FROM STDIN (FORMAT CSV)'
+    )
 
-    id_map = {}
-    lines = []
+    vertex_lines = []
+    id_map_lines = []
     entry_id = 1
+
+    def flush():
+        if vertex_lines:
+            copy_flush(cur, conn, vertex_copy_sql, vertex_lines)
+            copy_flush(cur, conn, id_map_copy_sql, id_map_lines)
+            vertex_lines.clear()
+            id_map_lines.clear()
 
     with open(csv_path, encoding="utf-8") as f:
         for line in f:
@@ -150,16 +205,14 @@ def load_vertex_csv(conn, cur, graph_name, label, csv_path):
             orig_id = line[:pipe]
             props_csv = line[pipe + 1:]  # already includes the trailing \n
             graphid = make_graphid(label_id, entry_id)
-            id_map[orig_id] = graphid
-            lines.append(f"{graphid},{props_csv}")
+            vertex_lines.append(f"{graphid},{props_csv}")
+            id_map_lines.append(f"{label},{orig_id},{graphid}\n")
             entry_id += 1
 
-            if len(lines) >= COPY_BATCH:
-                copy_flush(cur, conn, copy_sql, lines)
-                lines = []
+            if len(vertex_lines) >= COPY_BATCH:
+                flush()
 
-    if lines:
-        copy_flush(cur, conn, copy_sql, lines)
+    flush()
 
     # Advance the sequence so AGE assigns the next graphid correctly for IU ops.
     if entry_id > 1:
@@ -168,59 +221,101 @@ def load_vertex_csv(conn, cur, graph_name, label, csv_path):
         )
         conn.commit()
 
-    print(f"  {label}: {entry_id - 1} vertices")
-    return id_map
+    print(f"  {label}: {entry_id - 1} vertices", flush=True)
 
 
 # ---------------------------------------------------------------------------
-# Edge loading
+# Edge loading (worker function — runs in a subprocess)
 # ---------------------------------------------------------------------------
 
-def load_edge_csv(conn, cur, graph_name, label, csv_path, id_maps):
+def _load_edge_worker(args):
+    """Worker: load one edge label using SQL JOIN against _id_map for graphid
+    resolution. No Python id_map dict is pickled — each worker streams its
+    CSV and resolves business_id -> graphid in batches via indexed lookup on
+    the shared _id_map table.
+    """
+    connection_string, graph_name, label, csv_path = args
+    conn, cur = connect(connection_string)
+    try:
+        load_edge_csv(conn, cur, graph_name, label, csv_path)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def load_edge_csv(conn, cur, graph_name, label, csv_path):
     """
     Stream-load a preprocessed edge file via COPY.
 
     Input file format (no header), one row per line:
         <start_orig>|<end_orig>|<start_label>|<end_label>|"<agtype_properties_csv_escaped>"
 
-    Properties are already CSV-quoted by preprocess. We resolve start/end
-    orig_ids to graphids via id_maps and emit a four-column COPY line.
+    For each batch of rows we:
+      1. Collect unique (label, business_id) pairs.
+      2. Issue one SELECT per distinct vertex-label, fetching graphids from
+         the _id_map table indexed by (label, business_id).
+      3. Build COPY lines for the batch and flush to the edge table.
 
-    id_maps: {label_name: {original_id_str: graphid}}
+    Memory per worker is bounded by COPY_BATCH; no global id_map is held.
     """
     label_id = get_label_id(cur, graph_name, label)
     copy_sql = (
         f'COPY {graph_name}."{label}" (id, start_id, end_id, properties) '
         f'FROM STDIN (FORMAT CSV)'
     )
+    id_map_table = f'{graph_name}."_id_map"'
 
-    lines = []
+    batch = []  # list of (orig_start, orig_end, start_label, end_label, props_csv)
     entry_id = 1
     skipped = 0
+
+    def flush_batch():
+        nonlocal entry_id, skipped
+        if not batch:
+            return
+        # Collect unique business_ids per vertex label seen in this batch.
+        ids_by_label = defaultdict(set)
+        for orig_start, orig_end, sl, el, _props in batch:
+            ids_by_label[sl].add(int(orig_start))
+            ids_by_label[el].add(int(orig_end))
+
+        # Resolve via SQL (one round-trip per vertex label).
+        resolved = {}
+        for vlabel, bid_set in ids_by_label.items():
+            cur.execute(
+                f'SELECT business_id, graphid FROM {id_map_table} '
+                f'WHERE label = %s AND business_id = ANY(%s)',
+                (vlabel, list(bid_set)),
+            )
+            for bid, gid in cur.fetchall():
+                resolved[(vlabel, bid)] = gid
+
+        # Build COPY lines.
+        lines = []
+        for orig_start, orig_end, sl, el, props_csv in batch:
+            start_gid = resolved.get((sl, int(orig_start)))
+            end_gid = resolved.get((el, int(orig_end)))
+            if start_gid is None or end_gid is None:
+                skipped += 1
+                continue
+            edge_gid = make_graphid(label_id, entry_id)
+            lines.append(f"{edge_gid},{start_gid},{end_gid},{props_csv}")
+            entry_id += 1
+
+        if lines:
+            copy_flush(cur, conn, copy_sql, lines)
+        batch.clear()
 
     with open(csv_path, encoding="utf-8") as f:
         for line in f:
             parts = line.split("|", 4)
             if len(parts) < 5:
                 continue
-            orig_start, orig_end, start_label, end_label, props_csv = parts
+            batch.append(tuple(parts))
+            if len(batch) >= COPY_BATCH:
+                flush_batch()
 
-            start_gid = id_maps.get(start_label, {}).get(orig_start)
-            end_gid = id_maps.get(end_label, {}).get(orig_end)
-            if start_gid is None or end_gid is None:
-                skipped += 1
-                continue
-
-            edge_gid = make_graphid(label_id, entry_id)
-            lines.append(f"{edge_gid},{start_gid},{end_gid},{props_csv}")
-            entry_id += 1
-
-            if len(lines) >= COPY_BATCH:
-                copy_flush(cur, conn, copy_sql, lines)
-                lines = []
-
-    if lines:
-        copy_flush(cur, conn, copy_sql, lines)
+    flush_batch()
 
     if entry_id > 1:
         cur.execute(
@@ -229,23 +324,35 @@ def load_edge_csv(conn, cur, graph_name, label, csv_path, id_maps):
         conn.commit()
 
     total = entry_id - 1
-    suffix = f" ({skipped} skipped — vertex not found in id_map)" if skipped else ""
-    print(f"  {label}: {total} edges{suffix}")
+    suffix = f" ({skipped} skipped — vertex not in _id_map)" if skipped else ""
+    print(f"  {label}: {total} edges{suffix}", flush=True)
 
 
 # ---------------------------------------------------------------------------
-# GIN indexes (before edge loading for fast vertex lookup)
+# GIN indexes — deferred, built in parallel after all COPYs complete
 # ---------------------------------------------------------------------------
 
-def create_gin_indexes(conn, cur, graph_name):
-    print("Creating GIN indexes on vertex properties…")
-    for label in VERTEX_LABELS:
+def _create_gin_worker(args):
+    """Worker: create GIN index for one vertex label."""
+    connection_string, graph_name, label = args
+    conn, cur = connect(connection_string)
+    try:
         cur.execute(
             f'CREATE INDEX IF NOT EXISTS gin_{label.lower()} '
             f'ON {graph_name}."{label}" USING GIN (properties ag_catalog.gin_agtype_ops)'
         )
         conn.commit()
         print(f"  {label}: GIN index created")
+    finally:
+        cur.close()
+        conn.close()
+
+
+def create_gin_indexes_parallel(connection_string, graph_name, workers):
+    print("Creating GIN indexes on vertex properties (parallel)…")
+    gin_args = [(connection_string, graph_name, lbl) for lbl in VERTEX_LABELS]
+    with multiprocessing.Pool(processes=workers) as pool:
+        pool.map(_create_gin_worker, gin_args)
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +405,12 @@ def main():
         ),
     )
     parser.add_argument("--graph-name", default=GRAPH)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=6,
+        help="Parallel workers for vertex/edge COPY and GIN build (default: 6)",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -309,12 +422,16 @@ def main():
     print(f"Connecting to: {args.connection_string}")
     conn, cur = connect(args.connection_string)
 
-    # 1. Graph + labels
+    # 1. Graph + labels + _id_map (DDL must complete before parallel COPY)
     setup_graph(conn, cur, args.graph_name)
+    setup_id_map(conn, cur, args.graph_name)
+    cur.close()
+    conn.close()
 
-    # 2. Vertices
-    print("Loading vertices…")
-    id_maps = {}
+    # 2. Vertices — load in parallel, each worker writes both the vertex
+    # rows and the (label, business_id, graphid) mapping into _id_map.
+    print(f"Loading vertices (workers={args.workers})…")
+    vertex_args = []
     for label in VERTEX_LABELS:
         csv_path = vertex_csvs.get(label)
         if not csv_path:
@@ -323,13 +440,19 @@ def main():
         if not Path(csv_path).exists():
             print(f"  {label}: CSV not found at {csv_path}, skipping")
             continue
-        id_maps[label] = load_vertex_csv(conn, cur, args.graph_name, label, csv_path)
+        vertex_args.append((args.connection_string, args.graph_name, label, csv_path))
 
-    # 3. GIN indexes (must precede edge loading — edge MATCH lookups use them)
-    create_gin_indexes(conn, cur, args.graph_name)
+    with multiprocessing.Pool(processes=args.workers) as pool:
+        pool.map(_load_vertex_worker, vertex_args)
 
-    # 4. Edges
-    print("Loading edges…")
+    # 3. GIN indexes — deferred to after all vertices, built in parallel.
+    create_gin_indexes_parallel(args.connection_string, args.graph_name, args.workers)
+
+    # 4. Edges — parallel. Workers resolve business_id -> graphid via batched
+    # SQL JOIN against _id_map (no Python dict pickling). Scales to SF1000
+    # because the mapping lives in PostgreSQL, not in process memory.
+    print(f"Loading edges (workers={args.workers})…")
+    edge_args = []
     for label in EDGE_LABELS:
         csv_path = edge_csvs.get(label)
         if not csv_path:
@@ -338,11 +461,13 @@ def main():
         if not Path(csv_path).exists():
             print(f"  {label}: CSV not found at {csv_path}, skipping")
             continue
-        load_edge_csv(conn, cur, args.graph_name, label, csv_path, id_maps)
+        edge_args.append((args.connection_string, args.graph_name, label, csv_path))
 
-    cur.close()
-    conn.close()
-    print("\nLoad complete. Run scripts/create-indexes.sql and scripts/vacuum-analyze.sh next.")
+    with multiprocessing.Pool(processes=args.workers) as pool:
+        pool.map(_load_edge_worker, edge_args)
+
+    print("\nLoad complete. _id_map is retained for side-table loading; "
+          "load-side-tables.py will DROP it when done.")
 
 
 if __name__ == "__main__":

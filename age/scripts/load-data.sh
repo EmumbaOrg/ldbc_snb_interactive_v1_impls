@@ -11,11 +11,15 @@
 #   ./load-data.sh --sf 3 --skip-preprocess   # reuse already-converted CSVs
 #
 # Flags:
-#   --sf <N>            Scale factor (required). E.g. 0.1, 1, 3, 10, 100.
-#   --skip-preprocess   Skip the CSV preprocessing step (Step 1). Assumes
-#                       converted CSVs already exist under
-#                       age/scripts/converted/sf<N>/{vertices,edges}/.
-#                       The sanity check will fail if they are missing.
+#   --sf <N>              Scale factor (required). E.g. 0.1, 1, 3, 10, 100.
+#   --skip-preprocess     Skip the CSV preprocessing step (Step 1). Assumes
+#                         converted CSVs already exist under
+#                         age/scripts/converted/sf<N>/{vertices,edges}/.
+#                         The sanity check will fail if they are missing.
+#   --workers N           Parallel workers for vertex/edge COPY and GIN build.
+#                         Default: 6. (32 vCPU − buffer for Postgres workers.)
+#   --index-workers N     Parallel workers for B-tree/functional index builds.
+#                         Default: 4. (Index builds are memory-hungry.)
 #
 # Optional overrides (env vars):
 #   LDBC_DATA_DIR    directory containing the social_network-sf<N>-CsvComposite-LongDateFormatter
@@ -24,21 +28,35 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+RESULTS_DIR="${AGE_DIR}/results"
+mkdir -p "${RESULTS_DIR}"
 
 SF=""
 SKIP_PREPROCESS=false
+WORKERS=6
+INDEX_WORKERS=4
 while [[ $# -gt 0 ]]; do
   case $1 in
     --sf) SF="$2"; shift 2 ;;
     --skip-preprocess) SKIP_PREPROCESS=true; shift ;;
+    --workers) WORKERS="$2"; shift 2 ;;
+    --index-workers) INDEX_WORKERS="$2"; shift 2 ;;
     *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
 : "${SF:?--sf argument is required.  Example: ./load-data.sh --sf 0.1}"
 : "${CONNECTION_STRING:?CONNECTION_STRING environment variable must be set}"
 
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+LOG_FILE="${RESULTS_DIR}/load-sf${SF}-${TIMESTAMP}.log"
+
+# Tee all output to a timestamped log file.
+exec > >(tee -a "${LOG_FILE}") 2>&1
+echo "=== Load log: ${LOG_FILE} ==="
+echo "=== SF=${SF} workers=${WORKERS} index-workers=${INDEX_WORKERS} started at $(date) ==="
+
 CONVERTED_DIR="${SCRIPT_DIR}/converted/sf${SF}"
-AGE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 VENV="${AGE_DIR}/.venv"
 if [[ ! -x "${VENV}/bin/python3" ]]; then
   echo "Creating venv and installing psycopg2-binary..."
@@ -56,41 +74,61 @@ else
   if [[ -n "${LDBC_DATA_DIR:-}" ]]; then
     PREPROCESS_ARGS+=(--data-dir "${LDBC_DATA_DIR}")
   fi
-  "${PY}" "${SCRIPT_DIR}/preprocess_ldbc.py" "${PREPROCESS_ARGS[@]}"
+  time "${PY}" "${SCRIPT_DIR}/preprocess_ldbc.py" "${PREPROCESS_ARGS[@]}"
 fi
 
-# Sanity check — preprocessing must produce exactly 11 vertex CSVs and 15 edge CSVs.
-V_COUNT=$(ls "${CONVERTED_DIR}/vertices/" 2>/dev/null | wc -l | tr -d ' ')
-E_COUNT=$(ls "${CONVERTED_DIR}/edges/"    2>/dev/null | wc -l | tr -d ' ')
+# Sanity check — preprocessing must produce exactly 11 vertex CSVs, 15 edge CSVs,
+# and 2 side table CSVs.
+V_COUNT=$(ls "${CONVERTED_DIR}/vertices/"     2>/dev/null | wc -l | tr -d ' ')
+E_COUNT=$(ls "${CONVERTED_DIR}/edges/"        2>/dev/null | wc -l | tr -d ' ')
+S_COUNT=$(ls "${CONVERTED_DIR}/side_tables/"  2>/dev/null | wc -l | tr -d ' ')
 if [[ "$V_COUNT" -ne 11 || "$E_COUNT" -ne 15 ]]; then
   echo "ERROR: expected 11 vertex files and 15 edge files, got ${V_COUNT}v / ${E_COUNT}e."
   echo "Check ${CONVERTED_DIR}."
   exit 1
 fi
-echo "  Preprocessing OK: ${V_COUNT} vertex files, ${E_COUNT} edge files."
+if [[ "$S_COUNT" -lt 2 ]]; then
+  echo "ERROR: expected at least 2 side table CSVs, got ${S_COUNT}."
+  echo "Check ${CONVERTED_DIR}/side_tables/."
+  exit 1
+fi
+echo "  Preprocessing OK: ${V_COUNT} vertex files, ${E_COUNT} edge files, ${S_COUNT} side table files."
 
 # ---------------------------------------------------------------------------
 echo "=== Step 2: Loading graph into AGE via load-production-data.py ==="
 # load-production-data.py stores id/creationDate/joinDate/birthMonth/birthDay
 # as agtype integers so Cypher equality lookups (MATCH (n {id: X})) work correctly.
 # It also derives birthMonth and birthDay from birthday at load time for IC10.
-"${PY}" "${SCRIPT_DIR}/load-production-data.py" \
+# Vertices and edges load in parallel (--workers); GIN indexes are deferred to
+# after all COPYs complete, then built in parallel.
+time "${PY}" "${SCRIPT_DIR}/load-production-data.py" \
     --config "${CONVERTED_DIR}/agefreighter_config.json" \
-    --connection-string "$CONNECTION_STRING"
+    --connection-string "$CONNECTION_STRING" \
+    --workers "${WORKERS}"
 
 # ---------------------------------------------------------------------------
-echo "=== Step 3: Creating query-performance indexes ==="
-# Set maintenance_work_mem high so index builds on large edge tables don't spill to disk.
-psql "$CONNECTION_STRING" \
-    -c "SET maintenance_work_mem = '4GB';" \
-    -f "${SCRIPT_DIR}/create-indexes.sql" \
-    2>&1 | grep -v NOTICE || true
+echo "=== Step 3: Creating query-performance indexes (parallel, ${INDEX_WORKERS} workers) ==="
+# dispatch-indexes.py splits create-indexes.sql by table and runs each group
+# in a dedicated connection with per-session maintenance_work_mem.
+time "${PY}" "${SCRIPT_DIR}/dispatch-indexes.py" \
+    --sql "${SCRIPT_DIR}/create-indexes.sql" \
+    --connection-string "$CONNECTION_STRING" \
+    --workers "${INDEX_WORKERS}" \
+    --maintenance-work-mem "8GB"
 
 # ---------------------------------------------------------------------------
-echo "=== Step 3b: Applying denormalised schema (columns + indexes + backfill) ==="
-psql "$CONNECTION_STRING" \
+echo "=== Step 3b: Applying denormalised schema (DDL + SQL-driven backfills) ==="
+time psql "$CONNECTION_STRING" \
     -f "${SCRIPT_DIR}/denormalize-schema.sql" \
     2>&1 | grep -v NOTICE || true
+
+# ---------------------------------------------------------------------------
+echo "=== Step 3c: Loading CSV-driven side tables (CommentRootPost, MessageByCreator) ==="
+# copy_expert over libpq — works locally and against managed Horizon DB.
+time "${PY}" "${SCRIPT_DIR}/load-side-tables.py" \
+    --crp-csv "${CONVERTED_DIR}/side_tables/commentRootPost.csv" \
+    --mbc-csv "${CONVERTED_DIR}/side_tables/messageByCreator.csv" \
+    --connection-string "$CONNECTION_STRING"
 
 # ---------------------------------------------------------------------------
 # Step 4 (VACUUM ANALYZE) intentionally omitted: denormalize-schema.sql
@@ -103,9 +141,10 @@ psql "$CONNECTION_STRING" \
 # ---------------------------------------------------------------------------
 echo "=== Step 5: Taking snapshot ==="
 # This snapshot is the clean baseline used by restore-database.sh before each run.
-bash "${SCRIPT_DIR}/snapshot-database.sh"
+time bash "${SCRIPT_DIR}/snapshot-database.sh"
 
 echo ""
-echo "=== Data load complete for SF${SF} ==="
+echo "=== Data load complete for SF${SF} at $(date) ==="
+echo "=== Timing log: ${LOG_FILE} ==="
 echo "    Run the benchmark with: java ... Client -P driver/benchmark.properties"
 echo "    Before re-running:      bash scripts/restore-database.sh"
