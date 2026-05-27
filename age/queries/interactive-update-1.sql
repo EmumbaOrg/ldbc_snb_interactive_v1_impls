@@ -7,7 +7,7 @@
 --         (UNWIND [] produces 0 rows; count(*) aggregates them back to 1).
 -- Call 2: MATCH the just-created Person and RETURN id(p), p.firstName, p.lastName.
 --         Feeds PersonPostCount and PersonSide via a writable CTE so outer SQL
---         never reads the AGE Person label table (AGENTS.md §14).
+--         never reads the AGE Person label table (CLAUDE.md §14).
 --         firstName/lastName sourced from Cypher RETURN (not $personFirstName /
 --         $personLastName) because the driver's convertString() emits Cypher-style
 --         backslash escaping ('O\'Brien') that breaks SQL string literals.

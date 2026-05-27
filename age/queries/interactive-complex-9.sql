@@ -2,7 +2,7 @@
 -- Hybrid: Cypher block enumerates 1+2-hop friend ids (LDBC business bigints);
 -- outer SQL walks ldbc_snb."MessageByCreator" per-friend in date-DESC order
 -- with LATERAL LIMIT 20, then takes global top-20 and joins PersonSide for
--- names. AGENTS.md §14 compliant — outer SQL never touches AGE label tables
+-- names. CLAUDE.md §14 compliant — outer SQL never touches AGE label tables
 -- (Comment/Post/Person/HAS_CREATOR/KNOWS); MessageByCreator and PersonSide
 -- are non-AGE side tables maintained by the load step + IU1/IU6/IU7.
 --

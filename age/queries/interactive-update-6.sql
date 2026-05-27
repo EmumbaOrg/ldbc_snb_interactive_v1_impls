@@ -1,6 +1,6 @@
 -- LdbcUpdate6AddPost — create a Post vertex with HAS_CREATOR/CONTAINER_OF/IS_LOCATED_IN/HAS_TAG edges.
 -- Pure hybrid: two Cypher calls drive all writes. Zero outer-SQL reads or writes
--- of AGE label tables (AGENTS.md §14).
+-- of AGE label tables (CLAUDE.md §14).
 --
 -- Call 1: CREATE Post + all edges in one chained WITH/UNWIND block.
 --         RETURN count(*) ensures exactly one output row even when $tagIds
