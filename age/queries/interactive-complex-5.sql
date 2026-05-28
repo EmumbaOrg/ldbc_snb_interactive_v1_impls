@@ -1,42 +1,50 @@
 -- LdbcQuery5 — Recent forums (joined after minDate) that 1- or 2-hop friends joined, with post counts.
--- Hybrid: Cypher fetches 1+2-hop friend graphids via fixed-depth MATCH UNION
--- (no variable-length path per AGE-QUIRKS §4); outer SQL operates exclusively
--- on side tables, never on AGE-managed tables (client directive 2026-05-13):
---   HasMemberSide        — mirror of HAS_MEMBER (forum_id, member_id, join_date)
---   ForumMemberPostCount — precomputed (forum_id, member_id) → post_count
---   ForumSide            — mirror of Forum (forum_id, business_id, title)
+-- Hybrid: Cypher fetches 1+2-hop friend+forum memberships (HAS_MEMBER edge
+-- filtered by joinDate > $minDate) and projects forum scalar properties directly
+-- (Phase A: HasMemberSide and ForumSide retired). Outer SQL aggregates over the
+-- Cypher result and joins ForumMemberPostCount for the precomputed post count.
 -- Directed `-[:KNOWS]->` per AGE-QUIRKS §11; IU8 stores both directions.
--- Aggregation pre-groups by hms.forum_id (graphid scalar). MATERIALIZED forces
--- the planner to evaluate the friend set before the HasMemberSide join,
--- preventing the AGE 1.6 threshold-flip at SF100+ (sf3-final-report §5.1).
+-- MATERIALIZED forces the planner to evaluate the friends+memberships set
+-- before the FMPC join, preventing the AGE 1.6 threshold-flip at SF100+.
+--
+-- §14 compliance: ForumSide and HasMemberSide were §14-compliance workarounds
+-- for trivial scalar property reads. Cypher RETURN of forum.title, forum.id,
+-- and m.joinDate is the natural peer pattern — every peer reads Forum and
+-- HAS_MEMBER properties directly (Phase A reword of §14).
 
-WITH friends AS MATERIALIZED (
-  SELECT (friend_gid::text)::ag_catalog.graphid AS friend_id
+WITH memberships AS MATERIALIZED (
+  SELECT DISTINCT
+         (friend_gid::text)::ag_catalog.graphid  AS friend_id,
+         (forum_gid::text)::ag_catalog.graphid   AS forum_id,
+         (forum_biz::text)::bigint               AS forum_business_id,
+         forum_title::text                       AS forum_title
   FROM cypher('$graphName', $$
     MATCH (p:Person {id: $personId})-[:KNOWS]->(friend:Person)
     WHERE friend.id <> $personId
-    RETURN id(friend) AS friend_gid
-    UNION
+    MATCH (forum:Forum)-[m:HAS_MEMBER]->(friend)
+    WHERE m.joinDate > $minDate
+    RETURN id(friend) AS friend_gid, id(forum) AS forum_gid, forum.id AS forum_biz, forum.title AS forum_title
+    UNION ALL
     MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(friend:Person)
     WHERE friend.id <> $personId
-    RETURN id(friend) AS friend_gid
-  $$) AS x(friend_gid agtype)
+    MATCH (forum:Forum)-[m:HAS_MEMBER]->(friend)
+    WHERE m.joinDate > $minDate
+    RETURN id(friend) AS friend_gid, id(forum) AS forum_gid, forum.id AS forum_biz, forum.title AS forum_title
+  $$) AS x(friend_gid agtype, forum_gid agtype, forum_biz agtype, forum_title agtype)
 ),
 agg AS (
-  SELECT hms.forum_id,
+  SELECT mb.forum_id,
+         mb.forum_business_id,
+         mb.forum_title,
          COALESCE(SUM(fmpc.post_count), 0)::int AS postCount
-  FROM friends fr
-  JOIN ldbc_snb."HasMemberSide" hms
-    ON hms.member_id = fr.friend_id
-   AND hms.join_date > $minDate::bigint
+  FROM memberships mb
   LEFT JOIN ldbc_snb."ForumMemberPostCount" fmpc
-    ON fmpc.forum_id = hms.forum_id AND fmpc.member_id = fr.friend_id
-  GROUP BY hms.forum_id
+    ON fmpc.forum_id = mb.forum_id AND fmpc.member_id = mb.friend_id
+  GROUP BY mb.forum_id, mb.forum_business_id, mb.forum_title
 )
-SELECT fs.title AS forumTitle,
+SELECT a.forum_title  AS forumTitle,
        a.postCount
 FROM agg a
-JOIN ldbc_snb."ForumSide" fs ON fs.forum_id = a.forum_id
 ORDER BY a.postCount DESC,
-         fs.forum_business_id ASC
+         a.forum_business_id ASC
 LIMIT 20;

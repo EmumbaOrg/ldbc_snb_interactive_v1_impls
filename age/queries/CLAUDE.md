@@ -77,7 +77,7 @@ Implementations: `interactive-complex-N.sql`, `interactive-short-N.sql`, `intera
 
 10. **IC12 tag source** — tags come from the original Post via `(post:Post)-[:HAS_TAG]->(tag)`, never from the reply.
 
-11. **IU cypher() call count** — minimum needed per IU. **IU7 uses three calls** to dodge AGE MVCC bug (issue #1954, see `../AGE-1.6-MVCC-BUG.md`): the `HAS_TAG` UNWIND must run in a separate visibility window after the Comment is committed, and a third call reads the committed Comment's `content` for the `MessageByCreator` INSERT (Cypher-escaped content can't safely substitute into a SQL string literal). Don't merge IU7's three calls. Tier 1/2 splits: IU1=2, IU4=2, IU5=1, IU6=2, IU7=3.
+11. **IU cypher() call count** — minimum needed per IU. **IU7 uses three calls** to dodge AGE MVCC bug (issue #1954, see `../AGE-1.6-MVCC-BUG.md`): the `HAS_TAG` UNWIND must run in a separate visibility window after the Comment is committed, and a third call reads the committed Comment's `content` for the `MessageByCreator` INSERT (Cypher-escaped content can't safely substitute into a SQL string literal). Don't merge IU7's three calls. Tier 1/2 splits: IU1=2, IU4=1, IU5=1, IU6=2, IU7=3. (IU4 dropped from 2→1 in Phase A 2026-05-28: ForumSide retired, so the second call that populated it is gone; AddForum now completes in a single CREATE+UNWIND call.)
 
 12. **SF-appropriate tactics**:
     - Avoid materializing full edge sets if SF1000 will OOM; prefer streaming joins.
@@ -87,7 +87,13 @@ Implementations: `interactive-complex-N.sql`, `interactive-short-N.sql`, `intera
 
 13. **No parameterized JDBC path** (as of 2026-05-15). `age_parameterized_queries=` is empty in every `driver/*.properties` — every IC/IS/IU flows through `Statement.execute()` with values string-substituted into the SQL by the Java handler before send. Why: AGE's `MATCH (n:Label {prop: $param})` compiles to a runtime function call that can't bind to GIN at plan time (Seq Scan fallback — AGE-QUIRKS §13/§15); plus ~0.5–1 ms per-call overhead. **What to do**: pass parameters via the handler's `getQueryParameterMap`; reference them as `$paramName` in Cypher and outer SQL (both substituted by the same handler pass). **Do not** add a query to `age_parameterized_queries` without re-measuring under `PREPARE/EXECUTE` at the largest target SF — the generic-vs-custom plan decision is cost-estimate-driven, so a query safe at SF3 can flip to Seq Scan at SF100. The `cy`+`pher(` token is now safe in SQL comments (the legacy comment-scan bug fires only on the parameterized branch, which is dead code at runtime — but the trap returns for anyone who re-enables it).
 
-14. **Never access AGE tables directly from outer SQL** in runtime query files. (Deploy-time scripts in `age/scripts/` are exempt — see Implementation Style scope above.)
+14. **Outer SQL must not JOIN or aggregate against AGE label tables** in runtime query files. Two read patterns *are* permitted:
+
+    **(a) Cypher RETURN of scalar properties** — the natural peer pattern. Every peer implementation (`postgres/`, `duckdb/`, `umbra/`, `cypher/`, `tigergraph/`) reads Person/Forum/HAS_MEMBER properties directly from the canonical structure with zero side tables. Projecting `friend.firstName`, `forum.title`, or `m.joinDate` in a `cypher()` block's RETURN clause — and consuming those columns in outer SQL — is correct and idiomatic. Preferred.
+
+    **(b) Correlated scalar subqueries against an AGE label table** when all three conditions hold: (i) the WHERE clause is GIN-bound via `properties @> '{"id": X}'::agtype`, (ii) the outer query has already been LIMIT'd so the subquery fires at most ~LIMIT times per call, and (iii) the result is a single scalar projection (not used in a JOIN predicate). IS2's author-name fetch is the canonical example of case (b).
+
+    What §14 forbids is `JOIN ldbc_snb."Person"` / `JOIN ldbc_snb."HAS_MEMBER"` in outer SQL where the planner must operate on raw `agtype` columns over a full table without GIN support. (Deploy-time scripts in `age/scripts/` are exempt — see Implementation Style scope above.)
 
 ## Known Intentional Deviations — Do Not Flag
 

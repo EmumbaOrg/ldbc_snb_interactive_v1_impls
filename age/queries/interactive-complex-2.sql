@@ -10,8 +10,10 @@
 -- vs the prior 2-arm Comment+Post UNION shape that scanned ~62K Comment vertices per
 -- call to apply the date filter post-fetch. Byte-identical output on all 5 samples.
 --
--- AGENTS.md §14 compliance: outer SQL only touches non-AGE side tables
--- (MessageByCreator, PersonSide). No Comment/Post/HAS_CREATOR reads in outer SQL.
+-- §14 compliance: outer SQL only touches the non-AGE MessageByCreator side
+-- table. Friend names (personFirstName, personLastName) are projected from
+-- the Cypher RETURN (Phase A: PersonSide retired). No AGE label table reads
+-- in outer SQL.
 --
 -- Date filter: `<= $maxDate` (NOT `<`) matches the Neo4j reference (cypher/queries/
 -- interactive-complex-2.cypher line 9: `message.creationDate <= $maxDate`). The LDBC
@@ -39,19 +41,21 @@
 WITH friends AS (
   SELECT
     (fid::text)::bigint AS person_id,
-    (md::text)::bigint  AS max_date
+    (md::text)::bigint  AS max_date,
+    fn::text            AS first_name,
+    ln::text            AS last_name
   FROM cypher('$graphName', $$
     MATCH (p:Person {id: $personId})-[:KNOWS]->(friend:Person)
-    RETURN friend.id AS fid, $maxDate AS md
-  $$) AS x(fid agtype, md agtype)
+    RETURN friend.id AS fid, $maxDate AS md, friend.firstName AS fn, friend.lastName AS ln
+  $$) AS x(fid agtype, md agtype, fn agtype, ln agtype)
 )
 SELECT
-  m.creator_business_id::ag_catalog.agtype  AS personId,
-  ag_catalog.text_to_agtype(ps.first_name)  AS personFirstName,
-  ag_catalog.text_to_agtype(ps.last_name)   AS personLastName,
-  m.message_business_id::ag_catalog.agtype  AS messageId,
-  ag_catalog.text_to_agtype(m.content)      AS messageContent,
-  m.creation_date::ag_catalog.agtype        AS messageCreationDate
+  m.creator_business_id::ag_catalog.agtype        AS personId,
+  ag_catalog.text_to_agtype(friends.first_name)   AS personFirstName,
+  ag_catalog.text_to_agtype(friends.last_name)    AS personLastName,
+  m.message_business_id::ag_catalog.agtype        AS messageId,
+  ag_catalog.text_to_agtype(m.content)            AS messageContent,
+  m.creation_date::ag_catalog.agtype              AS messageCreationDate
 FROM friends
 CROSS JOIN LATERAL (
   SELECT mm.creator_business_id, mm.message_business_id, mm.creation_date, mm.content
@@ -61,6 +65,5 @@ CROSS JOIN LATERAL (
   ORDER BY mm.creation_date DESC, mm.message_business_id ASC
   LIMIT 20
 ) m
-JOIN ldbc_snb."PersonSide" ps ON ps.person_business_id = m.creator_business_id
 ORDER BY m.creation_date DESC, m.message_business_id ASC
 LIMIT 20;

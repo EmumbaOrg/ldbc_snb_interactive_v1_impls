@@ -1,21 +1,13 @@
 -- LdbcUpdate5AddForumMembership — adds a person as a forum member.
--- Hybrid: Cypher creates the HAS_MEMBER edge inside the AGE graph and returns
--- the forum and person graphids; outer SQL mirrors the membership into
--- HasMemberSide (a regular table) so IC5 can filter by join_date without
--- touching the AGE-managed HAS_MEMBER table.
+-- Phase A 2026-05-28: HasMemberSide retired. IC5 now reads m.joinDate directly
+-- from the Cypher block (MATCH (forum:Forum)-[m:HAS_MEMBER]->(friend) WHERE
+-- m.joinDate > $minDate). IU5 is now a single pure-Cypher call with no outer
+-- SQL side-table write.
 --
--- Single-statement INSERT...SELECT FROM cypher() — the Cypher CREATE executes
--- as part of the subquery and the returned graphids feed the INSERT in one
--- transaction. ON CONFLICT handles the rare duplicate-membership case (would
--- otherwise violate PK).
+-- Cypher-only: one call, no outer SQL INSERT needed.
 
-INSERT INTO ldbc_snb."HasMemberSide" (forum_id, member_id, join_date)
-SELECT (forum_gid::text)::ag_catalog.graphid,
-       (person_gid::text)::ag_catalog.graphid,
-       $joinDate
-FROM cypher('$graphName', $$
+SELECT * FROM cypher('$graphName', $$
   MATCH (forum:Forum {id: $forumId}), (person:Person {id: $personId})
   CREATE (forum)-[:HAS_MEMBER {joinDate: $joinDate}]->(person)
-  RETURN id(forum) AS forum_gid, id(person) AS person_gid
-$$) AS (forum_gid agtype, person_gid agtype)
-ON CONFLICT (member_id, forum_id) DO UPDATE SET join_date = EXCLUDED.join_date;
+  RETURN count(*)
+$$) AS (result agtype);

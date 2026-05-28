@@ -132,32 +132,15 @@ CREATE INDEX IF NOT EXISTS idx_fmpc_member_forum
 -- WHERE member_id = ? use cases as a leading prefix.
 DROP INDEX IF EXISTS idx_fmpc_member;
 
--- 3B (revised 2026-05-13): client directive — never directly access AGE-managed
--- tables in outer SQL. Replaces the prior HAS_MEMBER.join_date denorm column
--- (which violated the directive) with two side tables that mirror the AGE
--- state IC5 needs. IC5/IU5 read/write the side tables; AGE tables remain
--- accessible only via cypher() calls.
---
--- HasMemberSide — mirror of HAS_MEMBER edges (forum_id, member_id, join_date).
--- PK is (member_id, forum_id) because IC5 drives from the friend (member) side.
--- Maintained by IU5 (INSERT per AddForumMembership). Initial backfill below.
-CREATE TABLE IF NOT EXISTS "HasMemberSide" (
-  forum_id   ag_catalog.graphid NOT NULL,
-  member_id  ag_catalog.graphid NOT NULL,
-  join_date  bigint             NOT NULL,
-  PRIMARY KEY (member_id, forum_id)
-);
-CREATE INDEX IF NOT EXISTS idx_hms_member_joindate
-    ON "HasMemberSide" (member_id, join_date);
-
--- ForumSide — mirror of Forum vertex properties IC5 needs in its RETURN/ORDER BY.
--- forum_id is the AGE graphid (used for joining); forum_business_id is the LDBC
--- public id used as IC5's tie-breaker. Maintained by IU4 (INSERT per AddForum).
-CREATE TABLE IF NOT EXISTS "ForumSide" (
-  forum_id           ag_catalog.graphid PRIMARY KEY,
-  forum_business_id  bigint             NOT NULL,
-  title              text               NOT NULL
-);
+-- 3B (2026-05-13 original, retired Phase A 2026-05-28): HasMemberSide and
+-- ForumSide were §14-compliance workarounds for trivial HAS_MEMBER edge
+-- property reads and Forum scalar property reads. Phase A retires them:
+-- IC5 now projects m.joinDate, forum.title, and forum.id directly from the
+-- Cypher block's RETURN, and IU5 no longer maintains HasMemberSide.
+-- Drop stale tables/indexes for any pre-Phase-A deployment:
+DROP TABLE  IF EXISTS "HasMemberSide";
+DROP TABLE  IF EXISTS "ForumSide";
+DROP INDEX  IF EXISTS idx_hms_member_joindate;
 
 -- CommentRootPost — for each Comment, the LDBC business id (bigint) of the
 -- root Post reached by following REPLY_OF*. Used by IS6 (currently falls back
@@ -229,15 +212,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_msgbycreator_creator_date_msg
 CREATE UNIQUE INDEX IF NOT EXISTS idx_msgbycreator_message
   ON "MessageByCreator" (message_business_id);
 
--- PersonSide: small mirror of Person {id, firstName, lastName} for projection
--- queries that cannot read Person directly. PK on business id (bigint) so
--- friend-set joins from cypher() outputs are native bigint comparisons.
--- Maintained by IU1.
-CREATE TABLE IF NOT EXISTS "PersonSide" (
-  person_business_id bigint PRIMARY KEY,
-  first_name         text   NOT NULL,
-  last_name          text   NOT NULL
-);
+-- PersonSide: retired Phase A 2026-05-28. Was a §14-compliance workaround
+-- for trivial Person scalar property reads (firstName, lastName). IC9 now
+-- projects f.firstName/f.lastName directly from the Cypher RETURN; IS2 uses
+-- GIN-indexed scalar subqueries against the Person label table. IU1 no longer
+-- maintains PersonSide. Drop stale table for any pre-Phase-A deployment:
+DROP TABLE IF EXISTS "PersonSide";
 
 -- 5c. Composite covering index on HAS_INTEREST(start_id, end_id) — replaces
 -- the would-be Person.interest_tag_ids array. Lets the IC10 per-post
@@ -251,27 +231,8 @@ CREATE INDEX IF NOT EXISTS idx_hasinterest_start_end
 -- 6. Iteration-2 backfills
 -- =========================================================================
 
--- HasMemberSide: snapshot of HAS_MEMBER edges. Direct SQL — §14 governs
--- read queries; backfills running at deploy time are exempt. The cypher()
--- variant this replaces was ~5-10x slower at SF10 (Cypher executor overhead
--- per row vs. native PostgreSQL table scan).
-INSERT INTO "HasMemberSide" (forum_id, member_id, join_date)
-SELECT
-  hm.start_id,
-  hm.end_id,
-  CAST(ag_catalog.agtype_object_field_text(hm.properties, 'joinDate') AS bigint)
-FROM "HAS_MEMBER" hm
-ON CONFLICT (member_id, forum_id) DO NOTHING;
-
--- ForumSide: snapshot of Forum vertex properties used by IC5. Direct SQL —
--- see HasMemberSide note above.
-INSERT INTO "ForumSide" (forum_id, forum_business_id, title)
-SELECT
-  f.id,
-  CAST(ag_catalog.agtype_object_field_text(f.properties, 'id') AS bigint),
-  ag_catalog.agtype_object_field_text(f.properties, 'title')
-FROM "Forum" f
-ON CONFLICT (forum_id) DO NOTHING;
+-- HasMemberSide backfill: retired Phase A 2026-05-28 (table dropped above).
+-- ForumSide backfill: retired Phase A 2026-05-28 (table dropped above).
 
 -- CommentRootPost is loaded from preprocess-emitted CSV by load-side-tables.py
 -- (run as a separate step from load-data.sh after this script). The \copy
@@ -308,15 +269,7 @@ UPDATE "PersonPostCount" ppc
  WHERE ppc.person_id = sub.person_gid
    AND ppc.post_count = 0;
 
--- PersonSide: mirror Person {id, firstName, lastName} for IC9 + future use.
--- Driven by the already-loaded "Person" vertex table. Idempotent.
-INSERT INTO "PersonSide" (person_business_id, first_name, last_name)
-SELECT
-  CAST(ag_catalog.agtype_object_field_text(properties, 'id') AS bigint),
-  ag_catalog.agtype_object_field_text(properties, 'firstName'),
-  ag_catalog.agtype_object_field_text(properties, 'lastName')
-FROM "Person"
-ON CONFLICT (person_business_id) DO NOTHING;
+-- PersonSide backfill: retired Phase A 2026-05-28 (table dropped above).
 
 -- MessageByCreator is loaded from preprocess-emitted CSV by load-side-tables.py
 -- (run as a separate step from load-data.sh after this script). See the
@@ -339,6 +292,5 @@ ANALYZE "Company";
 ANALYZE "ForumMemberPostCount";
 ANALYZE "PersonPostCount";
 ANALYZE "MessageByCreator";
-ANALYZE "PersonSide";
 ANALYZE "HAS_INTEREST";
 ANALYZE "HAS_TAG";
