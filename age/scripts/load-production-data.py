@@ -95,12 +95,24 @@ def get_label_id(cur, graph_name, label_name):
 
 
 def setup_graph(conn, cur, graph_name):
-    """Drop (if exists) and recreate the graph with all labels."""
+    """Drop (if exists) and recreate the graph with all labels.
+
+    Aggressive cleanup: drop_graph + DROP SCHEMA CASCADE before create_graph.
+    drop_graph alone is not reliable after failed prior loads — it can leave a
+    standalone schema (no ag_graph row) that blocks create_graph with a
+    pg_namespace unique-violation. Belt-and-suspenders here is cheap.
+    """
     print("Setting up graph…")
+    # 1. Drop via AGE (clears ag_graph + ag_label + schema if all consistent)
     cur.execute("SELECT count(*) FROM ag_catalog.ag_graph WHERE name = %s", (graph_name,))
     if cur.fetchone()[0] > 0:
         cur.execute(f"SELECT drop_graph('{graph_name}', true)")
     conn.commit()
+    # 2. Belt-and-suspenders: if a schema with the same name persists outside
+    #    of AGE's tracking (from a half-completed prior load), wipe it.
+    cur.execute(f'DROP SCHEMA IF EXISTS "{graph_name}" CASCADE')
+    conn.commit()
+
     cur.execute(f"SELECT create_graph('{graph_name}')")
     conn.commit()
 
@@ -156,18 +168,21 @@ def copy_flush(cur, conn, sql, lines):
 # ---------------------------------------------------------------------------
 
 def _load_vertex_worker(args):
-    """Worker: load one vertex label."""
-    connection_string, graph_name, label, csv_path = args
+    """Worker: load one vertex label. label_id is pre-fetched in the main
+    process to avoid the catalog-visibility race that fires when workers
+    query ag_label freshly after setup_graph in another connection.
+    """
+    connection_string, graph_name, label, label_id, csv_path = args
     conn, cur = connect(connection_string)
     try:
-        load_vertex_csv(conn, cur, graph_name, label, csv_path)
+        load_vertex_csv(conn, cur, graph_name, label, label_id, csv_path)
     finally:
         cur.close()
         conn.close()
     return label
 
 
-def load_vertex_csv(conn, cur, graph_name, label, csv_path):
+def load_vertex_csv(conn, cur, graph_name, label, label_id, csv_path):
     """
     Stream-load a preprocessed vertex file via COPY, and in the same pass
     write (label, business_id, graphid) rows into the _id_map table so edges
@@ -178,8 +193,9 @@ def load_vertex_csv(conn, cur, graph_name, label, csv_path):
         <orig_id>|"<agtype_properties_csv_escaped>"
 
     The properties field is already CSV-quoted by preprocess.
+    label_id is passed in from the main process — looked up there once, after
+    setup_graph commits, where the catalog view is guaranteed consistent.
     """
-    label_id = get_label_id(cur, graph_name, label)
     vertex_copy_sql = f'COPY {graph_name}."{label}" FROM STDIN (FORMAT CSV)'
     id_map_copy_sql = (
         f'COPY {graph_name}."_id_map" (label, business_id, graphid) '
@@ -232,18 +248,18 @@ def _load_edge_worker(args):
     """Worker: load one edge label using SQL JOIN against _id_map for graphid
     resolution. No Python id_map dict is pickled — each worker streams its
     CSV and resolves business_id -> graphid in batches via indexed lookup on
-    the shared _id_map table.
+    the shared _id_map table. label_id is pre-fetched in the main process.
     """
-    connection_string, graph_name, label, csv_path = args
+    connection_string, graph_name, label, label_id, csv_path = args
     conn, cur = connect(connection_string)
     try:
-        load_edge_csv(conn, cur, graph_name, label, csv_path)
+        load_edge_csv(conn, cur, graph_name, label, label_id, csv_path)
     finally:
         cur.close()
         conn.close()
 
 
-def load_edge_csv(conn, cur, graph_name, label, csv_path):
+def load_edge_csv(conn, cur, graph_name, label, label_id, csv_path):
     """
     Stream-load a preprocessed edge file via COPY.
 
@@ -257,8 +273,8 @@ def load_edge_csv(conn, cur, graph_name, label, csv_path):
       3. Build COPY lines for the batch and flush to the edge table.
 
     Memory per worker is bounded by COPY_BATCH; no global id_map is held.
+    label_id is passed in from the main process (catalog-visibility race fix).
     """
-    label_id = get_label_id(cur, graph_name, label)
     copy_sql = (
         f'COPY {graph_name}."{label}" (id, start_id, end_id, properties) '
         f'FROM STDIN (FORMAT CSV)'
@@ -425,6 +441,19 @@ def main():
     # 1. Graph + labels + _id_map (DDL must complete before parallel COPY)
     setup_graph(conn, cur, args.graph_name)
     setup_id_map(conn, cur, args.graph_name)
+
+    # 1b. Pre-fetch every label's ag_label.id in the main connection. Workers
+    # used to call get_label_id themselves, which queried ag_catalog.ag_label
+    # from a freshly-opened connection — that occasionally raced against the
+    # catalog-visibility window after setup_graph and failed with "Label not
+    # found". Looking up label_ids here (same session that did setup_graph)
+    # is guaranteed to see the just-committed catalog state; passing the ids
+    # to workers in args removes the race entirely.
+    print("Pre-fetching label ids…")
+    label_ids = {}
+    for label in VERTEX_LABELS + EDGE_LABELS:
+        label_ids[label] = get_label_id(cur, args.graph_name, label)
+    conn.commit()
     cur.close()
     conn.close()
 
@@ -440,7 +469,7 @@ def main():
         if not Path(csv_path).exists():
             print(f"  {label}: CSV not found at {csv_path}, skipping")
             continue
-        vertex_args.append((args.connection_string, args.graph_name, label, csv_path))
+        vertex_args.append((args.connection_string, args.graph_name, label, label_ids[label], csv_path))
 
     with multiprocessing.Pool(processes=args.workers) as pool:
         pool.map(_load_vertex_worker, vertex_args)
@@ -461,7 +490,7 @@ def main():
         if not Path(csv_path).exists():
             print(f"  {label}: CSV not found at {csv_path}, skipping")
             continue
-        edge_args.append((args.connection_string, args.graph_name, label, csv_path))
+        edge_args.append((args.connection_string, args.graph_name, label, label_ids[label], csv_path))
 
     with multiprocessing.Pool(processes=args.workers) as pool:
         pool.map(_load_edge_worker, edge_args)
