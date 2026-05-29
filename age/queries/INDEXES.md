@@ -153,7 +153,7 @@ CREATE UNIQUE INDEX idx_msgbycreator_creator_date_msg
 | IC7 | `gin_person`, `idx_hascreator_*`, `idx_likes_*` |
 | IC8 | `gin_person` (entry), `idx_hascreator_*` (untyped intermediate; AGE plans as label UNION internally — bounded cost) |
 | IC9 | `gin_person` (entry), `idx_knows_start` (directed 1+2-hop friend ids via Cypher UNION), `idx_msgbycreator_creator_date_msg` (per-friend date-DESC walk with LATERAL LIMIT 20 — composite `(creator_business_id, creation_date DESC, message_business_id)`), `PersonSide_pkey` (friend name projection) |
-| IC10 | `gin_person` (entry), `idx_knows_start` (directed 2-hop FoF), `idx_islocatedin_*` (city), `idx_post_creator_id` (denorm: per-FoF post scan), `idx_hastag_*`, `idx_hasinterest_start_end` (composite), `PersonPostCount` PK (total post count) |
+| IC10 | `gin_person` (entry), `idx_knows_start` (directed 2-hop FoF), `idx_islocatedin_*` (city), `idx_msgbycreator_creator_date_msg` (per-FoF MBC scan: common + total post counts in one LATERAL), `idx_hastag_*`, `idx_hasinterest_start_end` (composite) |
 | IC11 | `gin_person`, `idx_knows_*`, `idx_workat_*`, `idx_islocatedin_*`, `idx_country_name` |
 | IC12 | `gin_person` (friends via directed KNOWS), `gin_tagclass` (root TagClass seed), `idx_knows_start` (friend hop), `idx_hascreator_end` (reverse HAS_CREATOR), `idx_replyof_start` (REPLY_OF to Post), `idx_hastag_*` (post tags); traverses graph entirely via Cypher — `idx_comment_creator_id` and `idx_comment_reply_of_id` retired 2026-05-14 |
 | IS1, IS3 | `gin_person`, `idx_islocatedin_*` (IS1), `idx_knows_start` (IS3 — directed) |

@@ -229,18 +229,14 @@ section 5 for the DDL.
 - Populated at load time by `denormalize-schema.sql` section 6 (aggregate from `CONTAINER_OF ⋈ Post.creator_id` — `Post.forum_id` was retired 2026-05-14).
 - Secondary index: `idx_fmpc_member` on `member_id`.
 
-### `ldbc_snb."PersonPostCount"`
+### `ldbc_snb."PersonPostCount"` — RETIRED Phase B 2026-05-29
 
-```sql
-(person_id ag_catalog.graphid PRIMARY KEY, post_count int NOT NULL DEFAULT 0)
-```
-
-- Stores total post count per Person.
-- Used by IC10 V5: provides `total_posts` in a single primary-key lookup,
-  avoiding a count over all Posts by the FoF candidate.
-- Maintained by IU6 (AddPost): `UPDATE … SET post_count = post_count + 1`.
-- Populated at load time from `Post.creator_id`; every Person has a row
-  (even those with 0 posts) so IU6 can always use `UPDATE` (no INSERT race).
+Was a per-Person total-post-count counter cache read only by IC10. Retired
+because IC10 now computes `total_posts` inline as `COUNT(*)` over
+`MessageByCreator` (filtered `is_post = true`) in the same LATERAL that computes
+`common_posts` — one index range scan per friend, no separate count probe and no
+counter to maintain. IU1 no longer seeds it; IU6 no longer increments it;
+`denormalize-schema.sql` issues `DROP TABLE IF EXISTS "PersonPostCount"`.
 
 ### `ldbc_snb."MessageByCreator"` (2026-05-14, IC9 Phase C)
 

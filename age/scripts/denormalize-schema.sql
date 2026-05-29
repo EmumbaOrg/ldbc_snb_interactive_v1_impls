@@ -170,14 +170,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_commentrootpost_business_id
 DROP INDEX IF EXISTS idx_hasmember_end_joindate;
 DROP INDEX IF EXISTS idx_hasmember_end_joindate_agtype;
 
--- 5b. PersonPostCount: 1 row per Person, total post_count. Side table
--- (NOT on the Person label) because AGE 1.6 cannot handle extra columns
--- with NOT NULL DEFAULT on its label tables — Cypher CREATE segfaults.
--- Maintained at IU6 (increment); load-time backfill from Post.creator_id.
-CREATE TABLE IF NOT EXISTS "PersonPostCount" (
-  person_id  ag_catalog.graphid PRIMARY KEY,
-  post_count int                NOT NULL DEFAULT 0
-);
+-- PersonPostCount: retired Phase B 2026-05-29. Was a per-Person post-count
+-- counter cache read only by IC10. IC10 now computes total post count inline as
+-- COUNT(*) over MessageByCreator (is_post=true) in the same LATERAL that computes
+-- common_post_count. IU1 no longer seeds it; IU6 no longer increments it. Drop
+-- stale table for any pre-Phase-B deployment:
+DROP TABLE IF EXISTS "PersonPostCount";
 
 -- 5d (2026-05-14): Phase C side tables for IC9.
 -- AGENTS.md §14 forbids outer-SQL reads of AGE label tables, so the prior
@@ -251,24 +249,7 @@ JOIN "HAS_CREATOR"  hc ON hc.start_id = p.id
 GROUP BY co.start_id, hc.end_id
 ON CONFLICT (forum_id, member_id) DO NOTHING;
 
--- PersonPostCount: aggregate posts per Person via HAS_CREATOR. Pre-populate
--- every Person (even those with 0 posts) so IU6 increment can use UPDATE.
--- (Post.creator_id retired 2026-05-15; traverse HAS_CREATOR directly.)
-INSERT INTO "PersonPostCount" (person_id, post_count)
-SELECT id, 0 FROM "Person"
-ON CONFLICT (person_id) DO NOTHING;
-
-UPDATE "PersonPostCount" ppc
-   SET post_count = sub.cnt
-  FROM (
-    SELECT hc.end_id AS person_gid, COUNT(*)::int AS cnt
-    FROM "Post" p
-    JOIN "HAS_CREATOR" hc ON hc.start_id = p.id
-    GROUP BY hc.end_id
-  ) sub
- WHERE ppc.person_id = sub.person_gid
-   AND ppc.post_count = 0;
-
+-- PersonPostCount backfill: retired Phase B 2026-05-29 (table dropped above).
 -- PersonSide backfill: retired Phase A 2026-05-28 (table dropped above).
 
 -- MessageByCreator is loaded from preprocess-emitted CSV by load-side-tables.py
@@ -290,7 +271,6 @@ ANALYZE "Country";
 ANALYZE "University";
 ANALYZE "Company";
 ANALYZE "ForumMemberPostCount";
-ANALYZE "PersonPostCount";
 ANALYZE "MessageByCreator";
 ANALYZE "HAS_INTEREST";
 ANALYZE "HAS_TAG";

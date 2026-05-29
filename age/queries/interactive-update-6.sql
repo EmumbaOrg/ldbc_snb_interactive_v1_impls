@@ -12,8 +12,10 @@
 --
 -- SQL maintains (all side tables — NO AGE label tables):
 --   ForumMemberPostCount(forum_id, member_id)     (iter-2 aggregate)
---   PersonPostCount(person_id)                    (iter-2 aggregate)
 --   MessageByCreator(creator_business_id, …, message_id)  (Phase C mirror)
+--
+-- PersonPostCount retired Phase B 2026-05-29: IU6 no longer increments a PPC
+-- counter. IC10 computes total post count inline against MessageByCreator.
 --
 -- Post.forum_id retired 2026-05-14: forum gid sourced from Call 2 MATCH.
 -- Post.creator_id retired 2026-05-15: IC10 was migrated to use
@@ -70,13 +72,6 @@ insert_fmpc AS (
   ON CONFLICT (forum_id, member_id) DO UPDATE
      SET post_count = ldbc_snb."ForumMemberPostCount".post_count + 1
   RETURNING forum_id, member_id
-),
-insert_ppc AS (
-  INSERT INTO ldbc_snb."PersonPostCount" (person_id, post_count)
-  SELECT author_gid, 1 FROM (SELECT DISTINCT author_gid FROM post_data LIMIT 1) ins
-  ON CONFLICT (person_id) DO UPDATE
-     SET post_count = ldbc_snb."PersonPostCount".post_count + 1
-  RETURNING person_id
 )
 -- Terminal DML: MessageByCreator append (now includes message_id graphid).
 -- content_text has the JSON quotes already stripped by ::text cast above.

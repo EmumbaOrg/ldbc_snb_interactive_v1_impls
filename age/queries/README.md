@@ -191,10 +191,12 @@ straddling a given month, ranked by how their post tags overlap with
   (AGE-QUIRKS §1), `OPTIONAL MATCH` direct-friend exclusion, and `IS_LOCATED_IN`
   city lookup. Returns graphids + scalar bio columns.
 - The SQL outer query computes `commonInterestScore = 2×common_posts − total_posts`
-  using: (a) `Post.creator_id` denorm (iter-1) for a fast per-friend post scan,
-  (b) `HAS_TAG` + `HAS_INTEREST` indexed JOIN for common-interest posts, and
-  (c) `PersonPostCount` side table (iter-2 aggregate) for total post count per
-  person in a single index lookup.
+  in a single LATERAL scan of `MessageByCreator` per friend (filtered
+  `creator_business_id = friend, is_post = true`): `total_posts = COUNT(*)` over
+  that range, `common_posts = COUNT(*) FILTER` on a per-post `HAS_TAG` +
+  `HAS_INTEREST` EXISTS check. `PersonPostCount` (the former total-count side
+  table) was retired Phase B 2026-05-29 — total is now derived from the same MBC
+  scan, no separate counter.
 - Directed `-[:KNOWS]->` per AGE-QUIRKS §11.
 
 The 30-day birthday window crosses a month boundary, which Cypher cannot

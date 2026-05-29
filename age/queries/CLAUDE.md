@@ -77,7 +77,7 @@ Implementations: `interactive-complex-N.sql`, `interactive-short-N.sql`, `intera
 
 10. **IC12 tag source** — tags come from the original Post via `(post:Post)-[:HAS_TAG]->(tag)`, never from the reply.
 
-11. **IU cypher() call count** — minimum needed per IU. **IU7 uses three calls** to dodge AGE MVCC bug (issue #1954, see `../AGE-1.6-MVCC-BUG.md`): the `HAS_TAG` UNWIND must run in a separate visibility window after the Comment is committed, and a third call reads the committed Comment's `content` for the `MessageByCreator` INSERT (Cypher-escaped content can't safely substitute into a SQL string literal). Don't merge IU7's three calls. Tier 1/2 splits: IU1=2, IU4=1, IU5=1, IU6=2, IU7=3. (IU4 dropped from 2→1 in Phase A 2026-05-28: ForumSide retired, so the second call that populated it is gone; AddForum now completes in a single CREATE+UNWIND call.)
+11. **IU cypher() call count** — minimum needed per IU. **IU7 uses three calls** to dodge AGE MVCC bug (issue #1954, see `../AGE-1.6-MVCC-BUG.md`): the `HAS_TAG` UNWIND must run in a separate visibility window after the Comment is committed, and a third call reads the committed Comment's `content` for the `MessageByCreator` INSERT (Cypher-escaped content can't safely substitute into a SQL string literal). Don't merge IU7's three calls. Tier 1/2 splits: IU1=1, IU4=1, IU5=1, IU6=2, IU7=3. (IU1 dropped from 2→1 in Phase B 2026-05-29: PersonPostCount retired, so the second call that seeded it is gone; AddPerson now completes in a single CREATE+UNWIND call. IU4 dropped from 2→1 in Phase A 2026-05-28: ForumSide retired, so the second call that populated it is gone; AddForum now completes in a single CREATE+UNWIND call.)
 
 12. **SF-appropriate tactics**:
     - Avoid materializing full edge sets if SF1000 will OOM; prefer streaming joins.
@@ -181,7 +181,7 @@ If no pattern is fast enough, the query joins IS6 as a pure-SQL holdout — exce
 
 Do **not** consult `postgres/`/`duckdb/`/`umbra/` for graph-pattern questions. Known bugs to ignore: TigerGraph IC7 picks highest ID on ties; DuckDB IC7 returns multiple rows per liker on timestamp ties.
 
-**Cross-check against AGE's existing tactics first.** Review `age/scripts/denormalize-schema.sql` and `INDEXES.md`. AGE already has denorm `graphid` columns (`Post.creator_id`), side tables (`ForumMemberPostCount`, `PersonPostCount`, `MessageByCreator`, `CommentRootPost`, `PersonSide`, `HasMemberSide`, `ForumSide`), composite indexes, and GIN+functional-B-tree splits that the relational implementations don't. If a relational tactic looks useful, add the denorm column or index in AGE's schema first, then write the hybrid query — don't convert AGE to pure SQL to mimic the relational shape.
+**Cross-check against AGE's existing tactics first.** Review `age/scripts/denormalize-schema.sql` and `INDEXES.md`. AGE already has side tables (`ForumMemberPostCount`, `MessageByCreator`, `CommentRootPost`), composite indexes, and GIN+functional-B-tree splits that the relational implementations don't. If a relational tactic looks useful, add the denorm column or index in AGE's schema first, then write the hybrid query — don't convert AGE to pure SQL to mimic the relational shape.
 
 ## Validation Against LDBC Reference Params
 
