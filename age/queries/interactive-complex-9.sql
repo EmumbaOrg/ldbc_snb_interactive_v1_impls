@@ -1,56 +1,144 @@
--- LdbcQuery9 — Top-20 recent messages (before maxDate) by friends + FoF.
--- Hybrid: Cypher block enumerates 1+2-hop friend ids (LDBC business bigints)
--- AND projects friend.firstName/lastName directly (Phase A: PersonSide retired).
--- Outer SQL walks ldbc_snb."MessageByCreator" per-friend in date-DESC order
--- with LATERAL LIMIT 20, then takes global top-20. CLAUDE.md §14 compliant —
--- outer SQL never touches AGE label tables; MessageByCreator is a non-AGE
--- side table maintained by the load step + IU1/IU6/IU7. Friend names come
--- from Cypher RETURN — the natural peer pattern (all peers read Person
--- properties directly with zero side tables; §14 was over-corrected for trivial
--- scalar RETURN values).
+-- LdbcQuery9 — Top-20 recent messages (before maxDate) by 1+2-hop friends.
+-- Hybrid: four Cypher arms (1-hop Comments, 1-hop Posts, 2-hop Comments,
+-- 2-hop Posts) each traverse friends then messages. Outer SQL UNION ALL,
+-- deduplicates by message id (friends reachable by both 1-hop and 2-hop
+-- must not appear twice), then takes global top-20.
 --
--- Why MessageByCreator rather than Cypher for messages: tested 2026-05-14
--- against local SF3, the Cypher-only 4-arm UNION (HAS_CREATOR.creationDate
--- edge property + composite functional index) ran 135x-388x slower than the
--- prior hybrid. AGE 1.6 cannot push LIMIT past Cypher UNION and cannot bind
--- Cypher edge-property predicates to functional indexes as Index Cond — the
--- date predicate always lands as a post-scan Filter. The side-table shape
--- lets PostgreSQL's planner bind the predicate to the composite index directly
--- and use LATERAL LIMIT 20 for per-friend early termination.
+-- Milestone A 2026-05-30: MessageByCreator retired. Canonical Cypher shape.
+-- Four arms needed because: (a) AGE has no polymorphic Message label
+-- (AGE-QUIRKS §3); (b) friend de-dup requires UNION (set-dedup) over
+-- 1-hop ∪ 2-hop, but a LIMIT inside a Cypher UNION is unsupported in AGE
+-- (AGE-QUIRKS §1 / CLAUDE.md unsupported list). Shape per arm:
+--   MATCH (p)-[:KNOWS]->{1|1..2}->(friend) WHERE friend.id <> $personId
+--   MATCH (friend)<-[:HAS_CREATOR]-(m:{Comment|Post})
+--   WHERE m.creationDate < $maxDate
+--   RETURN friend.id, friend.firstName, friend.lastName, m.id, content, m.creationDate
+--   ORDER BY m.creationDate DESC, m.id ASC LIMIT 20
+-- Dedup on message_id in outer SQL (a message has exactly one creator).
 --
--- Index used: idx_msgbycreator_creator_date_msg(creator_business_id, creation_date DESC, message_business_id)
--- — per-friend ordered range scan with both columns as Index Cond.
+-- 2026-05-31 OOM FIX: per-arm `ORDER BY ... LIMIT 20` (single-query LIMIT, not
+-- a Cypher-UNION LIMIT, so supported) is mandatory, not an optimization.
+-- AGE #1000: cypher() materializes its entire match set in backend memory
+-- before the outer SQL can apply LIMIT. For a high-degree person the 2-hop arm
+-- expands to ~2.5M (friend,message) rows; crossing all of them (with content
+-- text) into the SQL UNION OOM-kills the backend (signal 9, confirmed SF3
+-- persons 28587302332608 / 17592186047812 / 6597069786375). With the per-arm
+-- LIMIT the sort stays inside the Cypher executor (spills via work_mem) and only
+-- 20 rows per arm cross the boundary; the three crashers now complete in ~27-29s.
+-- CORRECTNESS: global top-20 ⊆ union of each arm's top-20 — a message in the
+-- global top-20 has ≤19 newer messages overall, hence ≤19 newer within its own
+-- arm (a subset), so it survives that arm's LIMIT 20. Outer SQL re-sorts the
+-- ≤80 unioned rows and takes the global top-20. The slow ~27s latency still
+-- surfaces #1000; the LIMIT only prevents the crash, it does not hide the cost.
+-- The per-arm `WITH DISTINCT friend` is MANDATORY, not cosmetic: a 2-hop friend
+-- reachable via K intermediaries yields K duplicate rows per message, and those
+-- duplicates would consume the LIMIT-20 slots BEFORE the outer dedup, dropping
+-- genuinely-newer messages. (Same path-multiplicity trap as IC5.) Verified at
+-- SF3: plain (no LIMIT) and DISTINCT+LIMIT hash-match; LIMIT-without-DISTINCT
+-- diverges. The old no-LIMIT form deduped before any LIMIT so was immune.
 --
--- Excluded from age_parameterized_queries: $maxDate lives in outer SQL,
--- only Cypher-internal params can be bound through the agtype blob.
-SELECT
-  m.creator_business_id::ag_catalog.agtype         AS personId,
-  ag_catalog.text_to_agtype(friends.first_name)    AS personFirstName,
-  ag_catalog.text_to_agtype(friends.last_name)     AS personLastName,
-  m.message_business_id::ag_catalog.agtype         AS messageId,
-  ag_catalog.text_to_agtype(m.content)             AS messageContent,
-  m.creation_date::ag_catalog.agtype               AS messageCreationDate
-FROM (
-  SELECT (fid::text)::bigint AS person_id,
-         fn::text            AS first_name,
-         ln::text            AS last_name
+-- Directed `-[:KNOWS]->` per AGE-QUIRKS §11; IU8 stores both directions.
+-- messageContent: kept as agtype — AgeConverter.toStr unwraps outer JSON quotes.
+
+WITH raw AS (
+  -- 1-hop friends, Comments
+  SELECT
+    (person_id::text)::bigint AS person_id,
+    fn::text                  AS first_name,
+    ln::text                  AS last_name,
+    (msg_id::text)::bigint    AS msg_id,
+    content                   AS msg_content,
+    (cdate::text)::bigint     AS cdate
   FROM ag_catalog.cypher('$graphName', $$
-    MATCH (p:Person {id: $personId})-[:KNOWS]->(f:Person)
-    WHERE f.id <> $personId
-    RETURN f.id AS fid, f.firstName AS fn, f.lastName AS ln
-    UNION
-    MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(f:Person)
-    WHERE f.id <> $personId
-    RETURN f.id AS fid, f.firstName AS fn, f.lastName AS ln
-  $$) AS x(fid ag_catalog.agtype, fn ag_catalog.agtype, ln ag_catalog.agtype)
-) friends
-CROSS JOIN LATERAL (
-  SELECT mm.creator_business_id, mm.message_business_id, mm.creation_date, mm.content
-  FROM ldbc_snb."MessageByCreator" mm
-  WHERE mm.creator_business_id = friends.person_id
-    AND mm.creation_date < $maxDate
-  ORDER BY mm.creation_date DESC, mm.message_business_id ASC
-  LIMIT 20
-) m
-ORDER BY m.creation_date DESC, m.message_business_id ASC
+    MATCH (p:Person {id: $personId})-[:KNOWS]->(friend:Person)
+    WHERE friend.id <> $personId
+    WITH DISTINCT friend
+    MATCH (friend)<-[:HAS_CREATOR]-(m:Comment)
+    WHERE m.creationDate < $maxDate
+    RETURN friend.id AS person_id, friend.firstName AS fn, friend.lastName AS ln,
+           m.id AS msg_id, m.content AS content, m.creationDate AS cdate
+    ORDER BY m.creationDate DESC, m.id ASC
+    LIMIT 20
+  $$) AS x(person_id agtype, fn agtype, ln agtype, msg_id agtype, content agtype, cdate agtype)
+  UNION ALL
+  -- 1-hop friends, Posts
+  SELECT
+    (person_id::text)::bigint,
+    fn::text,
+    ln::text,
+    (msg_id::text)::bigint,
+    content,
+    (cdate::text)::bigint
+  FROM ag_catalog.cypher('$graphName', $$
+    MATCH (p:Person {id: $personId})-[:KNOWS]->(friend:Person)
+    WHERE friend.id <> $personId
+    WITH DISTINCT friend
+    MATCH (friend)<-[:HAS_CREATOR]-(m:Post)
+    WHERE m.creationDate < $maxDate
+    RETURN friend.id AS person_id, friend.firstName AS fn, friend.lastName AS ln,
+           m.id AS msg_id, coalesce(m.content, m.imageFile) AS content,
+           m.creationDate AS cdate
+    ORDER BY m.creationDate DESC, m.id ASC
+    LIMIT 20
+  $$) AS y(person_id agtype, fn agtype, ln agtype, msg_id agtype, content agtype, cdate agtype)
+  UNION ALL
+  -- 2-hop friends, Comments
+  SELECT
+    (person_id::text)::bigint,
+    fn::text,
+    ln::text,
+    (msg_id::text)::bigint,
+    content,
+    (cdate::text)::bigint
+  FROM ag_catalog.cypher('$graphName', $$
+    MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(friend:Person)
+    WHERE friend.id <> $personId
+    WITH DISTINCT friend
+    MATCH (friend)<-[:HAS_CREATOR]-(m:Comment)
+    WHERE m.creationDate < $maxDate
+    RETURN friend.id AS person_id, friend.firstName AS fn, friend.lastName AS ln,
+           m.id AS msg_id, m.content AS content, m.creationDate AS cdate
+    ORDER BY m.creationDate DESC, m.id ASC
+    LIMIT 20
+  $$) AS a(person_id agtype, fn agtype, ln agtype, msg_id agtype, content agtype, cdate agtype)
+  UNION ALL
+  -- 2-hop friends, Posts
+  SELECT
+    (person_id::text)::bigint,
+    fn::text,
+    ln::text,
+    (msg_id::text)::bigint,
+    content,
+    (cdate::text)::bigint
+  FROM ag_catalog.cypher('$graphName', $$
+    MATCH (p:Person {id: $personId})-[:KNOWS]->(:Person)-[:KNOWS]->(friend:Person)
+    WHERE friend.id <> $personId
+    WITH DISTINCT friend
+    MATCH (friend)<-[:HAS_CREATOR]-(m:Post)
+    WHERE m.creationDate < $maxDate
+    RETURN friend.id AS person_id, friend.firstName AS fn, friend.lastName AS ln,
+           m.id AS msg_id, coalesce(m.content, m.imageFile) AS content,
+           m.creationDate AS cdate
+    ORDER BY m.creationDate DESC, m.id ASC
+    LIMIT 20
+  $$) AS b(person_id agtype, fn agtype, ln agtype, msg_id agtype, content agtype, cdate agtype)
+),
+-- De-duplicate: a message has exactly one creator, so msg_id uniquely
+-- identifies a row. Friends reachable by both 1-hop and 2-hop would
+-- otherwise produce duplicate rows for each message.
+deduped AS (
+  SELECT DISTINCT ON (msg_id)
+    person_id, first_name, last_name, msg_id, msg_content, cdate
+  FROM raw
+  ORDER BY msg_id
+)
+SELECT
+  person_id::ag_catalog.agtype                         AS personId,
+  ag_catalog.text_to_agtype(first_name)               AS personFirstName,
+  ag_catalog.text_to_agtype(last_name)                AS personLastName,
+  msg_id::ag_catalog.agtype                           AS messageId,
+  msg_content                                         AS messageContent,
+  cdate::ag_catalog.agtype                            AS messageCreationDate
+FROM deduped
+ORDER BY cdate DESC, msg_id ASC
 LIMIT 20;

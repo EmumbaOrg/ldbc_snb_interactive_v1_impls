@@ -130,9 +130,8 @@ def setup_id_map(conn, cur, graph_name):
     past SF100 (where the dict would exceed available RAM). UNLOGGED — we
     rebuild it on every load and don't need crash recovery.
 
-    Edge load and side-table load both resolve via SQL JOIN against this
-    table; it is dropped by load-side-tables.py after the side tables are
-    populated.
+    Edge load resolves via SQL JOIN against this table; it is dropped by
+    load-data.sh after the load completes.
     """
     cur.execute(
         f'DROP TABLE IF EXISTS {graph_name}."_id_map" CASCADE'
@@ -495,8 +494,8 @@ def main():
     with multiprocessing.Pool(processes=args.workers) as pool:
         pool.map(_load_edge_worker, edge_args)
 
-    print("\nLoad complete. _id_map is retained for side-table loading; "
-          "load-side-tables.py will DROP it when done.")
+    print("\nLoad complete. _id_map is retained for the post-load DROP "
+          "step in load-data.sh.")
 
 
 if __name__ == "__main__":

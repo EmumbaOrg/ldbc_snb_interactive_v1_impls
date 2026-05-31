@@ -217,50 +217,24 @@ managed label tables without triggering a segfault in the Cypher CREATE path,
 so these aggregates live in separate tables. See `denormalize-schema.sql`
 section 5 for the DDL.
 
-### `ldbc_snb."ForumMemberPostCount"`
+### `ldbc_snb."ForumMemberPostCount"` — RETIRED Milestone A 2026-05-30
 
-```sql
-(forum_id ag_catalog.graphid, member_id ag_catalog.graphid, post_count int, PRIMARY KEY (forum_id, member_id))
-```
+Was a precomputed per-(forum, member) post count read by IC5.
 
-- Stores the count of Posts each Person (member) made in each Forum.
-- Used by IC5 V11: replaces a per-pair `Post` LEFT JOIN with a single index lookup.
-- Maintained by IU6 (AddPost): `INSERT … ON CONFLICT … DO UPDATE SET post_count = post_count + 1`.
-- Populated at load time by `denormalize-schema.sql` section 6 (aggregate from `CONTAINER_OF ⋈ Post.creator_id` — `Post.forum_id` was retired 2026-05-14).
-- Secondary index: `idx_fmpc_member` on `member_id`.
+IC5 now computes the count inline via Cypher using `WITH DISTINCT friend, forum`
+staging before `count(post)` — required to prevent K× overcount from 2-hop
+path multiplicity (verified at SF3: staged form matches prior FMPC values).
 
-**Retention is honest AGE 1.6 tech debt (Phase C retirement attempted + reversed 2026-05-30).**
-The denorm audit (`declarative-orbiting-galaxy.md`) flagged FMPC for retirement: no
-peer impl (postgres/duckdb/umbra/cypher/tigergraph) precomputes a per-`(forum,
-member)` counter — they compute the count inline. We attempted to make IC5 do the
-same and an SF3 A/B/C/D bake-off surfaced three distinct AGE 1.6 limitations that
-the precompute had been hiding (these are the upstream-facing artifact — keeping
-FMPC is what lets the benchmark actually run at SF100–1000):
+No peer impl (postgres/duckdb/umbra/cypher/tigergraph) precomputes this counter.
+All peers compute the count inline.
 
-1. **Path-multiplicity overcount (correctness footgun).** The natural friend-driven
-   inline shape — two-arm `UNION ALL` of 1-hop and 2-hop friends, each with
-   `OPTIONAL MATCH (friend)<-[:HAS_CREATOR]-(post:Post)<-[:CONTAINER_OF]-(forum)`
-   then `count(post)` — **silently overcounts** (e.g. param `6597069768287`:
-   FMPC=203, naive inline=290). A friend reachable through *K* distinct 2-hop
-   intermediaries appears in *K* pre-aggregation rows, so `count(post)` is inflated
-   *K×*. Correctness requires a `WITH DISTINCT friend, forum` staging step *before*
-   the count (verified: staged variant reproduces FMPC's 22/21/203 exactly). This
-   would have failed LDBC validation, not merely run slow.
-2. **Latency regression even when correct.** The staged-correct form runs 8–15 s per
-   IC5 param at SF3 (FMPC path is a sub-second indexed lookup); a full
-   `validate_database` pass did not complete in 12 h. AGE 1.6 cannot push the
-   `HAS_CREATOR` creator filter into the `CONTAINER_OF` post scan, so the aggregate
-   re-walks posts per `(friend, forum)` pair — same class as AGE #1000 (functional
-   indexes / property predicates not binding from Cypher).
-3. **Backend crash on the variable-length form.** Rewriting the friend match as
-   `(p)-[:KNOWS*1..2]->(friend)` + `WITH DISTINCT` + the `OPTIONAL MATCH` count
-   chain **crashed the PostgreSQL backend** (server entered recovery mode) at SF3.
-   Reproducible; worth filing as an AGE 1.6 robustness bug.
+**Pre-retirement latency (SF3 baseline):** IC5 p50/p95/p99 ≈ sub-second (indexed lookup).
+**Post-retirement expected:** 8–15 s per param at SF3 (AGE 1.6 cannot push HAS_CREATOR
+filter into CONTAINER_OF post scan — AGE issue #1000).
 
-Findings 1+2 blew past the plan's `>30%` regression gate, so FMPC stays.
 **Un-retire when:** AGE gains predicate pushdown / index binding through Cypher
-(AGE #1000 class) so the per-pair count can use an index-backed traversal instead
-of a full per-forum scan.
+(AGE #1000) so the per-pair count can use an index-backed traversal instead of
+a full per-forum scan.
 
 ### `ldbc_snb."PersonPostCount"` — RETIRED Phase B 2026-05-29
 

@@ -77,22 +77,17 @@ else
   time "${PY}" "${SCRIPT_DIR}/preprocess_ldbc.py" "${PREPROCESS_ARGS[@]}"
 fi
 
-# Sanity check — preprocessing must produce exactly 11 vertex CSVs, 15 edge CSVs,
-# and 2 side table CSVs.
+# Sanity check — preprocessing must produce exactly 11 vertex CSVs and 15 edge CSVs.
+# Milestone A 2026-05-30: CommentRootPost and MessageByCreator side tables retired;
+# no side table CSVs are emitted by preprocess_ldbc.py any more.
 V_COUNT=$(ls "${CONVERTED_DIR}/vertices/"     2>/dev/null | wc -l | tr -d ' ')
 E_COUNT=$(ls "${CONVERTED_DIR}/edges/"        2>/dev/null | wc -l | tr -d ' ')
-S_COUNT=$(ls "${CONVERTED_DIR}/side_tables/"  2>/dev/null | wc -l | tr -d ' ')
 if [[ "$V_COUNT" -ne 11 || "$E_COUNT" -ne 15 ]]; then
   echo "ERROR: expected 11 vertex files and 15 edge files, got ${V_COUNT}v / ${E_COUNT}e."
   echo "Check ${CONVERTED_DIR}."
   exit 1
 fi
-if [[ "$S_COUNT" -lt 2 ]]; then
-  echo "ERROR: expected at least 2 side table CSVs, got ${S_COUNT}."
-  echo "Check ${CONVERTED_DIR}/side_tables/."
-  exit 1
-fi
-echo "  Preprocessing OK: ${V_COUNT} vertex files, ${E_COUNT} edge files, ${S_COUNT} side table files."
+echo "  Preprocessing OK: ${V_COUNT} vertex files, ${E_COUNT} edge files."
 
 # ---------------------------------------------------------------------------
 echo "=== Step 2: Loading graph into AGE via load-production-data.py ==="
@@ -123,12 +118,21 @@ time psql "$CONNECTION_STRING" \
     2>&1 | grep -v NOTICE || true
 
 # ---------------------------------------------------------------------------
-echo "=== Step 3c: Loading CSV-driven side tables (CommentRootPost, MessageByCreator) ==="
-# copy_expert over libpq — works locally and against managed Horizon DB.
-time "${PY}" "${SCRIPT_DIR}/load-side-tables.py" \
-    --crp-csv "${CONVERTED_DIR}/side_tables/commentRootPost.csv" \
-    --mbc-csv "${CONVERTED_DIR}/side_tables/messageByCreator.csv" \
-    --connection-string "$CONNECTION_STRING"
+# Step 3c: REMOVED Milestone A 2026-05-30.
+# CommentRootPost and MessageByCreator side tables retired; load-side-tables.py
+# no longer needed. _id_map is dropped inline via Python (same connection path
+# used by load-production-data.py).
+echo "=== Step 3c: Dropping _id_map (Milestone A: no side table loads remain) ==="
+"${PY}" - <<'PYEOF' "$CONNECTION_STRING"
+import sys, psycopg2
+conn = psycopg2.connect(sys.argv[1])
+conn.autocommit = True
+cur = conn.cursor()
+cur.execute('SET search_path = ldbc_snb, ag_catalog, public')
+cur.execute('DROP TABLE IF EXISTS "_id_map" CASCADE')
+conn.close()
+print("  _id_map dropped.")
+PYEOF
 
 # ---------------------------------------------------------------------------
 # Step 4 (VACUUM ANALYZE) intentionally omitted: denormalize-schema.sql

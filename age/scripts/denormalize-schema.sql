@@ -109,28 +109,15 @@ DROP INDEX IF EXISTS ldbc_snb.idx_comment_creator_creationdate;
 -- segfault, iter-2 keeps all aggregates in SIDE TABLES (not on AGE label
 -- tables) plus a composite index on the existing HAS_INTEREST edge.
 
--- 5a. ForumMemberPostCount: precomputed count of posts each Person made in
--- each Forum. Replaces IC5's per-pair Post LEFT JOIN with a single index
--- lookup. Maintained at IU6 (AddPost: increment).
-CREATE TABLE IF NOT EXISTS "ForumMemberPostCount" (
-  forum_id   ag_catalog.graphid NOT NULL,
-  member_id  ag_catalog.graphid NOT NULL,
-  post_count int                NOT NULL DEFAULT 0,
-  PRIMARY KEY (forum_id, member_id)
-);
-CREATE INDEX IF NOT EXISTS idx_fmpc_member ON "ForumMemberPostCount" (member_id);
-
--- 3A: Composite mirror of FMPC PK for IC5's two-column probe. PK is
--- (forum_id, member_id); IC5 drives from friend graphids and joins on both
--- columns. Without this, planner builds a 7 MB hash on full FMPC (610k rows
--- at SF10, ~6M at SF100) that spills to 16 batches. With it, NL-via-index
--- returns at most 1 row per probe.
-CREATE INDEX IF NOT EXISTS idx_fmpc_member_forum
-    ON "ForumMemberPostCount" (member_id, forum_id);
-
--- Drop the now-redundant single-column index; the composite covers all
--- WHERE member_id = ? use cases as a leading prefix.
+-- 5a. ForumMemberPostCount: RETIRED Milestone A 2026-05-30.
+-- Was a precomputed per-(forum, member) post count used by IC5.
+-- IC5 now computes the count inline via Cypher with WITH DISTINCT staging.
+-- No peer impl (postgres/duckdb/umbra/cypher/tigergraph) precomputes this.
+-- Un-retire when: AGE gains predicate pushdown / index binding through Cypher
+-- (AGE #1000) so the per-pair count can use an index-backed traversal.
+DROP TABLE IF EXISTS "ForumMemberPostCount";
 DROP INDEX IF EXISTS idx_fmpc_member;
+DROP INDEX IF EXISTS idx_fmpc_member_forum;
 
 -- 3B (2026-05-13 original, retired Phase A 2026-05-28): HasMemberSide and
 -- ForumSide were §14-compliance workarounds for trivial HAS_MEMBER edge
@@ -142,26 +129,16 @@ DROP TABLE  IF EXISTS "HasMemberSide";
 DROP TABLE  IF EXISTS "ForumSide";
 DROP INDEX  IF EXISTS idx_hms_member_joindate;
 
--- CommentRootPost — for each Comment, the LDBC business id (bigint) of the
--- root Post reached by following REPLY_OF*. Used by IS6 (currently falls back
--- to its own SQL walk; pending future refactor) and IS2 (consumes the
--- comment_business_id lookup). Storing the business id (not graphid) lets
--- queries use `MATCH (root:Post {id: $rid})` directly inside Cypher when needed.
--- Maintained by IU7 on AddComment. Backfilled below.
---
--- 2026-05-14: added comment_business_id column with a unique index, so IS2
--- can look up a Comment's root post by its LDBC bigint id without joining
--- the AGE Comment label table. The original comment_id (graphid) PK remains
--- so the iterative backfill loop can join against the REPLY_OF edge table
--- (Comment.reply_of_id was retired 2026-05-14; backfill now traverses
--- the REPLY_OF edge table directly).
-CREATE TABLE IF NOT EXISTS "CommentRootPost" (
-  comment_id            ag_catalog.graphid PRIMARY KEY,
-  comment_business_id   bigint             NOT NULL,
-  root_post_business_id bigint             NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_commentrootpost_business_id
-    ON "CommentRootPost" (comment_business_id);
+-- CommentRootPost: RETIRED Milestone A 2026-05-30.
+-- Was a transitive-closure cache (comment → root Post) used by IS2.
+-- IS2's root-post lookup is deferred to Milestone B (VLE): REPLY_OF*0..
+-- crashes AGE 1.6 backend. IS2 returns message's own id as a placeholder
+-- for the root post id until Milestone B.
+-- IS6 already has its own self-contained SQL recursive CTE over REPLY_OF
+-- and never read this table at runtime.
+-- No peer impl maintains an equivalent structure.
+DROP TABLE IF EXISTS "CommentRootPost";
+DROP INDEX IF EXISTS idx_commentrootpost_business_id;
 
 -- Drop the prior Phase 3B denorm index on the AGE-managed HAS_MEMBER table.
 -- Note: the column itself (HAS_MEMBER.join_date) cannot be dropped — AGE 1.6
@@ -177,38 +154,18 @@ DROP INDEX IF EXISTS idx_hasmember_end_joindate_agtype;
 -- stale table for any pre-Phase-B deployment:
 DROP TABLE IF EXISTS "PersonPostCount";
 
--- 5d (2026-05-14): Phase C side tables for IC9.
--- AGENTS.md §14 forbids outer-SQL reads of AGE label tables, so the prior
--- IC9 hybrid (date-DESC walk on Comment/Post via HAS_CREATOR joins) is out.
--- A Cypher-only shape on a HAS_CREATOR edge property failed gate (240x at
--- SF3 — AGE can't push LIMIT past UNION, and edge-property predicates don't
--- bind as Index Cond on functional indexes).
---
--- MessageByCreator: one row per (Comment | Post), keyed by creator's LDBC
--- business id (bigint). Composite index gives per-creator date-DESC walks
--- with a true Index Cond on `creation_date`, enabling the LATERAL LIMIT 20
--- per-friend shape used by IC9. Maintained by IU6/IU7. Backfilled below.
---
--- The `message_id` (graphid) column was added 2026-05-15 so IC10 can JOIN
--- HAS_TAG by graphid without reading the AGE Post label table — this lets
--- us retire Post.creator_id (the last live denorm column).
-CREATE TABLE IF NOT EXISTS "MessageByCreator" (
-  creator_business_id bigint            NOT NULL,
-  message_business_id bigint            NOT NULL,
-  message_id          ag_catalog.graphid NOT NULL,
-  creation_date       bigint            NOT NULL,
-  content             text,
-  is_post             boolean           NOT NULL
-);
--- For existing tables created before 2026-05-15: ensure the new column exists
--- (idempotent — no-op if already added by Tier 3b migration).
-ALTER TABLE "MessageByCreator" ADD COLUMN IF NOT EXISTS message_id ag_catalog.graphid;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_msgbycreator_creator_date_msg
-  ON "MessageByCreator" (creator_business_id, creation_date DESC, message_business_id);
--- Secondary unique index by message_business_id alone — IS2 looks up a
--- specific root post by its business id without scanning per-creator.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_msgbycreator_message
-  ON "MessageByCreator" (message_business_id);
+-- MessageByCreator: RETIRED Milestone A 2026-05-30.
+-- Was a creator-keyed mirror of Comment+Post used by IC2/IC9/IS2/IC10.
+-- IC2/IC9 now use canonical Cypher UNION arms (Comment + Post HAS_CREATOR).
+-- IC10 now uses Cypher OPTIONAL MATCH with WITH DISTINCT staging for count.
+-- IS2 canonical message walk uses Cypher UNION arms; root-post deferred to B.
+-- No peer impl (postgres/duckdb/umbra/cypher/tigergraph) maintains an
+-- equivalent structure — peers compute inline with per-creator FK index + sort.
+-- Un-retire when: AGE gains LIMIT pushdown past Cypher UNION (currently
+-- materialises full row set before sort — AGE structural limit #1).
+DROP TABLE IF EXISTS "MessageByCreator";
+DROP INDEX IF EXISTS idx_msgbycreator_creator_date_msg;
+DROP INDEX IF EXISTS idx_msgbycreator_message;
 
 -- PersonSide: retired Phase A 2026-05-28. Was a §14-compliance workaround
 -- for trivial Person scalar property reads (firstName, lastName). IC9 now
@@ -231,30 +188,11 @@ CREATE INDEX IF NOT EXISTS idx_hasinterest_start_end
 
 -- HasMemberSide backfill: retired Phase A 2026-05-28 (table dropped above).
 -- ForumSide backfill: retired Phase A 2026-05-28 (table dropped above).
-
--- CommentRootPost is loaded from preprocess-emitted CSV by load-side-tables.py
--- (run as a separate step from load-data.sh after this script). The \copy
--- approach previously here failed inside `psql -f` with sed-substituted paths;
--- copy_expert over libpq is robust and works against managed Horizon DB.
-
--- ForumMemberPostCount: aggregate Posts per (forum, creator) pair.
--- Post.forum_id retired 2026-05-14, Post.creator_id retired 2026-05-15 (Tier 3b);
--- both edges are now sourced directly from CONTAINER_OF + HAS_CREATOR.
--- ON CONFLICT DO NOTHING makes this idempotent.
-INSERT INTO "ForumMemberPostCount" (forum_id, member_id, post_count)
-SELECT co.start_id, hc.end_id, COUNT(*)::int
-FROM "Post" p
-JOIN "CONTAINER_OF" co ON co.end_id = p.id
-JOIN "HAS_CREATOR"  hc ON hc.start_id = p.id
-GROUP BY co.start_id, hc.end_id
-ON CONFLICT (forum_id, member_id) DO NOTHING;
-
+-- ForumMemberPostCount backfill: retired Milestone A 2026-05-30 (table dropped above).
 -- PersonPostCount backfill: retired Phase B 2026-05-29 (table dropped above).
 -- PersonSide backfill: retired Phase A 2026-05-28 (table dropped above).
-
--- MessageByCreator is loaded from preprocess-emitted CSV by load-side-tables.py
--- (run as a separate step from load-data.sh after this script). See the
--- CommentRootPost comment above for the rationale.
+-- MessageByCreator backfill: retired Milestone A 2026-05-30 (table dropped above).
+-- CommentRootPost backfill: retired Milestone A 2026-05-30 (table dropped above).
 
 -- =========================================================================
 -- 7. ANALYZE all touched tables
@@ -270,7 +208,5 @@ ANALYZE "City";
 ANALYZE "Country";
 ANALYZE "University";
 ANALYZE "Company";
-ANALYZE "ForumMemberPostCount";
-ANALYZE "MessageByCreator";
 ANALYZE "HAS_INTEREST";
 ANALYZE "HAS_TAG";
