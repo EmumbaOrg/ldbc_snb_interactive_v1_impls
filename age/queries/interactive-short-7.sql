@@ -6,7 +6,8 @@
 
 SELECT * FROM (
   SELECT * FROM cypher('$graphName', $$
-    MATCH (m:Comment {id: $messageId})<-[:REPLY_OF]-(reply:Comment)-[:HAS_CREATOR]->(author:Person)
+    MATCH (m:Comment)<-[:REPLY_OF]-(reply:Comment)-[:HAS_CREATOR]->(author:Person)
+    WHERE m.id = $messageId
     OPTIONAL MATCH (m)-[:HAS_CREATOR]->(orig:Person)-[:KNOWS]->(author)
     RETURN reply.id, reply.content, reply.creationDate, author.id, author.firstName, author.lastName,
            orig IS NOT NULL
@@ -16,7 +17,8 @@ SELECT * FROM (
           replyAuthorKnowsOriginalMessageAuthor agtype)
   UNION ALL
   SELECT * FROM cypher('$graphName', $$
-    MATCH (m:Post {id: $messageId})<-[:REPLY_OF]-(reply:Comment)-[:HAS_CREATOR]->(author:Person)
+    MATCH (m:Post)<-[:REPLY_OF]-(reply:Comment)-[:HAS_CREATOR]->(author:Person)
+    WHERE m.id = $messageId
     OPTIONAL MATCH (m)-[:HAS_CREATOR]->(orig:Person)-[:KNOWS]->(author)
     RETURN reply.id, reply.content, reply.creationDate, author.id, author.firstName, author.lastName,
            orig IS NOT NULL

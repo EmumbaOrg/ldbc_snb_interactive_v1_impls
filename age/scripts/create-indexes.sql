@@ -1,33 +1,48 @@
 -- Index strategy for Apache AGE LDBC SNB graph (AGE 1.6.0+)
 -- Run once after agefreighter load, before benchmarking.
 --
--- WHY GIN, NOT B-TREE, FOR VERTEX PROPERTY LOOKUPS
--- AGE compiles Cypher MATCH with a property filter — e.g. MATCH (p:Person {id: $personId}) —
--- to a PostgreSQL containment predicate:  properties @> '{"id": 933}'::agtype
--- The containment operator (@>) requires a GIN index with the gin_agtype_ops operator class.
--- B-tree indexes on CAST(agtype_object_field_text(properties,'id') AS bigint) do NOT support
--- @> and are never used by the planner for these patterns.
+-- TWO INDEX SHAPES — pick by how the Cypher anchor is written
 --
--- agefreighter already creates GIN-on-properties and B-tree-on-id/start_id/end_id automatically.
--- The GIN and edge-traversal indexes below are idempotent (IF NOT EXISTS) — safe to re-run,
--- and necessary for the dev path (load-test-data.py) which skips agefreighter.
+-- 1. Map-form anchor  MATCH (n:Label {prop: X})  compiles to a containment
+--    predicate  properties @> '{"prop": X}'::agtype  → needs a GIN
+--    (gin_agtype_ops). Used for Person {id}/{firstName} and the small label
+--    anchors (Forum/Tag/City/Company/University {id}/{name}). A functional
+--    B-tree does NOT support @> and is never picked for this form.
 --
--- B-tree indexes on extracted property values ARE useful for WHERE-clause range/equality
--- filters (creationDate ranges, name equality) where the planner can use a functional index.
--- These are NOT created by agefreighter.
+-- 2. WHERE-form anchor  MATCH (n:Label) WHERE n.prop = X  compiles to
+--    ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties,'"prop"'::agtype]) = X
+--    → binds a functional B-tree on that exact expression (PG expression-index
+--    matching is byte-exact). Verified Index Scan at SF3, including when the
+--    anchor starts a traversal. This corrects the older assumption (AGE-QUIRKS
+--    §2 / prior header) that such functional indexes "never bind from Cypher":
+--    they DO bind for the literal-substituted WHERE form, which is the runtime
+--    path (§13 — values are string-substituted, not JDBC-bound).
+--
+-- WHY Post/Comment use shape #2, not #1:
+-- Post and Comment are only ever anchored by id (IS4/5/6/7, IU2/3/7 — all
+-- rewritten to `WHERE m.id = $x`). A GIN on their `properties` tokenizes EVERY
+-- key including the free-text content/imageFile, producing a multi-GB index that
+-- ran the SF100 load out of disk. The functional id B-tree below indexes only the
+-- id scalar — ~5–6× smaller (SF3: gin_post 623 MB → 101 MB; gin_comment 1199 MB
+-- → 248 MB) and faster (exact single-row, no bitmap recheck). gin_post/gin_comment
+-- are therefore retired (also removed from the loader's per-label GIN loop).
+--
+-- agefreighter / the loader create the remaining GIN-on-properties and the edge
+-- start_id/end_id + graphid B-trees. Everything below is idempotent (IF NOT
+-- EXISTS) — safe to re-run and needed for the dev path (load-test-data.py).
 
 SET search_path = ag_catalog, '$user', public;
 
 -- ---------------------------------------------------------------------------
--- GIN indexes on vertex properties
--- Enables efficient MATCH (n:Label {id: X}) / {name: Y} containment lookups.
+-- GIN indexes on vertex properties (shape #1 — map-form {id:}/{name:} anchors).
 -- Country/TagClass/Continent GINs omitted: fixed-size reference tables (≤ a few
 -- hundred rows at any SF) that the planner always seq-scans — their GINs were
 -- never scanned (pg_stat_user_indexes idx_scan = 0).
+-- Post/Comment GINs omitted: those labels are anchored only by id (rewritten to
+-- the WHERE form) and served by the functional id B-trees at the bottom of this
+-- file — a content-tokenizing GIN on them is the SF100 disk hog. See header.
 -- ---------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS gin_person      ON ldbc_snb."Person"     USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX IF NOT EXISTS gin_comment     ON ldbc_snb."Comment"    USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX IF NOT EXISTS gin_post        ON ldbc_snb."Post"        USING GIN (properties ag_catalog.gin_agtype_ops);
 CREATE INDEX IF NOT EXISTS gin_forum       ON ldbc_snb."Forum"       USING GIN (properties ag_catalog.gin_agtype_ops);
 CREATE INDEX IF NOT EXISTS gin_tag         ON ldbc_snb."Tag"         USING GIN (properties ag_catalog.gin_agtype_ops);
 CREATE INDEX IF NOT EXISTS gin_city        ON ldbc_snb."City"        USING GIN (properties ag_catalog.gin_agtype_ops);
@@ -159,3 +174,13 @@ CREATE INDEX IF NOT EXISTS idx_comment_creationdate_agtype
 
 CREATE INDEX IF NOT EXISTS idx_post_creationdate_agtype
   ON ldbc_snb."Post" ((ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"creationDate"'::ag_catalog.agtype])));
+
+-- id anchors on Comment / Post (shape #2). These REPLACE gin_comment/gin_post:
+-- IS4/5/6/7 + IU2/3/7 anchor by `WHERE m.id = $x`, which AGE compiles to the
+-- agtype-access form below — byte-exact match → Index Scan (verified SF3). Much
+-- smaller than a content-tokenizing GIN (the SF100 disk blocker).
+CREATE INDEX IF NOT EXISTS idx_comment_id_agtype
+  ON ldbc_snb."Comment" ((ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"id"'::ag_catalog.agtype])));
+
+CREATE INDEX IF NOT EXISTS idx_post_id_agtype
+  ON ldbc_snb."Post" ((ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"id"'::ag_catalog.agtype])));

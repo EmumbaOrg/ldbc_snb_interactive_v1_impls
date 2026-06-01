@@ -20,14 +20,14 @@
 SELECT * FROM (
   -- Post arm: the message is itself the root contained in the forum.
   SELECT * FROM cypher('$graphName', $$
-    MATCH (m:Post {id: $messageId})<-[:CONTAINER_OF]-(f:Forum)-[:HAS_MODERATOR]->(mod:Person)
+    MATCH (m:Post)<-[:CONTAINER_OF]-(f:Forum)-[:HAS_MODERATOR]->(mod:Person) WHERE m.id = $messageId
     RETURN f.id, f.title, mod.id, mod.firstName, mod.lastName
   $$) AS (forumId agtype, forumTitle agtype, moderatorId agtype,
           moderatorFirstName agtype, moderatorLastName agtype)
   UNION ALL
-  -- Comment arm: walk REPLY_OF* up to the root Post, then the forum + moderator.
+  -- Comment arm: walk REPLY_OF up to the root Post, then its containing Forum + moderator.
   SELECT * FROM cypher('$graphName', $$
-    MATCH (m:Comment {id: $messageId})-[:REPLY_OF*1..]->(root:Post)<-[:CONTAINER_OF]-(f:Forum)-[:HAS_MODERATOR]->(mod:Person)
+    MATCH (m:Comment)-[:REPLY_OF*1..]->(root:Post)<-[:CONTAINER_OF]-(f:Forum)-[:HAS_MODERATOR]->(mod:Person) WHERE m.id = $messageId
     RETURN f.id, f.title, mod.id, mod.firstName, mod.lastName
   $$) AS (forumId agtype, forumTitle agtype, moderatorId agtype,
           moderatorFirstName agtype, moderatorLastName agtype)

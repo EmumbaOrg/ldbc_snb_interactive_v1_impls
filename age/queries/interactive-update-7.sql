@@ -16,8 +16,8 @@
 SELECT * FROM cypher('$graphName', $$
   MATCH (author:Person {id: $authorPersonId}),
         (country:Country {id: $countryId})
-  OPTIONAL MATCH (rp:Post    {id: $replyToId})
-  OPTIONAL MATCH (rc:Comment {id: $replyToId})
+  OPTIONAL MATCH (rp:Post)    WHERE rp.id = $replyToId
+  OPTIONAL MATCH (rc:Comment) WHERE rc.id = $replyToId
   WITH author, country, rp, coalesce(rp, rc) AS replyTo
   CREATE (comment:Comment {
     id: $commentId,
@@ -35,7 +35,7 @@ $$) AS (result agtype);
 -- Call 2: HAS_TAG batch (post-MVCC-window). DO NOT merge into Call 1 —
 -- MVCC split is non-negotiable (AGE issue #1954 / CLAUDE.md §11).
 SELECT * FROM cypher('$graphName', $$
-  MATCH (comment:Comment {id: $commentId})
+  MATCH (comment:Comment) WHERE comment.id = $commentId
   UNWIND $tagIds AS tagId
     MATCH (t:Tag {id: tagId})
     CREATE (comment)-[:HAS_TAG]->(t)

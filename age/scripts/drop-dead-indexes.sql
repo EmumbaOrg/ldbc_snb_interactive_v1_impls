@@ -43,6 +43,15 @@ DROP INDEX IF EXISTS gin_country;
 DROP INDEX IF EXISTS gin_tagclass;
 DROP INDEX IF EXISTS gin_continent;
 
+-- --- Content-tokenizing GINs on Post/Comment (the SF100 disk hog) -------------
+-- PRECONDITION: the WHERE-form id anchors (IS4/5/6/7, IU2/3/7) and the functional
+-- idx_{post,comment}_id_agtype B-trees (create-indexes.sql) MUST be deployed first,
+-- or these labels fall back to seq scans. A content GIN tokenizes every key
+-- including free-text content/imageFile → multi-GB (SF3: gin_comment ~1.2 GB,
+-- gin_post ~623 MB). Replaced by the id B-trees (~5–6× smaller).
+DROP INDEX IF EXISTS gin_comment;
+DROP INDEX IF EXISTS gin_post;
+
 -- --- Orphaned composite: IC10 fix (2026-06-01) retired its only consumer -------
 DROP INDEX IF EXISTS idx_hasinterest_start_end;   -- 17 MB
 

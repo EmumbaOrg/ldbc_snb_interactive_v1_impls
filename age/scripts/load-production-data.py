@@ -49,6 +49,17 @@ VERTEX_LABELS = [
     "City", "Country", "Continent", "Company", "University",
 ]
 
+# Labels that get a GIN-on-properties (map-form {id:}/{name:} anchors). Must stay
+# in sync with the GIN block in create-indexes.sql.
+#   - Post/Comment excluded: anchored only by id via the WHERE form, served by the
+#     functional idx_{post,comment}_id_agtype B-trees. A content-tokenizing GIN on
+#     them is the SF100 disk hog (gin_comment alone ~1.2 GB at SF3).
+#   - Country/Continent/TagClass excluded: fixed-size reference tables the planner
+#     always seq-scans (their GINs were never scanned, idx_scan = 0).
+GIN_LABELS = [
+    "Person", "Forum", "Tag", "City", "Company", "University",
+]
+
 EDGE_LABELS = [
     "KNOWS", "HAS_CREATOR", "REPLY_OF", "CONTAINER_OF", "HAS_MEMBER",
     "HAS_MODERATOR", "LIKES", "HAS_INTEREST", "STUDY_AT", "WORK_AT",
@@ -365,7 +376,7 @@ def _create_gin_worker(args):
 
 def create_gin_indexes_parallel(connection_string, graph_name, workers):
     print("Creating GIN indexes on vertex properties (parallel)…")
-    gin_args = [(connection_string, graph_name, lbl) for lbl in VERTEX_LABELS]
+    gin_args = [(connection_string, graph_name, lbl) for lbl in GIN_LABELS]
     with multiprocessing.Pool(processes=workers) as pool:
         pool.map(_create_gin_worker, gin_args)
 
