@@ -156,6 +156,6 @@ FROM (
   ORDER BY (friend_id::text::bigint), (dist::text::int) ASC
 ) deduped
 ORDER BY (dist::text::int) ASC,
-         friend_lastname::text ASC,
+         friend_lastname::text COLLATE "C" ASC,
          (friend_id::text::bigint) ASC
 LIMIT 20;
