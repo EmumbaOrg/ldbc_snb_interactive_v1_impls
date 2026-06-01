@@ -1,274 +1,128 @@
 # Index Strategy
 
-This is the most important document for performance review. AGE's query
-compilation interacts with PostgreSQL's index machinery in a non-obvious way,
-and getting this wrong silently produces sequential scans on every query.
+The most important performance doc. AGE compiles a Cypher anchor to one of two
+SQL predicate shapes, and the shape decides which index can bind. Get it wrong
+and the query silently seq-scans the whole label table.
+
+This file mirrors `scripts/create-indexes.sql` (the source of truth).
 
 ---
 
-## The critical fact: GIN, not B-tree, for property MATCH
+## Two anchor shapes — choose the index by how the anchor is written
 
-When AGE compiles:
+| Shape | Cypher anchor | Compiled predicate | Index that binds |
+|---|---|---|---|
+| **#1 map-form** | `MATCH (n:Label {id: X})` | `properties @> '{"id": X}'::agtype` | **GIN** (`gin_agtype_ops`). A functional B-tree does not support `@>` and is never picked for this form. |
+| **#2 WHERE-form** | `MATCH (n:Label) WHERE n.id = X` | `agtype_access_operator(VARIADIC ARRAY[properties,'"id"'::agtype]) = X` | **functional B-tree** on that exact expression (PG expression-index matching is byte-exact). |
 
-```cypher
-MATCH (p:Person {id: $personId})
-```
+Both bind only for **literal/parameter values known at plan time**. Runtime
+values from `UNWIND`/`WITH`/function output fall to seq scans regardless of shape
+(AGE-QUIRKS §15). The runtime path string-substitutes every parameter as a
+literal (CLAUDE.md §13), so both shapes bind reliably in production.
 
-it produces a SQL predicate of the form:
+> **Correction (2026-06-01):** the older claim that functional B-trees "never
+> bind from Cypher" (AGE #1000) is true only for shape #1. Shape #2 **does**
+> bind — verified Index Scan at SF3, including when the anchor starts a
+> traversal. This is what enabled the Post/Comment GIN→B-tree migration below.
 
-```sql
-WHERE properties @> '{"id": 933}'::agtype
-```
+### Why Post/Comment use shape #2 (not GIN)
 
-The containment operator `@>` is **only supported by a GIN index** with the
-`ag_catalog.gin_agtype_ops` operator class. **A B-tree index on the
-extracted value (e.g. `(CAST(agtype_object_field_text(properties,'id') AS bigint))`)
-is never used by the planner for this pattern.**
-Without the GIN, every `MATCH (n:Label {prop: X})` becomes a
-sequential scan over the whole label's vertex table.
+Post and Comment are only ever anchored by `id` (IS4/5/6/7, IU2/3/7 — all written
+`WHERE m.id = $x`). A GIN over their `properties` tokenizes **every** key,
+including the free-text `content`/`imageFile`, producing a multi-GB index that
+ran the **SF100 load out of disk** (SF3: `gin_comment` 1199 MB, `gin_post`
+623 MB). The functional id B-tree indexes only the id scalar — ~5× smaller and
+faster (exact single-row, no bitmap recheck). `gin_post`/`gin_comment` are
+retired and removed from the loader's GIN loop.
 
 ---
 
-## Three categories of index
+## Index inventory
 
-### 1. GIN on `properties` (one per node label)
+### 1. GIN on `properties` — 6 labels (shape #1 anchors)
 
-Backs every `MATCH (n:Label {prop: X})` containment lookup.
+`Person, Forum, Tag, City, Company, University` — anchored by `{id:}`/`{name:}`.
 
 ```sql
-CREATE INDEX gin_person     ON ldbc_snb."Person"     USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX gin_comment    ON ldbc_snb."Comment"    USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX gin_post       ON ldbc_snb."Post"       USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX gin_forum      ON ldbc_snb."Forum"      USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX gin_tag        ON ldbc_snb."Tag"        USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX gin_tagclass   ON ldbc_snb."TagClass"   USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX gin_city       ON ldbc_snb."City"       USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX gin_country    ON ldbc_snb."Country"    USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX gin_continent  ON ldbc_snb."Continent"  USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX gin_company    ON ldbc_snb."Company"    USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX gin_university ON ldbc_snb."University" USING GIN (properties ag_catalog.gin_agtype_ops);
+CREATE INDEX gin_person ON ldbc_snb."Person" USING GIN (properties ag_catalog.gin_agtype_ops);
+-- + gin_forum, gin_tag, gin_city, gin_company, gin_university
 ```
 
-### 2. B-tree on `start_id` / `end_id` (one pair per edge label)
+Excluded on purpose: **Post/Comment** (shape #2 id B-tree, see above);
+**Country/Continent/TagClass** (fixed-size reference tables the planner always
+seq-scans — their GINs measured `idx_scan = 0`).
 
-Backs every edge traversal `(a)-[:EDGE]->(b)`. AGE compiles a hop to a join
-on the edge table's `start_id` (forward traversal) or `end_id` (reverse).
+### 2. Edge `start_id` / `end_id` B-trees — 15 edges × 2
+
+Backs every `(a)-[:EDGE]->(b)` hop (forward = `start_id`, reverse = `end_id`)
+for all 15 edge labels: KNOWS, HAS_CREATOR, REPLY_OF, CONTAINER_OF, HAS_MEMBER,
+HAS_MODERATOR, LIKES, HAS_INTEREST, STUDY_AT, WORK_AT, IS_LOCATED_IN, IS_PART_OF,
+HAS_TYPE, IS_SUBCLASS_OF, HAS_TAG.
+
+### 3. Per-label graphid `id` B-trees — 11 labels
+
+AGE child label tables don't inherit the parent PK on `id` (graphid), so any
+`JOIN <Label> ON id = <graphid>` seq-scans without these.
 
 ```sql
-CREATE INDEX idx_knows_start        ON ldbc_snb."KNOWS"          (start_id);
-CREATE INDEX idx_knows_end          ON ldbc_snb."KNOWS"          (end_id);
--- ... same shape for HAS_CREATOR, REPLY_OF, HAS_TAG, LIKES, CONTAINER_OF,
---     HAS_MEMBER, IS_LOCATED_IN, HAS_INTEREST, WORK_AT, STUDY_AT, HAS_TYPE,
---     IS_SUBCLASS_OF, HAS_MODERATOR, IS_PART_OF
+CREATE INDEX idx_person_graphid ON ldbc_snb."Person" (id);  -- + 10 other vertex labels
 ```
 
-15 edge labels × 2 indexes = 30 edge B-trees.
+### 4. agtype-access functional B-trees on Post/Comment — date + id (shape #2)
 
-### 3. Functional B-trees on extracted values
-
-These supplement the GIN for two cases:
-
-**(a) Range/equality filters in WHERE clauses, not just MATCH.**  
-The GIN handles `MATCH ({creationDate: 12345})` (exact match) but not
-`WHERE n.creationDate < $maxDate` (range). For the latter, the planner needs
-a functional B-tree on the extracted `bigint` value.
+Match AGE's compiled `agtype_access_operator(...)` predicate byte-exact:
 
 ```sql
--- Used by IC2, IC3, IC4, IC7, IC9 (creationDate < maxDate, in date window)
-CREATE INDEX idx_comment_date ON ldbc_snb."Comment" (CAST(agtype_object_field_text(properties, 'creationDate') AS bigint));
-CREATE INDEX idx_post_date    ON ldbc_snb."Post"    (CAST(agtype_object_field_text(properties, 'creationDate') AS bigint));
-```
-
-**(b) Equality on text fields used in WHERE clauses, post-MATCH.**  
-Same reason — once a vertex is bound transitively, AGE checks
-`WHERE n.name = $X` as a containment per row, which is slow at scale.
-
-```sql
--- Used by IC3, IC4, IC5, IC6, IC11
-CREATE INDEX idx_tag_name      ON ldbc_snb."Tag"      (agtype_object_field_text(properties, 'name'));
-CREATE INDEX idx_tagclass_name ON ldbc_snb."TagClass" (agtype_object_field_text(properties, 'name'));
-CREATE INDEX idx_country_name  ON ldbc_snb."Country"  (agtype_object_field_text(properties, 'name'));
-
--- Used by IC1 (firstName filter applied post-traversal)
-CREATE INDEX idx_person_firstname ON ldbc_snb."Person" (agtype_object_field_text(properties, 'firstName'));
-```
-
-**(c) `id` projection / ORDER BY.**  
-When a query returns or sorts by `n.id` of a vertex bound transitively,
-having a functional B-tree on the extracted id avoids a parallel sort over
-the full vertex table.
-
-```sql
-CREATE INDEX idx_person_id   ON ldbc_snb."Person"   (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX idx_comment_id  ON ldbc_snb."Comment"  (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX idx_post_id     ON ldbc_snb."Post"     (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX idx_forum_id    ON ldbc_snb."Forum"    (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX idx_tag_id      ON ldbc_snb."Tag"      (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX idx_tagclass_id ON ldbc_snb."TagClass" (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX idx_city_id     ON ldbc_snb."City"     (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX idx_country_id  ON ldbc_snb."Country"  (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-```
-
-**(d) Composite covering for IC2.**  
-IC2 retrieves the most-recent N messages by `creationDate DESC` and
-tie-breaks on `id`. A composite `(creationDate DESC, id)` lets the
-planner index-scan in date-desc order without a sort node. IC9 used to
-share this index pre-2026-05-14; the strict §14 reading moved IC9 to a
-side-table walk (see `MessageByCreator` below).
-
-```sql
-CREATE INDEX idx_comment_date_id ON ldbc_snb."Comment"
-  (CAST(agtype_object_field_text(properties, 'creationDate') AS bigint) DESC,
-   CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX idx_post_date_id    ON ldbc_snb."Post"
-  (CAST(agtype_object_field_text(properties, 'creationDate') AS bigint) DESC,
-   CAST(agtype_object_field_text(properties, 'id') AS bigint));
-```
-
-**(e) IC9 side-table composite — per-friend date-DESC + tie-break.**  
-`MessageByCreator` mirrors Comment + Post {creator, creationDate, content}
-into a plain (non-AGE) table. The composite index keys per-friend ordered
-walks, which IC9 drives via `LATERAL LIMIT 20`. Both columns of the
-predicate are bound as `Index Cond:`, so each per-friend scan early-
-terminates at 20 rows. See `interactive-complex-9.sql` for the query
-shape and `SCHEMA.md` for table provenance and maintenance.
-
-```sql
-CREATE UNIQUE INDEX idx_msgbycreator_creator_date_msg
-  ON ldbc_snb."MessageByCreator" (creator_business_id, creation_date DESC, message_business_id);
+-- date-range filters: msg.creationDate < $maxDate  (IC2/IC3/IC4/IC9)
+idx_comment_creationdate_agtype, idx_post_creationdate_agtype
+-- id anchors (REPLACE gin_comment/gin_post): WHERE m.id = $x  (IS4/5/6/7, IU2/3/7)
+idx_comment_id_agtype, idx_post_id_agtype
 ```
 
 ---
 
-## Query → index map
+## Query → index family
 
-| Query | Primary indexes used |
+| Query group | Indexes used |
 |---|---|
-| IC1 | `gin_person` (seed graphid + firstName candidate), `idx_knows_start` (BFS walk via KNOWS edge table directly) |
-| IC2 | `gin_person` (entry), `idx_knows_start` (directed friend hop), `idx_hascreator_end` (reverse HAS_CREATOR), `idx_post_creationdate_agtype`, `idx_comment_creationdate_agtype` (date filter inside Cypher call) |
-| IC3 | `gin_person`, `idx_knows_*`, `idx_hascreator_*`, `idx_comment_date` / `idx_post_date`, `idx_country_name`, `gin_country` |
-| IC4 | `gin_person`, `idx_knows_*`, `idx_hascreator_*`, `idx_hastag_*`, `idx_post_date` |
-| IC5 | `gin_person` (entry), `idx_knows_start` (directed friend graphids via Cypher UNION), `idx_hms_member_joindate` (`HasMemberSide` friend→forum with native join_date filter), `idx_fmpc_member_forum` (`ForumMemberPostCount` two-column NL probe), `ForumSide` PK (forum title + business_id lookup) |
-| IC6 | `gin_person`, `idx_knows_*`, `idx_hascreator_*`, `idx_hastag_*`, `idx_tag_name` |
-| IC7 | `gin_person`, `idx_hascreator_*`, `idx_likes_*` |
-| IC8 | `gin_person` (entry), `idx_hascreator_*` (untyped intermediate; AGE plans as label UNION internally — bounded cost) |
-| IC9 | `gin_person` (entry), `idx_knows_start` (directed 1+2-hop friend ids via Cypher UNION), `idx_msgbycreator_creator_date_msg` (per-friend date-DESC walk with LATERAL LIMIT 20 — composite `(creator_business_id, creation_date DESC, message_business_id)`), `PersonSide_pkey` (friend name projection) |
-| IC10 | `gin_person` (entry), `idx_knows_start` (directed 2-hop FoF), `idx_islocatedin_*` (city), `idx_msgbycreator_creator_date_msg` (per-FoF MBC scan: common + total post counts in one LATERAL), `idx_hastag_*`, `idx_hasinterest_start_end` (composite) |
-| IC11 | `gin_person`, `idx_knows_*`, `idx_workat_*`, `idx_islocatedin_*`, `idx_country_name` |
-| IC12 | `gin_person` (friends via directed KNOWS), `gin_tagclass` (root TagClass seed), `idx_knows_start` (friend hop), `idx_hascreator_end` (reverse HAS_CREATOR), `idx_replyof_start` (REPLY_OF to Post), `idx_hastag_*` (post tags); traverses graph entirely via Cypher — `idx_comment_creator_id` and `idx_comment_reply_of_id` retired 2026-05-14 |
-| IS1, IS3 | `gin_person`, `idx_islocatedin_*` (IS1), `idx_knows_start` (IS3 — directed) |
-| IS2 | `gin_person`, `idx_hascreator_*`, `idx_commentrootpost_business_id` (comment_business_id → root_post_business_id lookup), `idx_msgbycreator_message` (root post creator lookup), `PersonSide_pkey` (author name projection) |
-| IS4, IS5 | `gin_comment` / `gin_post`, `idx_hascreator_*` (IS5) |
-| IS6 | `gin_comment` / `gin_post` (seed MATCH inside Cypher call), `idx_replyof_start` (variable-length walk `REPLY_OF*1..10`), `idx_containerof_end`, `idx_hasmoderator_start`, `idx_post_id`, `idx_comment_id` |
-| IS7 | `gin_comment` / `gin_post`, `idx_replyof_end`, `idx_hascreator_*`, `idx_knows_start` (directed, know-check) |
-| IU1–IU8 | `gin_*` for entry MATCHes; edge `idx_*_start/end` for existence checks; denorm-column indexes for UPDATE lookups |
+| Person-anchored IC/IS (IC1–IC12, IS1/IS3) | `gin_person` seed + edge `idx_*_start/end` per hop |
+| Post/Comment-anchored IS (IS4/5/6/7) | `idx_{post,comment}_id_agtype` seed + edge indexes |
+| Date-window filters (IC2/IC3/IC4/IC9) | `idx_{post,comment}_creationdate_agtype` |
+| KNOWS traversal (always directed `->`) | `idx_knows_start` (AGE-QUIRKS §11) |
+| Name lookups (Tag in IC6; Country in IC3/IC11) | `gin_tag`; Country seq-scans (small ref table, no GIN) |
+| IU1–IU8 | `gin_*` / `idx_{post,comment}_id_agtype` entry anchors; edge indexes for existence checks |
+
+No side tables, denorm columns, or composite covering indexes remain — see
+History.
 
 ---
 
-## Denorm column indexes (iter-1/2/3)
+## What is NOT indexed (and why)
 
-These B-tree indexes back the denormalized graphid columns added by
-`age/scripts/denormalize-schema.sql`. They enable direct indexed JOINs
-on the entity tables without going through the AGE edge tables.
-
-### Single-column denorm indexes
-
-```sql
--- Post denorm columns with live read consumers
-CREATE INDEX idx_post_creator_id     ON ldbc_snb."Post"     (creator_id);   -- IC10
--- Tag hierarchy indexes — live (may be used by future queries; IC12 now traverses via Cypher)
-CREATE INDEX idx_tag_tagclass_id         ON ldbc_snb."Tag"      (tagclass_id);
-CREATE INDEX idx_tagclass_subclass_of_id ON ldbc_snb."TagClass" (subclass_of_id);
-```
-
-**Retired 2026-05-14** — `Comment.creator_id` and `Comment.reply_of_id` columns retired; these indexes dropped by migration `2026-05-14-retire-comment-creator-replyof.sql`:
-- `idx_comment_creator_id` — IC12 migrated to Cypher traversal; no remaining runtime reader of `Comment.creator_id`
-- `idx_comment_reply_of_id` — IC12 migrated; IS2 uses `CommentRootPost`; no remaining runtime reader of `Comment.reply_of_id`
-
-**Retired 2026-05-14** — `Post.forum_id` column retired; these indexes dropped by migration `2026-05-14-drop-post-forum-id.sql`:
-- `idx_post_forum_id` (single-column on `forum_id`)
-- `idx_post_forum_creator` (composite `(forum_id, creator_id)` — the "IC5 LEFT JOIN" comment was stale; IC5 reads `ForumMemberPostCount` directly)
-
-**Retired 2026-05-14** (no read consumers, removed from `denormalize-schema.sql`):
-`idx_post_country_id`, `idx_comment_country_id`, `idx_forum_moderator_id`,
-`idx_person_city_id`, `idx_city_country_id`, `idx_country_continent_id`,
-`idx_university_city_id`, `idx_company_country_id`. Existing indexes in
-older deployments are empty and can be dropped with `DROP INDEX IF EXISTS`
-at the operator's convenience.
-
-### Composite covering indexes (hot JOIN patterns)
-
-`idx_post_forum_creator` on `(forum_id, creator_id)` was retired 2026-05-14: the
-comment "IC5 LEFT JOIN" was stale — IC5 reads `ForumMemberPostCount` directly and
-never touches `Post`. Dropped by migration `2026-05-14-drop-post-forum-id.sql`.
-
-#### Removed composites (IC2 rewrite 2026-05-13)
-
-`idx_post_creator_creationdate` and `idx_comment_creator_creationdate` have been
-dropped. They were IC2's only callers. IC2 is now a single Cypher call; the
-`creationDate <= $maxDate` filter runs inside Cypher and is backed by
-`idx_post_creationdate_agtype` / `idx_comment_creationdate_agtype` (defined in
-`create-indexes.sql`). The DROP is in `denormalize-schema.sql` section 4.
-
-### Side-table indexes
-
-```sql
--- ForumMemberPostCount: PK is (forum_id, member_id).
--- Phase 3A: composite (member_id, forum_id) replaces single-column idx_fmpc_member.
--- IC5 drives from friend graphids and probes both columns; NL+index returns
--- at most 1 row per probe, eliminating the 7 MB hash spill (16 batches at SF10).
-CREATE INDEX idx_fmpc_member_forum ON ldbc_snb."ForumMemberPostCount" (member_id, forum_id);
--- REMOVED: idx_fmpc_member (single-column) — covered by idx_fmpc_member_forum prefix.
-
--- HAS_INTEREST composite covering (IC10 per-post interest check)
-CREATE INDEX idx_hasinterest_start_end ON ldbc_snb."HAS_INTEREST" (start_id, end_id);
-```
-
-### IC5 side-table indexes (replaces Phase 3B's HAS_MEMBER.join_date approach)
-
-Client directive 2026-05-13: outer SQL must not directly access AGE-managed
-tables. Phase 3B's `idx_hasmember_end_joindate` on the AGE `HAS_MEMBER` table
-was dropped; IC5's filter now reads `HasMemberSide` (a regular table) and
-`ForumSide` (Forum property mirror).
-
-```sql
--- HasMemberSide: (member_id, forum_id) PK + (member_id, join_date) for IC5.
-CREATE TABLE "HasMemberSide" (
-  forum_id   ag_catalog.graphid NOT NULL,
-  member_id  ag_catalog.graphid NOT NULL,
-  join_date  bigint             NOT NULL,
-  PRIMARY KEY (member_id, forum_id)
-);
-CREATE INDEX idx_hms_member_joindate ON "HasMemberSide" (member_id, join_date);
-
--- ForumSide: forum_id PK + native title/business_id columns.
-CREATE TABLE "ForumSide" (
-  forum_id           ag_catalog.graphid PRIMARY KEY,
-  forum_business_id  bigint             NOT NULL,
-  title              text               NOT NULL
-);
-```
-
-REMOVED in the same revision:
-- `idx_hasmember_end_joindate` (on the AGE HAS_MEMBER table — directive violation)
-- `idx_hasmember_end_joindate_agtype` (legacy functional agtype index — both pre-Phase-3 and Phase-3B forms are gone)
-
-The `HAS_MEMBER.join_date` BIGINT column remains on the AGE table because AGE 1.6
-blocks DROP COLUMN on its label tables, but it is unindexed and unreferenced.
+- **`content`/`imageFile`, `Forum.title`** — only projected, never filtered; a
+  GIN over them was the SF100 disk blocker.
+- **`birthMonth`/`birthDay`** — IC10 filters post-traversal on a small FoF set.
+- **`STUDY_AT.classYear`, `WORK_AT.workFrom`** — post-traversal cardinality is
+  small; revisit at SF1000.
+- **`CAST(agtype_object_field_text(...) AS bigint)` functional B-trees** — never
+  matched AGE's compiled `agtype_access_operator(...)` predicate (`idx_scan = 0`);
+  removed. Use the agtype-access form (§4) for any new date/id index.
 
 ---
 
-## What is *not* indexed (and why)
+## History (decision-relevant)
 
-- **`birthMonth` / `birthDay`** — IC10 filters these post-traversal against a
-  small candidate set (≤ a few hundred friends-of-friends at SF1000). A
-  dedicated B-tree wouldn't reduce work; the GIN handles the rare case where
-  someone wants `MATCH (p:Person {birthMonth: 5})`.
-- **`Forum.title`, `Comment.content`, `Post.content`** — never used as filter
-  predicates in any LDBC IC/IS query; only projected.
-- **`STUDY_AT.classYear`, `WORK_AT.workFrom`** — IC11 filters `workFrom` but
-  the cardinality after the friend-traversal is small enough that the planner
-  doesn't benefit from an edge-property index. (Would revisit at SF1000.)
+- **2026-06-01** — Functional B-tree binds via shape #2; corrects the AGE #1000
+  "never binds" assumption and unblocked the Post/Comment GIN→B-tree migration.
+- **SF100 disk** — `gin_post`/`gin_comment` retired (content tokenization →
+  multi-GB index that exhausted disk during load).
+- **Milestone A (2026-05-30)** — all side tables and their indexes dropped
+  (ForumMemberPostCount, MessageByCreator, CommentRootPost, HasMemberSide,
+  ForumSide, PersonSide, PersonPostCount); queries went canonical Cypher.
+- **2026-05-14/15** — all denorm-column B-trees and the IC2 `(creator, date)`
+  composites dropped (unused after the IC2/IC12 rewrites).
+- **CAST-form date/id/name functional B-trees** — removed (wrong predicate shape,
+  never scanned).
 
 ---
 
@@ -276,8 +130,8 @@ blocks DROP COLUMN on its label tables, but it is unindexed and unreferenced.
 
 ```bash
 psql "$CONNECTION_STRING" -c "SET maintenance_work_mem='2GB';" -f scripts/create-indexes.sql
-psql "$CONNECTION_STRING" -c "VACUUM (ANALYZE, VERBOSE) ldbc_snb.\"Person\", ldbc_snb.\"KNOWS\";"
 ```
 
-`maintenance_work_mem='2GB'` is critical at SF100+ — without it, building the
-GIN over 180 M-row edge tables spills to disk and takes hours.
+`maintenance_work_mem='2GB'` matters at SF100+ so GIN builds don't spill to disk.
+`load-data.sh` runs this automatically (Step 3); the manual command is for the
+dev load path.

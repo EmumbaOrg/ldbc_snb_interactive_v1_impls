@@ -92,7 +92,7 @@ about direction. IU8 (add friendship) creates both rows in one transaction.
 | `HAS_CREATOR` | Comment\|Post → Person | — | Two source CSVs unified into one edge label |
 | `REPLY_OF` | Comment → Comment\|Post | — | Target can be either label; queries handle this with chained OPTIONAL MATCH |
 | `CONTAINER_OF` | Forum → Post | — | A Post belongs to exactly one Forum |
-| `HAS_MEMBER` | Forum → Person | `joinDate` (bigint) | Mirrored into the `HasMemberSide` side table for IC5 (see "Side tables" below) — the AGE table itself is not read by outer SQL |
+| `HAS_MEMBER` | Forum → Person | `joinDate` (bigint) | IC5 reads `joinDate` directly from the Cypher RETURN |
 | `HAS_MODERATOR` | Forum → Person | — | |
 | `LIKES` | Person → Comment\|Post | `creationDate` (bigint) | |
 | `HAS_INTEREST` | Person → Tag | — | |
@@ -121,192 +121,44 @@ about direction. IU8 (add friendship) creates both rows in one transaction.
 
 ---
 
-## Denormalization columns (iter-1/2/3)
+## Denormalization & side tables: none (canonical Cypher)
 
-Added by `age/scripts/denormalize-schema.sql`. These columns store graphids
-copied from the corresponding edge tables, enabling direct B-tree joins in
-hybrid SQL/Cypher queries without an extra edge-table lookup.
+As of **Milestone A (2026-05-30)** there are **no denorm columns and no side
+tables**. Every query traverses the canonical graph structure in Cypher; outer
+SQL only aggregates/orders/unions/formats the `cypher()` result. `denormalize-
+schema.sql` now only issues idempotent `DROP`s + `ANALYZE` (kept so existing
+deployments converge).
 
-Columns are populated at load time by `denormalize-schema.sql` and maintained
-on subsequent writes by the IU operations listed. All columns are of type
-`ag_catalog.graphid` (nullable — NULL until backfilled or inserted).
+This is deliberate: the project exists to **surface** AGE's limitations
+upstream, not mask them with structures no peer impl (postgres/duckdb/umbra/
+cypher/tigergraph) maintains. Denorm is only justified if a peer adopts the same
+pattern.
 
-### `ldbc_snb."Post"`
+### Why retired structures can't be physically dropped
 
-| Column | Source edge | Maintained by |
-|---|---|---|
-| `creator_id` | `HAS_CREATOR`.end_id | IU6 (SQL UPDATE) — read by IC10 |
-| ~~`forum_id`~~ | ~~`CONTAINER_OF`.start_id (inverse)~~ | **retired 2026-05-14** — IU6 now sources forum/author gids from Cypher RETURN; no external reader. UPDATE removed from IU6; column + indexes dropped by migration `2026-05-14-drop-post-forum-id.sql`. |
-| ~~`country_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no read consumer. UPDATE removed from IU6 and `denormalize-schema.sql`; column + index remain (AGE 1.6 ALTER limit). |
+AGE 1.6 blocks `ALTER TABLE ... DROP COLUMN` on label tables ("table X is for
+label X"). Retired denorm columns persist as inert NULL storage on old
+deployments until AGE 1.7+ relaxes the guard or the graph is rebuilt. Their
+**indexes** were droppable and are gone (migrations under `scripts/migrations/`).
 
-### `ldbc_snb."Comment"`
+### History (decision-relevant)
 
-| Column | Source edge | Maintained by |
-|---|---|---|
-| ~~`creator_id`~~ | ~~`HAS_CREATOR`.end_id~~ | **retired 2026-05-14** — IC12 was migrated to a Cypher-hybrid traversing `(friend)<-[:HAS_CREATOR]-(comment)-[:REPLY_OF]->(post)` directly; no remaining runtime reader. IU7 no longer writes it. Indexes dropped by migration `2026-05-14-retire-comment-creator-replyof.sql`; column stays on disk as NULL (AGE 1.6 ALTER limit). |
-| ~~`reply_of_id`~~ | ~~`REPLY_OF`.end_id~~ | **retired 2026-05-14** — IC12 migration removed the last runtime reader. IS2 uses `CommentRootPost`; `denormalize-schema.sql` backfill rewritten to traverse `REPLY_OF` directly. IU7 no longer writes it. Indexes dropped by migration `2026-05-14-retire-comment-creator-replyof.sql`; column stays on disk as NULL (AGE 1.6 ALTER limit). |
-| ~~`country_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no read consumer. UPDATE removed from IU7 and `denormalize-schema.sql` (was the slowest deploy-time UPDATE at SF3 → ~10 min saved at SF10+). |
-
-### `ldbc_snb."Forum"`
-
-| Column | Source edge | Maintained by |
-|---|---|---|
-| ~~`moderator_id`~~ | ~~`HAS_MODERATOR`.end_id~~ | **retired 2026-05-14** — no read query referenced it; IU4 no longer writes it. Existing column + index remain (AGE 1.6 blocks `ALTER TABLE` on label tables) but values for new Forums are NULL. Reintroduce as `ForumSide.moderator_id` if a read query ever needs it. |
-
-### `ldbc_snb."Person"`
-
-| Column | Source edge | Maintained by |
-|---|---|---|
-| ~~`city_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no read query referenced it; IU1 no longer writes it. Existing column + index remain (AGE 1.6 ALTER limit). |
-
-### Side tables (mirrors — outer SQL never reads AGE tables)
-
-Per client directive 2026-05-13: outer SQL must not directly access AGE-managed
-tables. The denorm columns above on `Post`/`Comment`/`Forum`/`Person` are legacy
-and tracked for migration to side tables. Phase 3B's `HAS_MEMBER.join_date`
-column was replaced by the side-table pattern below.
-
-#### `ldbc_snb."HasMemberSide"`
-
-| Column | Source | Maintained by |
-|---|---|---|
-| `forum_id` | `HAS_MEMBER.start_id` | IU5 (INSERT from cypher() result) |
-| `member_id` | `HAS_MEMBER.end_id` | IU5 |
-| `join_date` | `HAS_MEMBER.properties->'joinDate'` (cast to bigint) | IU5 |
-
-PK `(member_id, forum_id)`; secondary index `(member_id, join_date)`. Backfilled
-from `HAS_MEMBER` at deploy time. Used by IC5 as the directive-compliant
-replacement for the prior `HAS_MEMBER.join_date` column. The HAS_MEMBER column
-of the same name still exists in the AGE table (AGE 1.6 blocks DROP COLUMN on
-label tables) but is unindexed and unreferenced.
-
-#### `ldbc_snb."ForumSide"`
-
-| Column | Source | Maintained by |
-|---|---|---|
-| `forum_id` | `Forum.id` (graphid) | IU4 (INSERT from cypher() result) |
-| `forum_business_id` | `Forum.properties->'id'` (LDBC public id, bigint) | IU4 |
-| `title` | `Forum.properties->'title'` (text) | IU4 |
-
-PK on `forum_id`. Used by IC5 to read forum titles and the IC5 ORDER BY
-tie-breaker (`forum_business_id`) without invoking `agtype_access_operator` on
-each top-20 row.
-
-### Additional denorm columns (also in `denormalize-schema.sql`)
-
-| Table | Column | Source | Status |
-|---|---|---|---|
-| `Tag` | `tagclass_id` | `HAS_TYPE`.end_id | active — IC12 now traverses `HAS_TYPE` via Cypher; column may be read by future queries |
-| `TagClass` | `subclass_of_id` | `IS_SUBCLASS_OF`.end_id | active — IC12 now traverses `IS_SUBCLASS_OF` via Cypher; column may be read by future queries |
-| ~~`City`~~ | ~~`country_id`~~ | ~~`IS_PART_OF`.end_id~~ | **retired 2026-05-14** — no consumer |
-| ~~`Country`~~ | ~~`continent_id`~~ | ~~`IS_PART_OF`.end_id~~ | **retired 2026-05-14** — no consumer |
-| ~~`University`~~ | ~~`city_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no consumer |
-| ~~`Company`~~ | ~~`country_id`~~ | ~~`IS_LOCATED_IN`.end_id~~ | **retired 2026-05-14** — no consumer |
-
-Retired columns are no longer backfilled by `denormalize-schema.sql`. The
-columns and any indexes on them remain in the AGE schema (AGE 1.6 blocks
-`ALTER TABLE DROP COLUMN` on label tables) but values are NULL.
-
----
-
-## Side tables (iter-2)
-
-Plain PostgreSQL tables (not AGE label tables) that store precomputed
-aggregates. AGE 1.7 cannot add `NOT NULL DEFAULT` or array columns to its
-managed label tables without triggering a segfault in the Cypher CREATE path,
-so these aggregates live in separate tables. See `denormalize-schema.sql`
-section 5 for the DDL.
-
-### `ldbc_snb."ForumMemberPostCount"` — RETIRED Milestone A 2026-05-30
-
-Was a precomputed per-(forum, member) post count read by IC5.
-
-IC5 now computes the count inline via Cypher using `WITH DISTINCT friend, forum`
-staging before `count(post)` — required to prevent K× overcount from 2-hop
-path multiplicity (verified at SF3: staged form matches prior FMPC values).
-
-No peer impl (postgres/duckdb/umbra/cypher/tigergraph) precomputes this counter.
-All peers compute the count inline.
-
-**Pre-retirement latency (SF3 baseline):** IC5 p50/p95/p99 ≈ sub-second (indexed lookup).
-**Post-retirement expected:** 8–15 s per param at SF3 (AGE 1.6 cannot push HAS_CREATOR
-filter into CONTAINER_OF post scan — AGE issue #1000).
-
-**Un-retire when:** AGE gains predicate pushdown / index binding through Cypher
-(AGE #1000) so the per-pair count can use an index-backed traversal instead of
-a full per-forum scan.
-
-### `ldbc_snb."PersonPostCount"` — RETIRED Phase B 2026-05-29
-
-Was a per-Person total-post-count counter cache read only by IC10. Retired
-because IC10 now computes `total_posts` inline as `COUNT(*)` over
-`MessageByCreator` (filtered `is_post = true`) in the same LATERAL that computes
-`common_posts` — one index range scan per friend, no separate count probe and no
-counter to maintain. IU1 no longer seeds it; IU6 no longer increments it;
-`denormalize-schema.sql` issues `DROP TABLE IF EXISTS "PersonPostCount"`.
-
-### `ldbc_snb."MessageByCreator"` (2026-05-14, IC9 Phase C)
-
-```sql
-(creator_business_id bigint, message_business_id bigint, creation_date bigint,
- content text, is_post boolean)
-UNIQUE INDEX (creator_business_id, creation_date DESC, message_business_id)  -- IC9 per-creator walk
-UNIQUE INDEX (message_business_id)  -- IS2 lookup by message id, added 2026-05-14
-```
-
-- Mirrors `Comment` + `Post` keyed by the **creator's LDBC business id** (bigint).
-  `content` stores `Comment.content` or `Post.content`/`Post.imageFile` (whichever
-  is non-null, mirroring IC9's projection). `is_post` distinguishes the source.
-- Used by IC9 to walk per-friend date-DESC with `LATERAL LIMIT 20`. The composite
-  index binds both `creator_business_id` and `creation_date < $maxDate` as
-  `Index Cond:`, so each per-friend scan early-terminates at 20 rows.
-- Used by IS2 to look up the root post's creator after `CommentRootPost`
-  resolves `comment_business_id → root_post_business_id`. The secondary
-  unique index on `message_business_id` makes this a single PK probe.
-- Maintained by IU6 (AddPost) and IU7 (AddComment): one `INSERT … ON CONFLICT
-  DO NOTHING` per new message. No update path — messages are immutable.
-- Populated at load time by `denormalize-schema.sql` section 6 (`UNION ALL` over
-  `Comment ⨝ Person` and `Post ⨝ Person`).
-- Replaces the prior `Comment` + `Post` + `HAS_CREATOR` outer-SQL joins that
-  violated AGENTS.md §14. The Cypher-only alternative (`HAS_CREATOR.creationDate`
-  edge property + functional index) was tested 2026-05-14 and ran 135x–388x
-  slower at SF3 — AGE 1.6 can't push LIMIT past Cypher UNION and edge-property
-  predicates don't bind as `Index Cond:` on functional indexes.
-
-### `ldbc_snb."CommentRootPost"` (extended 2026-05-14 for IS2)
-
-```sql
-(comment_id ag_catalog.graphid PRIMARY KEY,
- comment_business_id bigint NOT NULL,
- root_post_business_id bigint NOT NULL)
-UNIQUE INDEX (comment_business_id)  -- added 2026-05-14 for IS2 lookup-by-bizid
-```
-
-- For each Comment, stores the LDBC business id of the root Post reachable
-  by walking `REPLY_OF*`. The `comment_id` (graphid) PK lets the iterative
-  deploy-time backfill loop join against the `REPLY_OF` edge table directly
-  (`Comment.reply_of_id` denorm was retired 2026-05-14).
-- Used by IS2 to skip the recursive REPLY_OF walk: a single lookup on
-  `comment_business_id` yields the root post id without touching any AGE
-  label table. (IS6 was the original target but currently falls back to
-  its own SQL walk pending a separate refactor.)
-- Maintained by IU7 (AddComment): when the new comment replies to a Post,
-  root = `$replyToId`; when it replies to another Comment, root inherits
-  the parent comment's `root_post_business_id` via a CommentRootPost lookup.
-- Populated at load time by `denormalize-schema.sql` section 6: seed every
-  Comment whose direct parent is a Post (by traversing `REPLY_OF` edge table),
-  then walk upward iteratively (replaces the prior recursive CTE — see commit `82865047`).
-
-### `ldbc_snb."PersonSide"` (2026-05-14, IC9 Phase C)
-
-```sql
-(person_business_id bigint PRIMARY KEY, first_name text, last_name text)
-```
-
-- Mirrors `Person.{id, firstName, lastName}` for projection queries that cannot
-  read `Person` directly under AGENTS.md §14.
-- Used by IC9 for the friend-name projection (`personFirstName`, `personLastName`).
-  Could be reused by other queries that need only `id/firstName/lastName`.
-- Maintained by IU1 (AddPerson): one `INSERT … ON CONFLICT DO NOTHING`.
-- Populated at load time by `denormalize-schema.sql` section 6 from `Person`
-  properties. ~10k rows at SF3, scales linearly with Person count.
+- **Side tables retired Milestone A (2026-05-30):** ForumMemberPostCount,
+  MessageByCreator, CommentRootPost. Earlier (Phase A/B, 2026-05-28/29):
+  HasMemberSide, ForumSide, PersonSide, PersonPostCount. All were §14-compliance
+  or aggregate caches; their work moved inline into Cypher.
+  - **IC5** computes the per-(forum,member) post count inline via Cypher with
+    `WITH DISTINCT friend, forum` staging (prevents 2-hop overcount).
+  - **IC9/IC2** use canonical Cypher Comment+Post `HAS_CREATOR` UNION arms.
+  - **IC10** computes common/total post counts inline (`OPTIONAL MATCH` +
+    `count(DISTINCT …)`, tag overlap via `EXISTS {}` semi-join).
+  - **IS2** root-post fields are a Milestone-A placeholder (returns the
+    message's own id) pending the VLE fix (Milestone B); see `project_vle_before_after`.
+- **Un-retire criterion:** only if AGE gains predicate/LIMIT pushdown through
+  Cypher (AGE #1000) — i.e. the inline form stops being structurally slow.
+  Slowness here is a *finding to report*, not a thing to hide.
+- **Denorm columns retired 2026-05-14/15** (Tier 1–3b): Post.{forum_id,
+  country_id, creator_id}, Comment.{creator_id, reply_of_id, country_id},
+  Forum.moderator_id, Person.city_id, Tag.tagclass_id, TagClass.subclass_of_id,
+  and the City/Country/University/Company place FKs — all replaced by Cypher
+  traversal of the underlying edges.

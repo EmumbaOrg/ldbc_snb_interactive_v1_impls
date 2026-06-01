@@ -102,35 +102,51 @@ agtype_string sorts strictly less than agtype_integer regardless of
 content. So `MATCH (p:Person {id: 933})` against a graph where
 `id` was loaded as `"933"` (string) returns zero rows.
 
-## 8. Property MATCH requires GIN; B-tree on extracted values is ignored
+## 8. Property MATCH binding depends on the anchor shape
 
-`MATCH (n {prop: X})` compiles to a `properties @> '{...}'::agtype`
-containment predicate, which is only supported by GIN indexes with
-`gin_agtype_ops`. Functional B-tree indexes on extracted columns are
-*never* used by the planner for this pattern.
+Two compiled shapes, two index needs:
+
+- **Map-form** `MATCH (n {prop: X})` → `properties @> '{"prop": X}'::agtype` →
+  served only by a **GIN** (`gin_agtype_ops`); a functional B-tree does not
+  support `@>`.
+- **WHERE-form** `MATCH (n) WHERE n.prop = X` →
+  `agtype_access_operator(VARIADIC ARRAY[properties,'"prop"'::agtype]) = X` →
+  served by a **functional B-tree** on that exact expression.
+
+This **corrects** the older absolute claim that a B-tree on extracted values is
+"never used" — that holds only for the map-form. The index expression must
+byte-match the compiled predicate; the `CAST(agtype_object_field_text(...))`
+form matches neither shape and is never picked.
 
 **Implications:**
-- Every node label has a GIN index on `properties`. Without it, every
-  property-keyed MATCH degenerates to a sequential scan. See INDEXES.md.
+- Map-form labels (Person, Forum, Tag, City, Company, University) carry a GIN.
+- **Post/Comment** anchor by `id` via the WHERE-form and use functional B-trees
+  (`idx_{post,comment}_id_agtype`), **not** a GIN — a content-tokenizing GIN on
+  them was the SF100 disk blocker. See INDEXES.md.
 
-## 9. Subclass / reply hierarchies require alternative traversal strategies
+## 9. Variable-length `*` paths crash AGE 1.6 — use fixed-depth ladders
 
-Variable-length paths don't push predicates and are slow (see quirk 4).
-For REPLY_OF and IS_SUBCLASS_OF we use two different strategies:
+Any `*` variable-length relationship (`-[:REPLY_OF*1..]->`,
+`[:IS_SUBCLASS_OF*]`) drops the AGE 1.6 backend into **recovery mode** — not
+merely slow. The untyped-intermediate seq-scan pathology (quirk 4) plus an
+"Invalid number of attributes" error through the label tables aborts the
+backend and any concurrent run. Predicate pushdown is also absent.
 
-**REPLY_OF (IS2, IS6):** Uses a SQL `WITH RECURSIVE` CTE on the REPLY_OF
-edge table directly (depth cap 20). Each step is one indexed lookup on
-`idx_replyof_start`. LDBC reply chains are bounded ~8 across all SFs; the
-depth-20 cap is a safety margin. This completely sidesteps the Cypher
-path-enumeration pathology and the earlier 8-level `OPTIONAL MATCH` ladder
-(which caused untyped-intermediate Parallel Append seq-scans — see quirk 4).
+Pure-SQL recursion over AGE label tables is forbidden (CLAUDE.md), so the
+canonical-Cypher workarounds are:
 
-**IS_SUBCLASS_OF (IC12):** Uses a SQL `WITH RECURSIVE` CTE on the
-`TagClass.subclass_of_id` denorm column (iter-3). PostgreSQL terminates the
-recursion naturally when no new rows are produced (the hierarchy is acyclic),
-so no explicit depth cap is needed.
+**IS_SUBCLASS_OF (IC12):** a fixed-depth `d1–d6 OPTIONAL MATCH` ladder in
+Cypher (the LDBC TagClass hierarchy is ≤ 6 levels). Returns the valid tag ids;
+outer SQL does the bigint semi-join, aggregation, and sort.
 
-Both strategies avoid the variable-length Cypher pathology entirely.
+**REPLY_OF (IS6):** migrated to the natural `-[:REPLY_OF*1..]->` VLE form
+specifically to **surface** the crash upstream — DISABLED pending the AGE VLE
+fix (the before/after experiment; see `project_vle_before_after`). It is not a
+SQL fallback.
+
+**REPLY_OF root-post (IS2):** root-post resolution (`REPLY_OF*0..`) is deferred
+to Milestone B (VLE). The Milestone-A placeholder returns the message's own id,
+so Comment rows are expected-incorrect in validation.
 
 ## 10. `NOT (p)-[:REL_TYPE]-(n)` pattern negation with typed relationship is rejected by the parser
 
@@ -407,8 +423,8 @@ parse-savings of the parameterised path don't materialise; see §13).
 | 5 | No ORDER BY on RETURN aliases | IC4, IC10, IC12 (WITH-bound score) |
 | 6 | UNION over nodes hangs | every UNION arm projects scalars |
 | 7 | agtype type strictness | loader stores numerics as integers |
-| 8 | GIN required for MATCH | INDEXES.md (every node label has GIN) |
-| 9 | Var-length paths slow | IS2, IS6 (SQL recursive CTE on REPLY_OF); IC12 (SQL recursive CTE on TagClass.subclass_of_id denorm) |
+| 8 | MATCH binding by anchor shape (map-form→GIN, WHERE-form→functional B-tree) | Person/Forum/Tag/City/Company/University (GIN); Post/Comment id (B-tree) |
+| 9 | Var-length `*` paths crash AGE 1.6 | IC12 (fixed-depth OPTIONAL MATCH ladder); IS6 (VLE form, disabled); IS2 root-post (deferred to Milestone B) |
 | 10 | `NOT (p)-[:TYPE]-(n)` negation rejected by parser | IC9 V4 (uses UNION dedup instead) |
 | 11 | Undirected traversal disables seed-node index | IC1, IC2, IC3, IC5, IC6, IC9, IC10, IC11, IS3, IS7 (all fixed: use directed `->`, IU8 guarantees symmetry) |
 | 12 | Multi-hop OPTIONAL MATCH triggers backward hash join + disk spill | IC1 (WORK_AT 2-hop pattern; fixed by splitting into two 1-hop steps with intermediate WITH) |

@@ -17,20 +17,18 @@ Every query goes through the AGE/Cypher path. Two tiers, in priority:
 1. **Cypher-only** — single `cypher(...)` call with no outer SQL logic beyond the mandatory wrapper. Default for simple lookups, updates, and queries the AGE planner handles well.
 2. **Hybrid** — Cypher for graph traversal, outer SQL for aggregation, multi-result `UNION ALL`, or complex `ORDER BY`/`LIMIT`. Use when the traversal is naturally Cypher but the remainder is faster in SQL.
 
-**Pure SQL is forbidden.** The main query must always flow through Cypher. If a tactic seems to require eliminating the `cypher()` call, find an index, denorm column, side table, or rewrite that lets Cypher do the traversal instead. IS6 is the only current holdout — tracked for migration, not precedent.
+**Pure SQL is forbidden.** The main query must always flow through Cypher. If a tactic seems to require eliminating the `cypher()` call, find an index or rewrite that lets Cypher do the traversal instead. As of Milestone A there are **no pure-SQL holdouts** — IS6 was migrated to the natural VLE Cypher form (disabled pending the AGE VLE fix).
 
-**Scope of the no-direct-read rule**: applies to runtime query files in `age/queries/`. Deploy-time tooling in `age/scripts/` (`denormalize-schema.sql`, load-time backfill, one-off migrations) is exempt — those run once on a known dataset shape and populate side tables explicitly.
-
-Clean up dead columns/tables when pivoting to a different strategy.
+**Scope of the no-direct-read rule**: applies to runtime query files in `age/queries/`. Deploy-time tooling in `age/scripts/` (one-off migrations) is exempt. `denormalize-schema.sql` now only issues idempotent DROPs + ANALYZE (all denorm/side tables retired — see SCHEMA.md).
 
 ## Companion Documents (read first)
 
 | Document | Purpose |
 |---|---|
 | `README.md` | Strategy, history, denormalization rationale |
-| `AGE-QUIRKS.md` | 12 catalogued AGE limitations (datetime, KNOWS direction, predicate pushdown, …) |
-| `SCHEMA.md` | Node/edge labels, agtype storage layout, denorm columns, side tables |
-| `INDEXES.md` | GIN on agtype, B-tree on edge IDs, functional indexes, composites |
+| `AGE-QUIRKS.md` | 15 catalogued AGE limitations (datetime, KNOWS direction, predicate pushdown, …) |
+| `SCHEMA.md` | Node/edge labels, agtype storage layout (no denorm columns / side tables — canonical Cypher) |
+| `INDEXES.md` | Two anchor shapes (map-form→GIN, WHERE-form→functional B-tree), edge-ID B-trees, graphid B-trees |
 
 YAML specs in `query-specifications/` are ground truth — follow exactly. For Cypher pattern correctness, defer to `cypher/queries/` (Neo4j authoritative reference).
 
@@ -77,7 +75,7 @@ Implementations: `interactive-complex-N.sql`, `interactive-short-N.sql`, `intera
 
 10. **IC12 tag source** — tags come from the original Post via `(post:Post)-[:HAS_TAG]->(tag)`, never from the reply.
 
-11. **IU cypher() call count** — minimum needed per IU. **IU7 uses three calls** to dodge AGE MVCC bug (issue #1954, see `../AGE-1.6-MVCC-BUG.md`): the `HAS_TAG` UNWIND must run in a separate visibility window after the Comment is committed, and a third call reads the committed Comment's `content` for the `MessageByCreator` INSERT (Cypher-escaped content can't safely substitute into a SQL string literal). Don't merge IU7's three calls. Tier 1/2 splits: IU1=1, IU4=1, IU5=1, IU6=2, IU7=3. (IU1 dropped from 2→1 in Phase B 2026-05-29: PersonPostCount retired, so the second call that seeded it is gone; AddPerson now completes in a single CREATE+UNWIND call. IU4 dropped from 2→1 in Phase A 2026-05-28: ForumSide retired, so the second call that populated it is gone; AddForum now completes in a single CREATE+UNWIND call.)
+11. **IU cypher() call count** — minimum needed per IU: **IU1=1, IU4=1, IU5=1, IU6=1, IU7=2.** IU7's two calls are mandatory: the `HAS_TAG` UNWIND must run in a separate visibility window after the Comment is committed (AGE MVCC bug #1954, see `../AGE-1.6-MVCC-BUG.md`) — don't merge them. All side-table-seeding extra calls were dropped at Milestone A 2026-05-30 (IU7's former third call wrote MessageByCreator; IU1/IU4 second calls seeded PersonPostCount/ForumSide — all retired). Every IU is now a single CREATE+UNWIND except IU7's MVCC split.
 
 12. **SF-appropriate tactics**:
     - Avoid materializing full edge sets if SF1000 will OOM; prefer streaming joins.
@@ -91,7 +89,7 @@ Implementations: `interactive-complex-N.sql`, `interactive-short-N.sql`, `intera
 
     **(a) Cypher RETURN of scalar properties** — the natural peer pattern. Every peer implementation (`postgres/`, `duckdb/`, `umbra/`, `cypher/`, `tigergraph/`) reads Person/Forum/HAS_MEMBER properties directly from the canonical structure with zero side tables. Projecting `friend.firstName`, `forum.title`, or `m.joinDate` in a `cypher()` block's RETURN clause — and consuming those columns in outer SQL — is correct and idiomatic. Preferred.
 
-    **(b) Correlated scalar subqueries against an AGE label table** when all three conditions hold: (i) the WHERE clause is GIN-bound via `properties @> '{"id": X}'::agtype`, (ii) the outer query has already been LIMIT'd so the subquery fires at most ~LIMIT times per call, and (iii) the result is a single scalar projection (not used in a JOIN predicate). IS2's author-name fetch is the canonical example of case (b).
+    **(b) Correlated scalar subqueries against an AGE label table** when all three conditions hold: (i) the WHERE clause is index-bound — either GIN via `properties @> '{"id": X}'::agtype` (map-form, e.g. Person) or a functional B-tree via the `agtype_access_operator(...)` WHERE-form (e.g. Post/Comment id); (ii) the outer query has already been LIMIT'd so the subquery fires at most ~LIMIT times per call; and (iii) the result is a single scalar projection (not used in a JOIN predicate). IS2's author-name fetch (Person, GIN-bound) is the canonical example.
 
     What §14 forbids is `JOIN ldbc_snb."Person"` / `JOIN ldbc_snb."HAS_MEMBER"` in outer SQL where the planner must operate on raw `agtype` columns over a full table without GIN support. (Deploy-time scripts in `age/scripts/` are exempt — see Implementation Style scope above.)
 
@@ -148,29 +146,26 @@ Verified against AGE 1.6 release tags (`PG14/15/16/17 v1.6.0-rc0`) and that vers
 
 Design around these — empirical from IC9 Phase A and Horizon SF10 experiments, not regression-test assertions:
 
-1. **No LIMIT pushdown.** `MATCH … RETURN … ORDER BY x DESC LIMIT N` materializes the full row set before sort. No Cypher rewrite fixes this in 1.6.
-2. **Functional B-tree indexes on extracted property values don't bind from Cypher** (AGE #1000). AGE wraps the vertex in `_agtype_build_vertex(...)` before the accessor. Only `gin_<label>` containment via `properties @> '{"id": X}'::agtype` binds reliably.
-3. **GIN containment binds only for literal/parameter values** in inline `{prop: X}`. Runtime values from `UNWIND`/`WITH`/function output fall to seq scans (verified: `UNWIND list AS r MATCH (n:Post {id: r.id})` was 5.7s for 10 lookups at SF3). Workaround: do per-row lookup inside a PG function, or pass via `cypher('…', $$ … $$, {id: …}::agtype)`.
-4. **Edge-property comparators in MATCH don't bind to composite functional indexes either** (same root cause as #2). IC9 Phase A confirmed the predicate landed as `Filter:`, not `Index Cond:`. Don't propose "add edge property + functional index" as a fix.
-5. **Each `cypher(...)` call costs ~10–30 ms overhead.** Splitting work across calls matters at IU/IS scale (IU7's three-call split is the established example).
+1. **No LIMIT pushdown.** `MATCH … RETURN … ORDER BY x DESC LIMIT N` materializes the full row set before sort. No Cypher rewrite fixes this in 1.6. This is the dominant cost on IC5/IC9 and the main weakness the project surfaces upstream.
+2. **Index binding depends on the anchor shape** (corrects the older "functional B-trees never bind from Cypher" / AGE #1000 claim):
+   - Map-form `MATCH (n {id: X})` → `properties @> '{"id": X}'::agtype` → needs a **GIN**.
+   - WHERE-form `MATCH (n) WHERE n.id = X` → `agtype_access_operator(VARIADIC ARRAY[properties,'"id"'::agtype]) = X` → binds a **functional B-tree** on that exact expression (verified Index Scan at SF3, including as a traversal anchor and for edge-property/date range predicates). The index expression must **byte-match** the compiled predicate — the `CAST(agtype_object_field_text(...))` form does NOT match and is never picked; index the `agtype_access_operator(...)` expression instead. Post/Comment use this for `id` and `creationDate`. See INDEXES.md.
+3. **Either shape binds only for literal/parameter values known at plan time.** Runtime values from `UNWIND`/`WITH`/function output fall to seq scans (verified: `UNWIND list AS r MATCH (n:Post {id: r.id})` was 5.7s for 10 lookups at SF3). Workaround: per-row lookup inside a PG function, or pass via `cypher('…', $$ … $$, {id: …}::agtype)`.
+4. **Each `cypher(...)` call costs ~10–30 ms overhead.** Splitting work across calls matters at IU/IS scale (IU7's MVCC-mandated two-call split is the established example).
 
-### Hybrid Patterns (reach for in order)
+### Hybrid techniques (kept for future use)
 
-**A — Seed-MATCH + UDF body** (AGE-docs sanctioned, fastest). When post-seed work is bounded indexed scans against side tables, put it in a `STABLE` PL/pgSQL function returning a single `agtype` list:
+Post-Milestone-A every shipped query is Cypher traversal + outer SQL for
+aggregation/order/limit/union. No shipped query currently needs the patterns
+below; reach for them in order only if a future query forces it:
 
-```cypher
-MATCH (p:Person {id: $personId})       -- GIN binds for runtime $param here
-UNWIND public.my_function(p.id) AS r   -- UDF returns list-shaped agtype
-RETURN r.field1, r.field2, …
-```
+**A — Seed-MATCH + UDF body.** Anchor in Cypher, then `UNWIND public.fn(seed) AS r`, where the `STABLE` PL/pgSQL function returns a single `agtype` list. Build the agtype via `jsonb_agg(jsonb_build_object(…))::text::ag_catalog.agtype` — the AGE `agtype_build_list(VARIADIC array_agg(…))` form has a "pfree called with invalid pointer" bug.
 
-Build the agtype via `jsonb_agg(jsonb_build_object(…))::text::ag_catalog.agtype` — the AGE `agtype_build_list(VARIADIC array_agg(…))` form has a "pfree called with invalid pointer" bug.
+**B — `UNWIND range(0, N-1) AS i` driving `CALL public.fn(seed, i) YIELD …`.** Slower than A (N× function overhead + N× index walks); `YIELD` runtime values don't bind to an index.
 
-**B — `UNWIND range(0, N-1) AS i` driving `CALL public.fn(seed, i) YIELD …`.** Works, but slower than A due to N× PG-function overhead + N× index walks. Reserve for cases where each row needs different per-row Cypher work — and remember, `YIELD` runtime values don't bind to GIN.
+**C — Multiple Cypher calls in sequence.** Pays per-call overhead but is the only way around per-call MVCC and label-disjoint patterns (IU7).
 
-**C — Multiple Cypher calls in sequence.** Pays per-call overhead but is the only way around per-call MVCC and label-disjoint patterns (IU7, old IS2).
-
-If no pattern is fast enough, the query joins IS6 as a pure-SQL holdout — exception requiring explicit sanction, with the structural reason documented in the query header.
+There are **no pure-SQL holdouts**. IS6 was migrated to the natural VLE Cypher form (`-[:REPLY_OF*1..]->`) to surface AGE's VLE crash upstream — it's DISABLED pending the AGE VLE fix (see `project_vle_before_after`), not a SQL fallback.
 
 ## Cross-Implementation Reference
 
@@ -181,7 +176,15 @@ If no pattern is fast enough, the query joins IS6 as a pure-SQL holdout — exce
 
 Do **not** consult `postgres/`/`duckdb/`/`umbra/` for graph-pattern questions. Known bugs to ignore: TigerGraph IC7 picks highest ID on ties; DuckDB IC7 returns multiple rows per liker on timestamp ties.
 
-**Cross-check against AGE's existing tactics first.** Review `age/scripts/denormalize-schema.sql` and `INDEXES.md`. AGE already has side tables (`ForumMemberPostCount`, `MessageByCreator`, `CommentRootPost`), composite indexes, and GIN+functional-B-tree splits that the relational implementations don't. If a relational tactic looks useful, add the denorm column or index in AGE's schema first, then write the hybrid query — don't convert AGE to pure SQL to mimic the relational shape.
+**Surface AGE weaknesses; don't mask them with denorm.** As of Milestone A,
+AGE has **no side tables and no denorm columns** — they were all retired so the
+benchmark measures AGE's true canonical-Cypher behavior (the project's purpose).
+Only the GIN (map-form) / functional-B-tree (WHERE-form) anchor split remains
+(see INDEXES.md). Do **not** reintroduce a denorm column or side table to win
+latency unless a peer impl (`postgres/`/`duckdb/`/`umbra/`/`cypher/`/
+`tigergraph/`) maintains the same structure — a slow canonical query is a
+finding to report upstream, not a bug to hide. And never convert a query to
+pure SQL to mimic the relational shape.
 
 ## Validation Against LDBC Reference Params
 
