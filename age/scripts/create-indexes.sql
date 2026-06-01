@@ -21,34 +21,30 @@ SET search_path = ag_catalog, '$user', public;
 -- ---------------------------------------------------------------------------
 -- GIN indexes on vertex properties
 -- Enables efficient MATCH (n:Label {id: X}) / {name: Y} containment lookups.
+-- Country/TagClass/Continent GINs omitted: fixed-size reference tables (≤ a few
+-- hundred rows at any SF) that the planner always seq-scans — their GINs were
+-- never scanned (pg_stat_user_indexes idx_scan = 0).
 -- ---------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS gin_person      ON ldbc_snb."Person"     USING GIN (properties ag_catalog.gin_agtype_ops);
 CREATE INDEX IF NOT EXISTS gin_comment     ON ldbc_snb."Comment"    USING GIN (properties ag_catalog.gin_agtype_ops);
 CREATE INDEX IF NOT EXISTS gin_post        ON ldbc_snb."Post"        USING GIN (properties ag_catalog.gin_agtype_ops);
 CREATE INDEX IF NOT EXISTS gin_forum       ON ldbc_snb."Forum"       USING GIN (properties ag_catalog.gin_agtype_ops);
 CREATE INDEX IF NOT EXISTS gin_tag         ON ldbc_snb."Tag"         USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX IF NOT EXISTS gin_tagclass    ON ldbc_snb."TagClass"    USING GIN (properties ag_catalog.gin_agtype_ops);
 CREATE INDEX IF NOT EXISTS gin_city        ON ldbc_snb."City"        USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX IF NOT EXISTS gin_country     ON ldbc_snb."Country"     USING GIN (properties ag_catalog.gin_agtype_ops);
-CREATE INDEX IF NOT EXISTS gin_continent   ON ldbc_snb."Continent"   USING GIN (properties ag_catalog.gin_agtype_ops);
 CREATE INDEX IF NOT EXISTS gin_company     ON ldbc_snb."Company"     USING GIN (properties ag_catalog.gin_agtype_ops);
 CREATE INDEX IF NOT EXISTS gin_university  ON ldbc_snb."University"  USING GIN (properties ag_catalog.gin_agtype_ops);
 
 -- ---------------------------------------------------------------------------
--- B-tree indexes on extracted date values
--- Supports WHERE-clause range filters: msg.creationDate < $maxDate (IC2, IC3, IC4, IC7, IC9)
--- ---------------------------------------------------------------------------
-CREATE INDEX IF NOT EXISTS idx_comment_date ON ldbc_snb."Comment" (CAST(agtype_object_field_text(properties, 'creationDate') AS bigint));
-CREATE INDEX IF NOT EXISTS idx_post_date    ON ldbc_snb."Post"    (CAST(agtype_object_field_text(properties, 'creationDate') AS bigint));
-
--- ---------------------------------------------------------------------------
--- B-tree indexes on extracted name values
--- Supports WHERE-clause equality: tag.name = $tagName, country.name = $countryName (IC3, IC4, IC5, IC6, IC11)
--- ---------------------------------------------------------------------------
-CREATE INDEX IF NOT EXISTS idx_tag_name      ON ldbc_snb."Tag"      (agtype_object_field_text(properties, 'name'));
-CREATE INDEX IF NOT EXISTS idx_tagclass_name ON ldbc_snb."TagClass" (agtype_object_field_text(properties, 'name'));
-CREATE INDEX IF NOT EXISTS idx_country_name  ON ldbc_snb."Country"  (agtype_object_field_text(properties, 'name'));
-
+-- Date range filters (msg.creationDate < $maxDate; IC2/IC3/IC4/IC9) are served by
+-- the agtype-access-operator indexes at the bottom of this file. The
+-- CAST(agtype_object_field_text(... AS bigint)) form was removed: AGE compiles the
+-- Cypher predicate to agtype_access_operator(...), which the CAST form does not
+-- match, so idx_comment_date / idx_post_date were never scanned (idx_scan = 0).
+--
+-- Name filters use either the {name: X} map form (→ GIN containment) or, on the
+-- fixed-size reference tables, a seq scan. The agtype_object_field_text(...) form
+-- (idx_tag_name / idx_tagclass_name / idx_country_name) matched neither and was
+-- never scanned — removed.
 -- ---------------------------------------------------------------------------
 -- B-tree indexes on edge start_id / end_id
 -- Supports adjacency traversal for all MATCH patterns following edge hops.
@@ -86,47 +82,16 @@ CREATE INDEX IF NOT EXISTS idx_ispartof_start     ON ldbc_snb."IS_PART_OF"     (
 CREATE INDEX IF NOT EXISTS idx_ispartof_end       ON ldbc_snb."IS_PART_OF"     (end_id);
 
 -- ---------------------------------------------------------------------------
--- Phase C additions — vertex.id functional B-tree indexes
--- The existing GIN-on-properties index supports MATCH ({id: X}) containment.
--- However, for queries that PROJECT n.id from a previously-bound vertex set
--- (e.g. RETURN friend.id ORDER BY friend.id), the planner cannot reuse the GIN
--- and falls back to a parallel sort over the entire vertex table. A functional
--- B-tree on the extracted id column lets the planner satisfy ORDER BY friend.id
--- without a sort node and provides faster equality lookup than GIN containment
--- for the hot single-id MATCH path.
+-- (Removed) vertex.id and Person.firstName functional B-trees, and the
+-- Comment/Post (creationDate, id) composites — all CAST(agtype_object_field_text
+-- (...)) / agtype_object_field_text(...) form. These never matched the queries:
+--   * {id: X} / {firstName: X} anchors compile to `properties @>` → served by GIN.
+--   * ORDER BY / LIMIT run in OUTER SQL over the agtype result columns, not inside
+--     Cypher, so no in-Cypher access path picks a label-table functional index.
+-- All were confirmed unused (pg_stat_user_indexes idx_scan = 0) after a full run.
+-- Label-table joins use the graphid-`id` B-trees below; in-Cypher date ranges use
+-- the agtype-access-operator date indexes at the bottom of this file.
 -- ---------------------------------------------------------------------------
-CREATE INDEX IF NOT EXISTS idx_person_id   ON ldbc_snb."Person"   (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX IF NOT EXISTS idx_comment_id  ON ldbc_snb."Comment"  (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX IF NOT EXISTS idx_post_id     ON ldbc_snb."Post"     (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX IF NOT EXISTS idx_forum_id    ON ldbc_snb."Forum"    (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX IF NOT EXISTS idx_tag_id      ON ldbc_snb."Tag"      (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX IF NOT EXISTS idx_tagclass_id ON ldbc_snb."TagClass" (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX IF NOT EXISTS idx_city_id     ON ldbc_snb."City"     (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX IF NOT EXISTS idx_country_id  ON ldbc_snb."Country"  (CAST(agtype_object_field_text(properties, 'id') AS bigint));
-
--- ---------------------------------------------------------------------------
--- Phase C additions — Person.firstName (IC1)
--- IC1 filters friend.firstName = $firstName across 1, 2, and 3-hop KNOWS paths.
--- The existing GIN supports {firstName: X} but only at the *original* MATCH —
--- once Person is bound transitively, the projection-side filter becomes a
--- per-row containment check.
--- ---------------------------------------------------------------------------
-CREATE INDEX IF NOT EXISTS idx_person_firstname ON ldbc_snb."Person" (agtype_object_field_text(properties, 'firstName'));
-
--- ---------------------------------------------------------------------------
--- Phase C additions — Message.creationDate composite covering index
--- IC2 ("recent messages by friends") and IC9 ("recent messages by friends-of-friends")
--- both filter messages by creationDate < maxDate and ORDER BY creationDate DESC.
--- A composite (creationDate, id) on the union of Comment+Post would let the planner
--- index-scan in date-desc order. AGE's per-label storage prevents a true union index;
--- the next-best is a per-label composite that includes id as a covering column.
--- ---------------------------------------------------------------------------
-CREATE INDEX IF NOT EXISTS idx_comment_date_id ON ldbc_snb."Comment"
-  (CAST(agtype_object_field_text(properties, 'creationDate') AS bigint) DESC,
-   CAST(agtype_object_field_text(properties, 'id') AS bigint));
-CREATE INDEX IF NOT EXISTS idx_post_date_id    ON ldbc_snb."Post"
-  (CAST(agtype_object_field_text(properties, 'creationDate') AS bigint) DESC,
-   CAST(agtype_object_field_text(properties, 'id') AS bigint));
 
 -- ---------------------------------------------------------------------------
 -- Per-label B-tree indexes on the graphid `id` column
@@ -185,11 +150,10 @@ CREATE INDEX IF NOT EXISTS idx_university_graphid ON ldbc_snb."University" (id);
 -- exist at this point.
 
 -- Date predicates on Comment / Post for IC2/IC4-style date-range filters in Cypher.
--- Same agtype-expression-matching pattern as above. Existing idx_comment_date /
--- idx_post_date use the CAST-as-bigint form, which matches our pure-SQL rewrites
--- (SQ6/IS4/IC9/IC3) but NOT AGE-compiled Cypher predicates. These agtype-form
--- variants do match `comment.creationDate <= $maxDate` / `post.creationDate >= $X`
--- as AGE 1.6 compiles them.
+-- These agtype-access-operator indexes match `comment.creationDate <= $maxDate` /
+-- `post.creationDate >= $X` exactly as AGE 1.6 compiles them, and are the only
+-- date indexes actually used (the CAST-as-bigint form never matched the compiled
+-- Cypher predicate and was removed — see note above).
 CREATE INDEX IF NOT EXISTS idx_comment_creationdate_agtype
   ON ldbc_snb."Comment" ((ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"creationDate"'::ag_catalog.agtype])));
 

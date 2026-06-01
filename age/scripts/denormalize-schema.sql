@@ -174,13 +174,12 @@ DROP INDEX IF EXISTS idx_msgbycreator_message;
 -- maintains PersonSide. Drop stale table for any pre-Phase-A deployment:
 DROP TABLE IF EXISTS "PersonSide";
 
--- 5c. Composite covering index on HAS_INTEREST(start_id, end_id) — replaces
--- the would-be Person.interest_tag_ids array. Lets the IC10 per-post
--- check `EXISTS (SELECT 1 FROM HAS_INTEREST WHERE start_id = p AND
--- end_id = t)` be a single tight index probe instead of a NL via
--- idx_hasinterest_start + filter.
-CREATE INDEX IF NOT EXISTS idx_hasinterest_start_end
-    ON "HAS_INTEREST" (start_id, end_id);
+-- 5c. (Removed) composite HAS_INTEREST(start_id, end_id). It served the old
+-- IC10 SQL semi-join `EXISTS (SELECT 1 FROM HAS_INTEREST WHERE start_id=p AND
+-- end_id=t)`. The 2026-06-01 IC10 fix moved tag-overlap into a Cypher EXISTS{}
+-- semi-join that binds idx_hasinterest_start; the composite was then never
+-- scanned (pg_stat_user_indexes idx_scan = 0).
+DROP INDEX IF EXISTS idx_hasinterest_start_end;
 
 -- =========================================================================
 -- 6. Iteration-2 backfills
