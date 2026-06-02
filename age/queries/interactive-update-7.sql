@@ -1,14 +1,13 @@
 -- LdbcUpdate7AddComment — create a Comment vertex with HAS_CREATOR/REPLY_OF/IS_LOCATED_IN/HAS_TAG edges.
 --
--- Three Cypher calls. Splitting Cypher across statements is required by the
+-- Two Cypher calls. Splitting Cypher across statements is required by the
 -- AGE 1.6 MVCC concurrency trigger (see AGE-1.6-MVCC-BUG.md): HAS_TAG must
 -- run in a fresh visibility window after the Comment is committed.
 --
 -- Milestone A 2026-05-30: CommentRootPost and MessageByCreator retired.
--- Call 1 now just creates the Comment (no CRP INSERT afterward).
--- Call 2 still runs HAS_TAG in its own MVCC window (non-negotiable per §11).
--- Call 3 is dropped: no MessageByCreator INSERT needed.
--- IU7 is now two calls (down from three).
+-- Call 1 creates the Comment + edges (no CRP INSERT afterward).
+-- Call 2 runs HAS_TAG in its own MVCC window (non-negotiable per §11).
+-- The former Call 3 (MessageByCreator INSERT) is dropped — down from three.
 --
 -- Comment.creator_id/reply_of_id/country_id: all previously retired 2026-05-14.
 

@@ -75,107 +75,65 @@ bash scripts/load-test-data.sh
 
 This script auto-creates a `.venv` with `psycopg2-binary` on first run.
 
-### Production data (SF0.1+) via agefreighter
+### Production data (SF0.1+)
 
-Production loads use the [agefreighter](https://github.com/rioriost/agefreighter) library, which
-streams pre-converted CSVs directly into AGE via PostgreSQL's `COPY` protocol — the only approach
-that scales to SF1000.
-
-#### Prerequisites
+One command runs the whole pipeline — preprocess, load, index, snapshot:
 
 ```bash
-# Clone agefreighter and create its venv (one-time setup)
-cd ~/repositories
-git clone https://github.com/rioriost/agefreighter.git
-cd agefreighter
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip && pip install -e . && pip install "psycopg[binary]"
+export CONNECTION_STRING="postgresql://user:pass@host:5432/dbname"
+cd age
+bash scripts/load-data.sh --sf 3     # 0.1, 1, 3, 10, 100, …
 ```
 
-The preprocessing script lives in the `GraphBenchmarking` repo (sibling to this repo):
-```
-~/repositories/GraphBenchmarking/ldbc_snb_benchmark/preprocess_ldbc.py
-```
+`load-data.sh` auto-creates a `.venv` with `psycopg2-binary` on first run. LDBC raw data is
+expected at `~/repositories/ldbc_snb_data/sf{N}/` (override with `LDBC_DATA_DIR`). Useful flags:
+`--skip-preprocess` (reuse converted CSVs), `--workers N` (COPY/GIN parallelism, default 6),
+`--index-workers N` (B-tree build parallelism, default 4).
 
-LDBC raw data is expected at `~/repositories/ldbc_snb_data/sf{N}/` (see the SF3 Bootstrap doc for
-the download commands).
+The script runs these steps in order:
 
-#### Step 1 — Preprocess LDBC CSVs
+**Step 1 — Preprocess** (`scripts/preprocess_ldbc.py --sf N`, skippable). Produces comma-delimited
+CSVs under `scripts/converted/sf{N}/{vertices,edges}/` plus the `agefreighter_config.json` that
+drives the load (exactly 11 vertex + 15 edge files; the sanity check fails otherwise). Key
+transformations: Places split into `City`/`Country`/`Continent` and organisations into
+`Company`/`University`; Person `language`→`speaks` and `email` converted to JSON arrays; `KNOWS`
+stored **bidirectionally** (A→B and B→A) because queries traverse directed `(p)-[:KNOWS]->(friend)`.
 
-```bash
-cd ~/repositories/GraphBenchmarking/ldbc_snb_benchmark
-python3 preprocess_ldbc.py --sf 3   # replace 3 with 0.1, 1, 10, 100, 300, 1000
-
-# Sanity check
-ls converted/sf3/vertices/ | wc -l   # must be 11
-ls converted/sf3/edges/ | wc -l      # must be 15
-ls converted/sf3/agefreighter_config.json
-```
-
-This produces comma-delimited CSVs under `converted/sf{N}/vertices/` and `converted/sf{N}/edges/`,
-plus an `agefreighter_config.json` that drives the load. Key transformations applied:
-- Places split into `City`, `Country`, `Continent`; organisations split into `Company`, `University`
-- Person `language` column renamed to `speaks` and converted to a JSON array (e.g. `["si","en"]`)
-- Person `email` column converted to a JSON array
-- `KNOWS` edges stored **bidirectionally** (both A→B and B→A) because AGE queries use directed
-  `(p)-[:KNOWS]->(friend)` patterns
-
-#### Step 2 — Load with the production loader
+**Step 2 — Load** (`scripts/load-production-data.py --config … --workers N`). Drops/recreates the
+graph and streams all vertices then edges via PostgreSQL `COPY`, parallelised across workers with a
+load-time `_id_map` for graphid resolution; GIN builds are deferred until all COPYs finish.
 
 > **Why not `agefreighter --source-type csv` directly?**
-> agefreighter's `format_kv()` wraps every value in double-quotes, storing all properties as
-> agtype strings — `{"id": "933", "creationDate": "1266161530447"}`. AGE queries use integer
-> literals (`MATCH (p:Person {id: 933})`), and integer `933 ≠` string `"933"` in agtype
-> containment, so every MATCH returns 0 rows. `scripts/load-production-data.py` uses the same
-> PostgreSQL COPY protocol but applies two correctness-critical transformations:
-> 1. The three columns whose Cypher comparisons have no cast wrapper — `id`, `creationDate`,
->    `joinDate` — are stored as agtype integers, not quoted strings. (Other numeric-looking
->    columns like `birthday`, `length`, `classYear`, `workFrom` stay as strings: every query
->    that compares them already wraps with `toInteger()` / `::bigint`. See
->    [`agefreighter-plan.md`](./agefreighter-plan.md) §2.1 for the derivation.)
-> 2. Empty-string fields are **omitted** rather than stored as `""`. Image posts have empty
->    `content` and `language`; text posts have empty `imageFile`. Keeping these as `""` makes
->    `coalesce(p.content, p.imageFile)` return `""` for image posts (since `""` is non-null in
->    Cypher), breaking IS2/IS4/IC2/IC7/IC9 expected results.
+> agefreighter's `format_kv()` quotes every value, storing all properties as agtype strings —
+> `{"id": "933", …}`. Queries use integer literals (`MATCH (p:Person {id: 933})`), and `933 ≠`
+> `"933"` under agtype containment, so every MATCH returns 0 rows. `load-production-data.py` uses
+> the same COPY protocol but applies two correctness-critical transforms:
+> 1. Columns compared without a cast wrapper — `id`, `creationDate`, `joinDate`, plus derived
+>    `birthMonth`/`birthDay` (for IC10) — are stored as agtype integers. Others (`birthday`,
+>    `length`, `classYear`, `workFrom`) stay strings: their queries already wrap `toInteger()` /
+>    `::bigint`. See [`agefreighter-plan.md`](./agefreighter-plan.md) §2.1.
+> 2. Empty-string fields are **omitted**, not stored as `""`, so `coalesce(p.content, p.imageFile)`
+>    resolves correctly for image vs. text messages (IS2/IS4/IC2/IC7/IC9).
 
-```bash
-export CONNECTION_STRING="postgresql://user:pass@host:5432/dbname"
-cd ~/repositories/ldbc_snb_interactive_v1_impls/age
+**Step 3 — Indexes** (`scripts/dispatch-indexes.py --sql create-indexes.sql --workers N`). Splits
+`create-indexes.sql` by table and builds each group in parallel with per-session
+`maintenance_work_mem`. The inventory (full detail in [`queries/INDEXES.md`](./queries/INDEXES.md)):
+- **GIN `properties`** on 6 labels only — `Person, Forum, Tag, City, Company, University`. AGE
+  compiles map-form `MATCH (n:Label {id:X})` to `properties @> '{"id":X}'` (containment), which
+  needs `gin_agtype_ops`.
+- **Functional B-trees on `Post`/`Comment`** — `id` and `creationDate`, bound by the WHERE-form
+  anchor `MATCH (n) WHERE n.id=X`. These labels are deliberately **not** GIN-indexed: GIN over
+  their `properties` tokenizes free-text `content`/`imageFile` into multi-GB indexes (the SF100
+  disk blocker).
+- **B-trees on edge `start_id`/`end_id`** (15 edge labels × 2) — adjacency for every multi-hop
+  pattern — and on each label's `id` graphid.
 
-python3 scripts/load-production-data.py \
-  --config ~/repositories/GraphBenchmarking/ldbc_snb_benchmark/converted/sf3/agefreighter_config.json \
-  --graph-name ldbc_snb
-```
+**Step 3b** applies `denormalize-schema.sql` (now DROP + targeted `ANALYZE` only — no denorm
+columns remain post-Milestone-A). **Step 3c** drops the load-time `_id_map`. A full `VACUUM` is
+skipped (Step 3b's ANALYZE covers a fresh, dead-tuple-free load).
 
-This drops and recreates the graph, loads all vertices via COPY, creates GIN indexes, then loads
-all edges via COPY — in that order.
-
-#### Step 3 — Create query-performance indexes
-
-```bash
-export CONNECTION_STRING="postgresql://user:pass@host:5432/dbname"
-psql "$CONNECTION_STRING" -f scripts/create-indexes.sql
-```
-
-`create-indexes.sql` adds:
-- **GIN on `properties`** (idempotent; required for dev load path too): AGE compiles
-  `MATCH (n:Label {id: X})` to `properties @> '{"id":X}'::agtype` (containment), which requires
-  GIN with `gin_agtype_ops` — B-tree on extracted values cannot serve this operator.
-- **B-tree on extracted `creationDate`**: range filters (`WHERE msg.creationDate < $maxDate`) in IC2, IC3, IC4, IC7, IC9.
-- **B-tree on extracted `name`**: equality filters on Tag, TagClass, Country names in IC3–IC6, IC11.
-- **B-tree on edge `start_id`/`end_id`** (idempotent): adjacency traversal for all multi-hop patterns.
-
-#### Step 4 — Vacuum, analyze, and snapshot
-
-```bash
-export CONNECTION_STRING="postgresql://user:pass@host:5432/dbname"
-bash scripts/vacuum-analyze.sh
-bash scripts/snapshot-database.sh
-```
-
-The snapshot is required before validation or benchmark runs because IU operations mutate the
-graph — see [Snapshot and Restore](#snapshot-and-restore) below.
+**Step 5 — Snapshot** (`scripts/snapshot-database.sh`). Required before validation/benchmark runs
+because IU operations mutate the graph — see [Snapshot and Restore](#snapshot-and-restore) below.
 
 ## Snapshot and Restore
 
@@ -336,15 +294,16 @@ converts `java.util.Date` → `Long.toString(date.getTime())`. Queries use numer
 WHERE msg.creationDate >= $startDate AND msg.creationDate < $endDate
 ```
 
-### Pattern predicates not supported
+### Pattern predicates: bare form unsupported, `EXISTS { }` is supported
 
-Apache AGE 1.6.0 does not support pattern expressions in `WHERE` or `CASE WHEN`:
+Apache AGE 1.6.0 does not accept a **bare** pattern expression as a boolean in `WHERE` / `CASE WHEN`:
 ```cypher
 -- NOT supported in AGE:
 WHERE NOT (p)-[:KNOWS]-(friend)
 CASE WHEN (a)-[:REL]->(b) THEN ...
 ```
-These are rewritten using `OPTIONAL MATCH` + null checks, or explicit MATCH + property filters.
+Rewrite these as `OPTIONAL MATCH` + null checks, or as an `EXISTS { MATCH … }` subquery — the
+subquery form **is** supported and is how IC10 does its tag-overlap semi-join inline in Cypher.
 
 ### `agtype` aggregation
 
