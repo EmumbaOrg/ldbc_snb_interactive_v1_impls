@@ -128,9 +128,9 @@ load-time `_id_map` for graphid resolution; GIN builds are deferred until all CO
 - **B-trees on edge `start_id`/`end_id`** (15 edge labels × 2) — adjacency for every multi-hop
   pattern — and on each label's `id` graphid.
 
-**Step 3b** applies `denormalize-schema.sql` (now DROP + targeted `ANALYZE` only — no denorm
-columns remain post-Milestone-A). **Step 3c** drops the load-time `_id_map`. A full `VACUUM` is
-skipped (Step 3b's ANALYZE covers a fresh, dead-tuple-free load).
+**Step 3b** applies `post-load-finalize.sql` (targeted `ANALYZE` only — all denorm columns and
+side tables were retired post-Milestone-A). **Step 3c** drops the load-time `_id_map`. A full
+`VACUUM` is skipped (Step 3b's ANALYZE covers a fresh, dead-tuple-free load).
 
 **Step 5 — Snapshot** (`scripts/snapshot-database.sh`). Required before validation/benchmark runs
 because IU operations mutate the graph — see [Snapshot and Restore](#snapshot-and-restore) below.
@@ -163,10 +163,15 @@ new schema OID — it patches `ag_catalog.ag_graph` and `ag_catalog.ag_label` to
 
 ### Local end-to-end (recommended)
 
+> **Prerequisite (fresh checkout):** fetch the official LDBC data first —
+> `bash scripts/download-ldbc-data.sh --sf 3` downloads, extracts, and verifies the
+> graph, substitution params, and validation oracle into `age/datasets/`. The loaders
+> below read from there; they do not download.
+
 ```bash
 cd age
 
-# First run: load data, generate params, restore, then validate
+# First run: load data, restore, then validate
 bash scripts/run-local-validation.sh --load
 
 # Subsequent runs (skip load if data already loaded):
@@ -174,9 +179,9 @@ bash scripts/run-local-validation.sh
 ```
 
 This script:
-1. Generates `test-data/validation_params.csv` using the current implementation
-2. Restores the snapshot (resets IU mutations from step 1)
-3. Runs `validate_database` against the generated params
+1. Restores the snapshot (clean state for `validate_database`)
+2. Runs `validate_database` against the official LDBC validation params
+   (downloaded; `validate-local.properties` points at the `validation_params` CSV)
 
 ### Manual
 

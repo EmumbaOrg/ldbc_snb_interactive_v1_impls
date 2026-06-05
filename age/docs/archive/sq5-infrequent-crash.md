@@ -3,7 +3,7 @@
 ## Symptom
 
 During benchmark runs (`mode=execute_benchmark`, e.g. via `driver/benchmark.sh
-driver/benchmark-local-10k.properties`), the workload occasionally crashes with:
+driver/benchmark-20k-5kwarmup.properties`), the workload occasionally crashes with:
 
 ```
 java.lang.ClassCastException: class java.util.ArrayList cannot be cast to class

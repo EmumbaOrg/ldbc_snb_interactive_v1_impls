@@ -56,7 +56,7 @@ Hardware scaling rationale:
 | `shared_buffers` | **64 GB** | 25% of RAM rule. AGE label tables + GIN indexes are large (HAS_TAG = ~3.5B rows at SF1000); 64 GB covers the hot working set so IC reads don't hit OS cache. |
 | `effective_cache_size` | **192 GB** | 75% of RAM. Planner hint that the OS page cache is large → encourages index scans over Seq Scans for cold paths. |
 | `work_mem` | **256 MB** | Per-sort/hash unit. With ~50-100 concurrent active queries × ~3 work_mem allocations each (sorts, hashes, materialize) = up to ~75 GB worst case. Leaves headroom over shared_buffers. Do not raise without measuring concurrent peak. |
-| `maintenance_work_mem` | **8 GB** | For ANALYZE + index builds. Bigger speeds up `denormalize-schema.sql` runs and `pg_restore` index rebuilds noticeably. |
+| `maintenance_work_mem` | **8 GB** | For ANALYZE + index builds. Bigger speeds up `post-load-finalize.sql` ANALYZE and `pg_restore` index rebuilds noticeably. |
 
 ## I/O — NVMe assumptions
 

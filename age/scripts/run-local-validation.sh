@@ -2,11 +2,13 @@
 # End-to-end local validation against a local AGE/PostgreSQL instance.
 # Run from the age/ directory after building the JAR.
 #
+# Validation parameters come from the official LDBC download (validate-local.properties
+# points at the downloaded validation_params CSV) — we do not generate them locally.
+#
 # Steps:
 #   1. (Optional) Load test data: pass --load to trigger load-test-data.sh
-#   2. Generate validation_params.csv using our implementation
-#   3. Restore snapshot (resets IU mutations from step 2)
-#   4. Run validate_database against the generated params
+#   2. Restore snapshot (clean state for validate_database)
+#   3. Run validate_database against the official validation params
 #
 # Usage:
 #   cd age
@@ -24,7 +26,6 @@ export CONNECTION_STRING="${CONNECTION_STRING:-postgresql://postgres:postgres@lo
 SNAPSHOT_FILE="${SNAPSHOT_FILE:-/tmp/ldbc_snb_snapshot.dump}"
 
 LOCAL_VALIDATE="${AGE_DIR}/driver/validate-local.properties"
-LOCAL_CREATE_PARAMS="${AGE_DIR}/driver/create-validation-parameters-local.properties"
 
 # ---- Parse connection details from CONNECTION_STRING -------------------------
 # Expected format: postgresql://user:pass@host:port/dbname
@@ -51,7 +52,6 @@ fill_local_props() {
 }
 
 fill_local_props "${LOCAL_VALIDATE}"
-fill_local_props "${LOCAL_CREATE_PARAMS}"
 
 # ---- Optionally load test data -----------------------------------------------
 if [[ "${1:-}" == "--load" ]]; then
@@ -67,10 +67,9 @@ fi
 
 cd "${AGE_DIR}"
 
-# ---- Step 0: Restore snapshot (reset any IU mutations from prior runs) -------
-# create_validation must run against the same clean state validate_database will see,
-# otherwise Update operations re-create entities (CREATE, not MERGE) and the captured
-# expected results contain duplicates that the post-restore validate_database can't reproduce.
+# ---- Step 1: Restore snapshot (clean state for validate_database) ------------
+# validate_database replays Update operations against the live DB, so it must start
+# from a clean snapshot — otherwise re-runs accumulate duplicate entities.
 if [[ ! -f "${SNAPSHOT_FILE}" ]]; then
   echo "ERROR: Snapshot not found at ${SNAPSHOT_FILE}." >&2
   echo "       Run with --load first, or run scripts/snapshot-database.sh manually." >&2
@@ -80,18 +79,7 @@ echo ""
 echo "=== Pre-validation: restoring snapshot ==="
 bash scripts/restore-database.sh
 
-# ---- Step 1: Generate validation_params.csv ----------------------------------
-echo ""
-echo "=== Generating validation_params.csv ==="
-java -cp "${JAR}" org.ldbcouncil.snb.driver.Client \
-  -P "${LOCAL_CREATE_PARAMS}"
-
-# ---- Step 2: Restore snapshot (reset IU mutations) ---------------------------
-echo ""
-echo "=== Restoring snapshot ==="
-bash scripts/restore-database.sh
-
-# ---- Step 3: Validate --------------------------------------------------------
+# ---- Step 2: Validate --------------------------------------------------------
 echo ""
 echo "=== Running validation ==="
 java -cp "${JAR}" org.ldbcouncil.snb.driver.Client \

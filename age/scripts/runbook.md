@@ -161,8 +161,16 @@ For each scale factor you need two separate datasets:
 
 ### Where to get the data
 
+> **One-shot:** `bash scripts/download-ldbc-data.sh --sf <N>` (default SF3) downloads,
+> extracts, and verifies the graph, substitution params, *and* the validation-params
+> oracle (§11.1) into `age/datasets/`. It does not touch the DB — run
+> `scripts/load-data.sh --sf <N>` afterwards to build the snapshot. The manual steps
+> below remain as reference / for unsupported scale factors.
+
 LDBC publishes pre-generated datasets for all supported scale factors.
-Download from: https://github.com/ldbc/ldbc_snb_interactive_v2_impls/blob/main/docs/datasets.md
+Catalogue: https://ldbcouncil.org/benchmarks/snb/datasets/ — the v1 artifacts live under
+`https://datasets.ldbcouncil.org/snb-interactive-v1/` (graph) and
+`.../snb-interactive-v1-parameters/` (substitution params).
 
 Each scale factor is distributed as two separate archives:
 - **Social network graph** — `social_network-sf<N>-CsvComposite-LongDateFormatter.tar.zst`
@@ -239,7 +247,7 @@ Three profiles are checked in under `driver/`:
 |---|---|---|
 | `benchmark.properties` | HorizonDB / production | Full Horizon runs on Azure |
 | `benchmark-local.properties` | Local PostgreSQL, **SF3**, 5K ops | Default local SF3 perf run |
-| `benchmark-local-10k.properties` | Local PostgreSQL, **SF3**, 10K ops + 1K warmup | Quick local smoke / iteration |
+| `benchmark-20k-5kwarmup.properties` | Local PostgreSQL, **SF3**, 20K ops + 5K warmup | Medium local run / smoke (baseline/gate profile) |
 
 Pick the one matching your target and edit the host-specific fields below.
 
@@ -269,8 +277,8 @@ Pre-configured for `localhost:5432/postgres` and the SF3 paths under
 `warmup=1000`. Only override the endpoint/user/password if your local
 PostgreSQL isn't on the default port/credentials.
 
-For a quick smoke run, use `benchmark-local-10k.properties` instead
-(`operation_count=10000`, same threads).
+For a quick smoke run, use `benchmark-20k-5kwarmup.properties` instead
+(`operation_count=20000`, `warmup=5000`, same threads).
 
 ### Key notes (all profiles)
 
@@ -308,9 +316,9 @@ bash scripts/restore-database.sh
 bash driver/benchmark.sh driver/benchmark-local.properties \
   2>&1 | tee results/bench-sf3-$(date +%Y%m%d-%H%M%S).log
 
-# …or the 10K-op smoke variant
-bash driver/benchmark.sh driver/benchmark-local-10k.properties \
-  2>&1 | tee results/bench-sf3-10k-$(date +%Y%m%d-%H%M%S).log
+# …or the 20K-op smoke variant
+bash driver/benchmark.sh driver/benchmark-20k-5kwarmup.properties \
+  2>&1 | tee results/bench-sf3-20k-$(date +%Y%m%d-%H%M%S).log
 ```
 
 ### Option B — raw java invocation (production / HorizonDB)
@@ -394,6 +402,9 @@ reference implementation and is the authoritative oracle.
 
 ### 11.1 One-time: download the official validation params
 
+> `scripts/download-ldbc-data.sh` already pulls this oracle alongside the dataset.
+> The manual steps below are for fetching it on its own.
+
 Distributed as a single tarball covering SF0.1 → SF10 (~195 MB compressed,
 ~1.6 GB extracted):
 
@@ -460,7 +471,7 @@ Same procedure: restore the snapshot on the target DB, then
 | Load data (first time) | `bash scripts/load-data.sh --sf 3` |
 | Restore snapshot | `bash scripts/restore-database.sh` |
 | Run benchmark — local SF3 | `bash driver/benchmark.sh driver/benchmark-local.properties` |
-| Run benchmark — local SF3 (10K smoke) | `bash driver/benchmark.sh driver/benchmark-local-10k.properties` |
+| Run benchmark — local SF3 (20K smoke) | `bash driver/benchmark.sh driver/benchmark-20k-5kwarmup.properties` |
 | Run benchmark — HorizonDB | `bash driver/benchmark.sh driver/benchmark.properties` |
 | Run validation — local SF3 (LDBC oracle) | `bash driver/validate.sh driver/validate-local.properties` |
 | Run validation — HorizonDB | `bash driver/validate.sh driver/validate.properties` |

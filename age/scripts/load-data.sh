@@ -112,9 +112,9 @@ time "${PY}" "${SCRIPT_DIR}/dispatch-indexes.py" \
     --maintenance-work-mem "8GB"
 
 # ---------------------------------------------------------------------------
-echo "=== Step 3b: Applying denormalised schema (DDL + SQL-driven backfills) ==="
+echo "=== Step 3b: Post-load finalize (ANALYZE core tables) ==="
 time psql "$CONNECTION_STRING" \
-    -f "${SCRIPT_DIR}/denormalize-schema.sql" \
+    -f "${SCRIPT_DIR}/post-load-finalize.sql" \
     2>&1 | grep -v NOTICE || true
 
 # ---------------------------------------------------------------------------
@@ -135,8 +135,8 @@ print("  _id_map dropped.")
 PYEOF
 
 # ---------------------------------------------------------------------------
-# Step 4 (VACUUM ANALYZE) intentionally omitted: denormalize-schema.sql
-# section 7 already runs targeted ANALYZE on every table it touches, and a
+# Step 4 (VACUUM ANALYZE) intentionally omitted: post-load-finalize.sql
+# already runs targeted ANALYZE on every table it touches, and a
 # fresh load produces zero dead tuples so VACUUM has nothing to reclaim. The
 # full-DB `VACUUM (ANALYZE, VERBOSE)` scanned ~150M heap rows at SF10 for no
 # new information (~15-30 min wasted). restore-database.sh still runs

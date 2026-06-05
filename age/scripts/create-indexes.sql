@@ -159,10 +159,8 @@ CREATE INDEX IF NOT EXISTS idx_university_graphid ON ldbc_snb."University" (id);
 -- range predicates. Worth trying on Comment.creationDate / Post.creationDate
 -- if those queries (IC2/IC9 etc.) ever flag at SF100+ in profiling.
 -- ---------------------------------------------------------------------------
--- Native (end_id, join_date) B-tree index moved to denormalize-schema.sql
--- (after the join_date BIGINT ALTER+backfill). create-indexes.sql runs
--- BEFORE denormalize-schema.sql in load-data.sh, so the column doesn't yet
--- exist at this point.
+-- The (end_id, join_date) HAS_MEMBER B-tree index is retired (IC5/IU5 read
+-- joinDate from Cypher RETURN directly); fresh loads never create it.
 
 -- Date predicates on Comment / Post for IC2/IC4-style date-range filters in Cypher.
 -- These agtype-access-operator indexes match `comment.creationDate <= $maxDate` /

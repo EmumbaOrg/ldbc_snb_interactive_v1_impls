@@ -1,5 +1,26 @@
 # AGE Query Authoring & Review Guide
 
+This is the **canonical source of truth** for AGE query rules and standards. The
+`age-query-planner`, `age-query-implementer`, `age-query-reviewer`, and
+`age-results-analyst` agents all defer to this file — they carry only the critical
+guardrails inline and point here for the full checklist, support matrix, structural
+limits, deviations, and cross-impl references. Edit AGE rules **here**, not in the agents.
+
+## Hard Rules (canonical — every agent and query complies)
+
+1. **No pure SQL for graph operations.** Every query flows through `cypher(...)` —
+   Cypher-only, or hybrid (Cypher traversal + outer SQL for aggregation / `UNION ALL` /
+   complex `ORDER BY`/`LIMIT`). Detail: "Implementation Style" below.
+2. **KNOWS is always directed** — `(a)-[:KNOWS]->(b)`, never `-[:KNOWS]-`. Detail:
+   checklist §2 + AGE-QUIRKS §11.
+3. **Only AGE 1.6 supported constructs.** Detail: "AGE 1.6 Cypher Support" below.
+4. **SF100–SF1000 is the design target, not SF3.** Reject tactics that help SF≤10 at the
+   cost of SF100+. Detail: "Target System" + checklist §12.
+5. **No new denormalization unless a peer impl maintains the same structure** — surface a
+   slow canonical query upstream, don't mask it. Detail: "Cross-Implementation Reference".
+6. **All DB writes are local-only** — never run write/benchmark/load/restore against shared
+   Horizon DB; read-only `EXPLAIN` against Horizon is the only permitted remote op.
+
 ## Persona
 Database expert with deep experience in PostgreSQL/AGE and other graph DBs (Neo4j, GraphDB, TigerGraph).
 
@@ -19,7 +40,6 @@ Every query goes through the AGE/Cypher path. Two tiers, in priority:
 
 **Pure SQL is forbidden.** The main query must always flow through Cypher. If a tactic seems to require eliminating the `cypher()` call, find an index or rewrite that lets Cypher do the traversal instead. As of Milestone A there are **no pure-SQL holdouts** — IS6 was migrated to the natural VLE Cypher form (disabled pending the AGE VLE fix).
 
-**Scope of the no-direct-read rule**: applies to runtime query files in `age/queries/`. Deploy-time tooling in `age/scripts/` (one-off migrations) is exempt. `denormalize-schema.sql` now only issues idempotent DROPs + ANALYZE (all denorm/side tables retired — see SCHEMA.md).
 
 ## Companion Documents (read first)
 
@@ -101,6 +121,8 @@ Implementations: `interactive-complex-N.sql`, `interactive-short-N.sql`, `intera
 | IC14 | Returns `[]` | No `allShortestPaths()` |
 | All reads | `UNION ALL` Comment + Post branches | No polymorphic `Message` label |
 | All dates | Stored/compared as epoch ms (bigint) | No native DateTime type |
+| IS6 | DISABLED (natural VLE Cypher form, not a SQL fallback) | AGE VLE crash pending upstream fix |
+| IS2 | Placeholder for `originalPost*` fields | VLE / Milestone B pending |
 
 ## AGE 1.6 Cypher Support
 
