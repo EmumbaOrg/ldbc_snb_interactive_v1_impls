@@ -43,7 +43,12 @@ flowchart TD
     CHK -->|no — fails / regresses| ANAF["Analyst<br/>interprets the failure"]
     ANAF --> PLAN
     CHK -->|yes| ANAS["Analyst writes<br/>success report"]
-    ANAS --> DONE([Done])
+    ANAS --> REFQ{touched op<br/>improved meaningfully?}
+    REFQ -->|no| DONE([Done])
+    REFQ -->|yes| ASKHUMAN([You: refresh<br/>baseline?])
+    ASKHUMAN -->|no| DONE
+    ASKHUMAN -->|yes| REFRESH["Main session runs<br/>capture-baseline.sh + commits"]
+    REFRESH --> DONE
 ```
 
 ## What each one does (one line)
@@ -51,7 +56,7 @@ flowchart TD
 - **Planner** — designs the fix and writes it down as a plan. Never touches code itself.
 - **Implementer** — does exactly what an approved plan says, then self-gates it (build, spot-check, validation, benchmark) before handing off to review.
 - **Reviewer** — checks a query against the spec and flags anything wrong. Suggests, never edits.
-- **Analyst** — reads the final-gate results: on failure, explains what's slow or broken (→ planner); on success, writes the success report that closes the change.
+- **Analyst** — reads the final-gate results: on failure, explains what's slow or broken (→ planner); on success, writes the success report; if a touched op improved meaningfully, asks the main session to get your approval before refreshing the baseline.
 - **age-bench** (skill) — the thing that actually runs the validation and benchmark numbers.
 
 ## The one rule that decides where things go
@@ -68,4 +73,7 @@ Every failure in the pipeline is one of two kinds, and that kind decides where i
 
 So a change only reaches `Done` after it survives three gates in order: the implementer's own
 self-gate, a clean review, and the main-session 10K validation + 50K benchmark with no
-regression — at which point the analyst writes the success report that closes it out.
+regression — at which point the analyst writes the success report that closes it out. If the
+change improved a touched op meaningfully, the analyst flags it and the main session asks you
+whether to refresh the baseline before closing; refreshing is opt-in, never automatic, so the
+baseline only ratchets when you say so.
