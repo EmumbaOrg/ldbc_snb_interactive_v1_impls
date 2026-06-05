@@ -199,11 +199,39 @@ the approved plan file the change implemented (for the latency target it promise
    ```
    Report only **measured** numbers from the gate run — never projected or speculative.
 
-3. **Close it.** State clearly in your return message that the gate passed and the change is
-   complete, citing the report path. Recommend the main session refresh
-   `baselines/bench-sf3-baseline.json` (via `scripts/capture-baseline.sh`) if this change
-   improved a touched op, so future deltas measure against the new performance. You are
-   read-only on code/baselines — you recommend the refresh, you do not run it.
+3. **Decide if a baseline refresh should be proposed.** Compute the per-op deltas vs the
+   current baseline. Propose a refresh only if **at least one touched op improved meaningfully**:
+   mean drop ≥ 10% AND p99 drop ≥ 5% (beyond run-to-run noise). A wash or sub-noise win is NOT
+   grounds — do not propose a refresh that would ratchet the baseline against ordinary jitter.
+   Improvements on **non-touched** ops alone are suspicious (more likely noise than real signal) —
+   surface them as an observation, not a refresh trigger.
+
+4. **Close it.** State clearly in your return message that the gate passed and the change is
+   complete, citing the report path. You are read-only on baselines — you do NOT run
+   `scripts/capture-baseline.sh` yourself.
+
+   **If a refresh is warranted (step 3 trigger met)**, your return message MUST instruct the
+   main session to ask the human for permission before refreshing. Use this exact phrasing so
+   the main session knows to invoke its `AskUserQuestion` tool (subagents cannot ask the user
+   directly):
+
+   ```
+   BASELINE REFRESH — HUMAN APPROVAL REQUIRED
+   Main session: please ask the user whether to refresh baselines/bench-sf3-baseline.json.
+   Improvement summary (this is what they need to decide):
+     - <op A>: mean <baseline>→<new> ms (-X%), p99 <baseline>→<new> ms (-Y%)
+     - <op B>: ...
+   If approved, run from age/:
+     CONNECTION_STRING=postgresql://postgres:postgres@localhost:5432/postgres \
+       scripts/capture-baseline.sh
+   Then commit the updated baselines/bench-sf3-baseline.json.
+   If declined, leave the baseline as-is — the change is still signed off and closed.
+   ```
+
+   Append the same block at the bottom of the success report file so the decision and its
+   numbers are persisted alongside the gate result. If no refresh is warranted, state "No
+   baseline refresh proposed — improvements are within noise or only on non-touched ops" and
+   write nothing under that heading in the report.
 
 ---
 
