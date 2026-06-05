@@ -2,11 +2,10 @@
 -- Hybrid: two Cypher arms (1-hop and 2-hop friends) each compute per-(friend, forum) post count
 -- inline. Outer SQL sums pc per forum and returns top-20 by postCount DESC, forum.id ASC.
 --
--- Milestone A 2026-05-30: ForumMemberPostCount retired. Count computed inline.
 -- CORRECTNESS: the count MUST use staged `WITH DISTINCT friend, forum` BEFORE
 -- `count(post)`. Without staging, a 2-hop friend reachable through K intermediaries
 -- appears in K pre-aggregation rows, inflating count(post) by K×. Verified at SF3:
--- staged form gives correct results (matching prior FMPC values); naive form overcounts.
+-- staged form gives correct results; naive form overcounts.
 --
 -- Shape per arm:
 --   MATCH ...friends... MATCH (forum:Forum)-[m:HAS_MEMBER]->(friend) WHERE m.joinDate > $minDate
@@ -17,7 +16,7 @@
 --
 -- Directed `-[:KNOWS]->` per AGE-QUIRKS §11; IU8 stores both directions.
 -- §14 compliance: Cypher RETURN of forum.title, forum.id scalar properties —
--- the natural peer pattern (Phase A: HasMemberSide and ForumSide retired).
+-- the natural peer pattern.
 
 WITH per_friend_forum AS MATERIALIZED (
   SELECT DISTINCT

@@ -8,9 +8,9 @@
 -- isNew flag: `NOT EXISTS { MATCH (p)-[:KNOWS]->(liker) }` instead of an OPTIONAL MATCH +
 -- `knows IS NULL` projection. The OPTIONAL MATCH variant forces the planner to carry
 -- `p` and `knows` through the entire RETURN row stream and to compute the (p)-[:KNOWS]
--- traversal once per liker even though we only need a boolean. Measured 2026-05-15 SF3:
--- replacing OPTIONAL MATCH with NOT EXISTS gave a 50-200× speedup (mean ~124× across 5
--- sample personIds) with byte-identical output. AGE 1.6 EXISTS subqueries plan as
+-- traversal once per liker even though we only need a boolean. Replacing OPTIONAL
+-- MATCH with NOT EXISTS gives a 50-200× speedup with byte-identical output. AGE 1.6
+-- EXISTS subqueries plan as
 -- short-circuit semi-joins (AGENTS.md §"AGE 1.6 Cypher Constructs — EXISTS").
 
 SELECT personId, personFirstName, personLastName, likeCreationDate, commentOrPostId,

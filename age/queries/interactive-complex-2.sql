@@ -3,7 +3,6 @@
 -- UNION ALL arms — AGE has no polymorphic Message label, AGE-QUIRKS §3).
 -- Outer SQL takes global top-20 by creationDate DESC, id ASC.
 --
--- Milestone A 2026-05-30: MessageByCreator retired. Canonical Cypher shape.
 -- Each arm does: MATCH (p)-[:KNOWS]->(friend) MATCH (friend)<-[:HAS_CREATOR]-(m:Type)
 -- WHERE m.creationDate <= $maxDate RETURN ... ORDER BY creationDate DESC, id ASC LIMIT 20.
 -- Inner LIMIT 20 per arm limits rows before outer sort (AGE still materialises fully,

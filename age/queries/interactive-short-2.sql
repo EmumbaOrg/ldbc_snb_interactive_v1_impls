@@ -2,17 +2,13 @@
 -- Hybrid: two Cypher calls (Comment arm + Post arm) traverse Person<-HAS_CREATOR-msg.
 -- AGE has no polymorphic Message label (AGE-QUIRKS §3): two arms required.
 --
--- Milestone A 2026-05-30: MessageByCreator and CommentRootPost retired.
---
--- Root-post lookup (originalPostId / originalPostAuthorId):
---   MILESTONE A PLACEHOLDER — root-post resolution via REPLY_OF*0.. is
---   Milestone B (VLE). REPLY_OF*0.. crashes AGE 1.6 backend (confirmed this
---   session). Pure-SQL recursion over AGE label tables is forbidden (CLAUDE.md).
---   For Milestone A: returns the message's own id as originalPostId and
---   the message's own creator as originalPostAuthorId. This breaks validation
---   for Comment rows (which have a different root Post), so IC-bucket will show
---   IS2 as incorrect in the validate run. Reported as expected — do not treat
---   as a regression requiring a fix in Milestone A.
+-- Root-post lookup (originalPostId / originalPostAuthorId) — PLACEHOLDER:
+--   Correct resolution needs a REPLY_OF*0.. variable-length path, which crashes
+--   the AGE 1.6 backend (gated on the incoming VLE fix). Pure-SQL recursion over
+--   AGE label tables is forbidden (CLAUDE.md). As a placeholder this returns the
+--   message's own id as originalPostId and its own creator as originalPostAuthorId.
+--   That breaks validation for Comment rows (which have a different root Post), so
+--   IS2 shows as incorrect in the validate run — expected, NOT a regression.
 --
 -- Author name: fetched via GIN-bound scalar LATERAL subquery against Person
 -- (permitted by §14 case (b): GIN containment on `properties @> {"id": X}`).
@@ -54,8 +50,8 @@ SELECT
   ut.biz_id_bi::ag_catalog.agtype                                               AS messageId,
   ut.content_agt                                                                 AS messageContent,
   ut.cdate_bi::ag_catalog.agtype                                                 AS messageCreationDate,
-  -- Milestone A placeholder: returns message's own id (not root post id).
-  -- Milestone B will replace with REPLY_OF*0.. traversal once VLE is stable.
+  -- Placeholder: returns message's own id (not root post id); will use a
+  -- REPLY_OF*0.. traversal once the AGE VLE fix lands (see header).
   ut.biz_id_bi::ag_catalog.agtype                                               AS originalPostId,
   $personId::ag_catalog.agtype                                                   AS originalPostAuthorId,
   ag_catalog.text_to_agtype(author.first_name)                                   AS originalPostAuthorFirstName,

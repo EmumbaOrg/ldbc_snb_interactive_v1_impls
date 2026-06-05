@@ -1,11 +1,5 @@
 -- LdbcUpdate6AddPost — create a Post vertex with HAS_CREATOR/CONTAINER_OF/IS_LOCATED_IN/HAS_TAG edges.
 -- Cypher-only: single CREATE + UNWIND call. No side tables maintained.
---
--- Milestone A 2026-05-30: ForumMemberPostCount and MessageByCreator retired.
--- IC5 computes post counts inline; IC2/IC9 use canonical Cypher UNION arms.
--- No side-table writes remain, so Call 2 is dropped. IU6 is now a single call.
---
--- Post.forum_id retired 2026-05-14; Post.creator_id retired 2026-05-15.
 
 -- Call 1: CREATE Post + edges. count(*) always returns exactly 1 row.
 SELECT * FROM cypher('$graphName', $$

@@ -8,10 +8,6 @@
 --         THEN post END)
 -- Both EXISTS{} and count(DISTINCT CASE WHEN … END) are AGE-1.6 supported per CLAUDE.md.
 -- Outer SQL is a thin cast/format wrapper only — no JOIN or aggregate against any AGE label table.
---
--- Milestone A 2026-05-30: MessageByCreator retired.
--- Fix 2026-06-01: removed HAS_TAG ⋈ HAS_INTEREST JOIN from outer SQL (§14 violation);
---   tag-overlap now computed inside Cypher via EXISTS{} semi-join.
 
 SELECT
   (friend_id::text)::bigint::ag_catalog.agtype                                  AS personId,

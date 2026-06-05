@@ -4,7 +4,6 @@
 -- deduplicates by message id (friends reachable by both 1-hop and 2-hop
 -- must not appear twice), then takes global top-20.
 --
--- Milestone A 2026-05-30: MessageByCreator retired. Canonical Cypher shape.
 -- Four arms needed because: (a) AGE has no polymorphic Message label
 -- (AGE-QUIRKS §3); (b) friend de-dup requires UNION (set-dedup) over
 -- 1-hop ∪ 2-hop, but a LIMIT inside a Cypher UNION is unsupported in AGE
@@ -16,7 +15,7 @@
 --   ORDER BY m.creationDate DESC, m.id ASC LIMIT 20
 -- Dedup on message_id in outer SQL (a message has exactly one creator).
 --
--- 2026-05-31 OOM FIX: per-arm `ORDER BY ... LIMIT 20` (single-query LIMIT, not
+-- Per-arm `ORDER BY ... LIMIT 20` (single-query LIMIT, not
 -- a Cypher-UNION LIMIT, so supported) is mandatory, not an optimization.
 -- AGE #1000: cypher() materializes its entire match set in backend memory
 -- before the outer SQL can apply LIMIT. For a high-degree person the 2-hop arm

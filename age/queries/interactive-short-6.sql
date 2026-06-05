@@ -1,6 +1,6 @@
 -- LdbcShortQuery6MessageForum — return the containing forum and moderator for a message.
 --
--- CANONICAL VLE FORM (2026-06-01): rewritten from the prior pure-SQL RECURSIVE walk
+-- CANONICAL VLE FORM: rewritten from the prior pure-SQL RECURSIVE walk
 -- to the natural variable-length-path Cypher form, to SURFACE the AGE VLE weakness
 -- upstream (project goal: expose limitations, not hide them). See QUERY-REVIEW.md and
 -- the VLE before/after experiment.
