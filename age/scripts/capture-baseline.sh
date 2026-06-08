@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Capture the canonical SF3 benchmark baseline used by the regression gates.
 #
-# Runs the main-session final-gate benchmark profile (benchmark-local-50k by
+# Runs the main-session final-gate benchmark profile (benchmark-local-20k by
 # default) against the LOCAL database, then copies the driver's
 # results/LDBC-results.json to baselines/bench-sf3-baseline.json. Both the
-# implementer self-gate (10K) and the main-session final gate (50K) diff their
+# implementer self-gate (10K) and the main-session final gate (20K) diff their
 # runs against this one file.
 #
 # The baseline is MEASURED data — it can only be produced by running this script
@@ -20,7 +20,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PROFILE="${1:-driver/benchmark-local-50k.properties}"
+PROFILE="${1:-driver/benchmark-local-20k.properties}"
 BASELINE="${AGE_DIR}/baselines/bench-sf3-baseline.json"
 RESULTS="${AGE_DIR}/results/LDBC-results.json"
 

@@ -23,7 +23,7 @@ The core loop is a pipeline. The **planner** designs a fix; you approve it; the
 **implementer** builds it and runs its own self-gate (validation + benchmark), looping on
 itself until clean. A clean build then goes to the **reviewer**; review feedback bounces back
 to the implementer. Only once review passes does the **main session** run the big final
-quality gate through the **age-bench** skill — **10K validation + 50K benchmark**. The
+quality gate through the **age-bench** skill — **10K validation + 20K benchmark**. The
 **analyst** then interprets that result either way: if it fails or regresses, the analyst
 explains why and it goes back to the planner for a redesign; if it passes, the analyst writes
 a success report and the change is done.
@@ -38,7 +38,7 @@ flowchart TD
     T -->|yes| REV["Reviewer<br/>audits the change"]
     REV --> RV{review pass?}
     RV -->|no, feedback| IMPL
-    RV -->|yes| SKILL[/"Main session runs age-bench skill:<br/>10K validation + 50K benchmark"/]
+    RV -->|yes| SKILL[/"Main session runs age-bench skill:<br/>10K validation + 20K benchmark"/]
     SKILL --> CHK{pass & no<br/>regression?}
     CHK -->|no — fails / regresses| ANAF["Analyst<br/>interprets the failure"]
     ANAF --> PLAN
@@ -68,11 +68,11 @@ Every failure in the pipeline is one of two kinds, and that kind decides where i
   self-gate → reviewer → implementer.
 - **Approach problem** (the rewrite is wrong in principle, or it validates but regresses /
   is still too slow) → back to the **planner** for a redesign. The main-session 10K
-  validation + 50K benchmark is the gate that catches these; the analyst interprets the
+  validation + 20K benchmark is the gate that catches these; the analyst interprets the
   failure first.
 
 So a change only reaches `Done` after it survives three gates in order: the implementer's own
-self-gate, a clean review, and the main-session 10K validation + 50K benchmark with no
+self-gate, a clean review, and the main-session 10K validation + 20K benchmark with no
 regression — at which point the analyst writes the success report that closes it out. If the
 change improved a touched op meaningfully, the analyst flags it and the main session asks you
 whether to refresh the baseline before closing; refreshing is opt-in, never automatic, so the

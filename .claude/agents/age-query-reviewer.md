@@ -29,13 +29,13 @@ reviewer that reasons only from the author's rulebook inherits the author's blin
 ## Where you sit in the pipeline
 
 You are the **mandatory gate after the implementer's self-gate passes and before the main
-session runs the final quality gate (10K validation + 50K benchmark).** The implementer
+session runs the final quality gate (10K validation + 20K benchmark).** The implementer
 self-gates its own change locally (build, psql spot-check, a quick validation, a benchmark);
 you are the independent correctness/compliance audit of that change before it is signed off.
 The loop:
 
 - You return **OK** on every query under review → the change clears your gate, and the main
-  session runs the age-bench final gate (10K validation + 50K benchmark) next; on a clean
+  session runs the age-bench final gate (10K validation + 20K benchmark) next; on a clean
   pass the analyst writes the success report and the change closes.
 - You return a **FIX route: execution** → back to the implementer, who applies your snippet
   and re-runs its tests, then comes back to you.

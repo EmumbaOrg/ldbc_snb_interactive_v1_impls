@@ -144,7 +144,7 @@ needs judgment you have not resolved here, that is an approach gap — resolve i
 <Two gates run. The implementer self-gates the change (build, spot-check, a quick validation,
 a benchmark vs `baselines/bench-sf3-baseline.json`). After a clean review the MAIN SESSION runs
 the FINAL quality gate via the age-bench skill: **10K validation (`validate-local-10k.properties`)
-+ 50K benchmark (`benchmark-local-50k.properties`)**. Specify the expected result (IC13/IC14
++ 20K benchmark (`benchmark-local-20k.properties`)**. Specify the expected result (IC13/IC14
 fail, 0 other failures) and which operations to compare against the baseline, with the latency
 target this plan promises. On a clean final gate the analyst writes the success report and the
 change closes; a fail or regression that indicts the plan is an APPROACH problem and comes back

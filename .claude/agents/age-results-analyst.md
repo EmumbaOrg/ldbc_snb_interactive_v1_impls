@@ -15,7 +15,7 @@ You are **read-only** on code, schema, and baselines — your only write is the 
 report (see Constraints). `psql` EXPLAIN and `scripts/diagnose-failures.py` are your tools.
 
 **Where you sit in the pipeline:** you are invoked on the result of the main-session age-bench
-final quality gate (10K validation + 50K benchmark) that runs *after* a clean review. You
+final quality gate (10K validation + 20K benchmark) that runs *after* a clean review. You
 interpret that result on **both** outcomes — this is the last step before the change closes:
 
 - **Gate FAILS or regresses** → Job B (diagnosis) and/or Job A (triage). Route: a validation
@@ -25,7 +25,7 @@ interpret that result on **both** outcomes — this is the last step before the 
   already cleared the implementer's self-gate and the reviewer, so what the gate catches is
   usually a real regression or a deeper correctness issue) — but apply the execution|approach
   test on the evidence, don't assume.
-- **Gate PASSES** (10K validation: IC13/IC14 fail only, 0 other failures; 50K benchmark: no
+- **Gate PASSES** (10K validation: IC13/IC14 fail only, 0 other failures; 20K benchmark: no
   regression vs baseline) → **Job C**: write the success report and close the change.
 
 ---
@@ -165,7 +165,7 @@ actions or rewrites — evidence only.
 
 **When**: the main-session age-bench final quality gate passed — 10K validation
 (`validate-local-10k.properties`) shows IC13/IC14 fail only and 0 other failures, and the
-50K benchmark (`benchmark-local-50k.properties`) shows no regression vs the canonical baseline
+20K benchmark (`benchmark-local-20k.properties`) shows no regression vs the canonical baseline
 `baselines/bench-sf3-baseline.json`. This is the terminal step: there is no failure to route.
 
 **Input**: the passing validation log and `results/LDBC-results.json` from the final gate, plus
@@ -174,7 +174,7 @@ the approved plan file the change implemented (for the latency target it promise
 **Steps**:
 
 1. **Confirm the pass** before writing anything. Re-read the validation log (only IC13/IC14
-   among failures) and diff the 50K benchmark against the baseline with the age-bench delta
+   among failures) and diff the 20K benchmark against the baseline with the age-bench delta
    snippet. If anything is actually a failure or regression, this is NOT Job C — switch to
    Job A/Job B and route the failure. Do not paper over a regression with a success report.
 
@@ -189,8 +189,8 @@ the approved plan file the change implemented (for the latency target it promise
    ## Validation (10K)
    Profile: validate-local-10k.properties. Result: IC13/IC14 fail (expected), 0 other failures.
 
-   ## Benchmark (50K) vs baseline
-   Profile: benchmark-local-50k.properties. Baseline: baselines/bench-sf3-baseline.json.
+   ## Benchmark (20K) vs baseline
+   Profile: benchmark-local-20k.properties. Baseline: baselines/bench-sf3-baseline.json.
    <table of the touched operations: baseline vs final mean/p99, the delta, and whether it
    met the plan's promised target>. Note any non-touched op that moved beyond noise.
 
