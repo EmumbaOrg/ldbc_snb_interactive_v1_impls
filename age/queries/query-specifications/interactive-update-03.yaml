@@ -1,0 +1,13 @@
+workload: Updates
+operation: insert
+number: 3
+title: Add like to comment
+description: Add a *likes* **edge** to a *Comment*.
+parameters:
+  - name: personId
+    type: ID
+  - name: commentId
+    type: ID
+  - name: creationDate
+    type: DateTime
+choke_points: [9.2]

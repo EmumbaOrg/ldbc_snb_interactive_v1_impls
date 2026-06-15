@@ -1,0 +1,16 @@
+workload: Interactive
+operation: short
+number: 5
+title: Creator of a message
+description: |
+  Given a *Message* with ID `$messageId`, retrieve its author.
+parameters:
+  - name: messageId
+    type: ID
+result:
+  - name: person.id
+    type: ID
+  - name: person.firstName
+    type: String
+  - name: person.lastName
+    type: String

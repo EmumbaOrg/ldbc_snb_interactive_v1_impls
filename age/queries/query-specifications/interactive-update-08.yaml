@@ -1,0 +1,13 @@
+workload: Updates
+operation: insert
+number: 8
+title: Add friendship
+description: Add a friendship **edge** (*knows*) between two *Persons*.
+parameters:
+  - name: person1Id
+    type: ID
+  - name: person2Id
+    type: ID
+  - name: creationDate
+    type: DateTime
+choke_points: [9.2]

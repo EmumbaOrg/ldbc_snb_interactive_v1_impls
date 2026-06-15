@@ -1,0 +1,20 @@
+workload: Interactive
+operation: short
+number: 6
+title: Forum of a message
+description: |
+  Given a *Message* with ID `$messageId`, retrieve the *Forum* that contains it and the *Person* that moderates that *Forum*. Since *Comments* are not directly contained in *Forums*, for *Comments*, return the *Forum* containing the original *Post* in the thread which the *Comment* is replying to.
+parameters:
+  - name: messageId
+    type: ID
+result:
+  - name: forum.id
+    type: ID
+  - name: forum.title
+    type: Long String
+  - name: moderator.id
+    type: ID
+  - name: moderator.firstName
+    type: String
+  - name: moderator.lastName
+    type: String

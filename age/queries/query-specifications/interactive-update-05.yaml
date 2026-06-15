@@ -1,0 +1,13 @@
+workload: Updates
+operation: insert
+number: 5
+title: Add forum membership
+description: Add a *Forum* membership **edge** (*hasMember*) to a *Person*.
+parameters:
+  - name: personId
+    type: ID
+  - name: forumId
+    type: ID
+  - name: creationDate
+    type: DateTime
+choke_points: [9.1, 9.2]

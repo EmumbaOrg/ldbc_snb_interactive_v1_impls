@@ -1,0 +1,26 @@
+workload: Interactive
+operation: short
+number: 1
+title: Profile of a person
+description: |
+  Given a start *Person* with ID `$personId`, retrieve their first name, last name, birthday, IP address, browser, and city of residence.
+parameters:
+  - name: personId
+    type: ID
+result:
+  - name: person.firstName
+    type: String
+  - name: person.lastName
+    type: String
+  - name: person.birthday
+    type: Date
+  - name: person.locationIP
+    type: String
+  - name: person.browserUsed
+    type: String
+  - name: city.id
+    type: ID
+  - name: person.gender
+    type: String
+  - name: person.creationDate
+    type: DateTime

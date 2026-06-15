@@ -1,0 +1,17 @@
+workload: Updates
+operation: insert
+number: 4
+title: Add forum
+description: Add a *Forum* **node**, connected to the network by 2 possible **edge** types.
+parameters:
+  - name: forumId
+    type: ID
+  - name: forumTitle
+    type: Long String
+  - name: creationDate
+    type: DateTime
+  - name: moderatorId
+    type: ID
+  - name: tagIds
+    type: \{ID\}
+choke_points: [9.1, 9.2]
