@@ -1,40 +1,49 @@
 #!/usr/bin/env bash
-# Capture a benchmark baseline for the implementer self-gate to diff against.
-# Runs the 20K benchmark on a freshly-restored local SF3 DB and saves the result
-# as baselines/bench-sf3-baseline.json (the canonical baseline path — a committed fixture,
-# kept outside the gitignored results/ dir so it is tracked and shared).
+# Capture the canonical SF3 benchmark baseline used by the regression gates.
 #
-# Usage: CONNECTION_STRING=postgresql://postgres:postgres@localhost:5432/postgres \
-#          scripts/capture-baseline.sh [benchmark-profile]
-# Default profile: driver/benchmark-20k-5kwarmup.properties (matches the gate).
+# Runs the main-session final-gate benchmark profile (benchmark-local-20k by
+# default) against the LOCAL database, then copies the driver's
+# results/LDBC-results.json to baselines/bench-sf3-baseline.json. Both the
+# implementer self-gate (10K) and the main-session final gate (20K) diff their
+# runs against this one file.
+#
+# The baseline is MEASURED data — it can only be produced by running this script
+# against a loaded, snapshotted SF3 database. It cannot be hand-written.
+#
+# Refuses any non-local CONNECTION_STRING: the baseline must never be captured
+# against shared HorizonDB.
+#
+# Usage:
+#   CONNECTION_STRING=postgresql://postgres:postgres@localhost:5432/postgres \
+#     scripts/capture-baseline.sh [driver/<benchmark-profile>.properties]
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROFILE="${1:-driver/benchmark-local-20k.properties}"
+BASELINE="${AGE_DIR}/baselines/bench-sf3-baseline.json"
+RESULTS="${AGE_DIR}/results/LDBC-results.json"
 
 : "${CONNECTION_STRING:?CONNECTION_STRING environment variable must be set}"
 
-# Local-only guard: baselines (and any benchmark/write cycle) must never run against
-# shared HorizonDB. Refuse anything that is not a local connection.
+# Local-only guard — never capture a baseline against shared HorizonDB.
 case "$CONNECTION_STRING" in
-  *localhost*|*127.0.0.1*) ;;
-  *) echo "REFUSING: CONNECTION_STRING is not local ($CONNECTION_STRING). Baselines run local-only." >&2; exit 1 ;;
+  *localhost*|*127.0.0.1*) : ;;
+  *) echo "ERROR: CONNECTION_STRING ($CONNECTION_STRING) is not local. Baseline capture is local-only."; exit 1 ;;
 esac
 
-cd "$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )/.."
+cd "${AGE_DIR}"
+mkdir -p baselines
 
-PROFILE="${1:-driver/benchmark-20k-5kwarmup.properties}"
-BASELINE="baselines/bench-sf3-baseline.json"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-
-echo "==> Restore before"
+echo "=== Capturing baseline with profile: ${PROFILE} ==="
+bash scripts/restore-database.sh
+bash driver/benchmark.sh "${PROFILE}" 2>&1 | tee "results/capture-baseline-$(date +%Y%m%d-%H%M%S).log"
 bash scripts/restore-database.sh
 
-echo "==> Benchmark ($PROFILE)"
-bash driver/benchmark.sh "$PROFILE" 2>&1 | tee "results/bench-baseline-${STAMP}.log"
-
-echo "==> Saving baseline -> $BASELINE"
-mkdir -p "$(dirname "$BASELINE")"
-cp results/LDBC-results.json "$BASELINE"
-
-echo "==> Restore after"
-bash scripts/restore-database.sh
-
-echo "Baseline captured: $BASELINE (profile: $PROFILE, $STAMP)"
+if [[ ! -f "${RESULTS}" ]]; then
+  echo "ERROR: expected ${RESULTS} after the run, but it is missing."
+  exit 1
+fi
+cp "${RESULTS}" "${BASELINE}"
+echo "=== Baseline written: ${BASELINE} ==="
+echo "    Commit it so a fresh checkout has the reference fixture."
